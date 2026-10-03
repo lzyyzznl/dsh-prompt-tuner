@@ -161,7 +161,7 @@ node scripts/bench.mjs --runs 3 --effort auto     # 对照：省掉字段要多�
 ## 安装
 
 ```sh
-dsh plugin add github:<owner>/<repo>
+dsh plugin add github:lzyyzznl/dsh-prompt-tuner
 ```
 
 仓库根有 `cordis.patch.yml`（一条 `insert`），`package.json` 声明 `dsh.bundle.patch` 与 `dsh.client.platform=web`；不含构建步骤，`lib/` 即源码。
