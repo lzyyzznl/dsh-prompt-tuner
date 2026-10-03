@@ -1,0 +1,3 @@
+# Keep one line ending everywhere: these files are shipped as-is (no build step),
+# and a mixed checkout would show up as diff noise in every future PR.
+* text=auto eol=lf

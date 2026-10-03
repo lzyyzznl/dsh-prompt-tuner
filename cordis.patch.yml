@@ -1,0 +1,8 @@
+# Install manifest read by `dsh plugin add`.
+#
+# One entry, and it must be `insert:` — a bundle patch replaces an existing entry
+# wholesale when the id matches, and there is nothing here to replace. `name` is
+# the package name the loader resolves; `id` is this entry's own identity.
+- insert:
+    - id: dsh-prompt-tuner
+      name: dsh-prompt-tuner

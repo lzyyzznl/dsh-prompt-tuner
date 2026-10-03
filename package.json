@@ -1,0 +1,59 @@
+{
+  "name": "dsh-prompt-tuner",
+  "version": "0.1.0",
+  "description": "Composer prompt tuner for the DSH Web GUI: rewrites the input draft through a model you choose (by default the session's own), with the model, reasoning effort, rewrite style and optimization prompt configured on a settings page",
+  "type": "module",
+  "main": "./lib/index.js",
+  "files": [
+    "lib",
+    "scripts",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "BSD-3-Clause",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lzyyzznl/dsh-prompt-tuner.git"
+  },
+  "homepage": "https://github.com/lzyyzznl/dsh-prompt-tuner#readme",
+  "bugs": {
+    "url": "https://github.com/lzyyzznl/dsh-prompt-tuner/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "prompt",
+    "composer"
+  ],
+  "scripts": {
+    "check": "node scripts/check.mjs",
+    "bench": "node scripts/bench.mjs"
+  },
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "engines": {
+      "dsh": ">=0.2.0-rc.1"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  }
+}

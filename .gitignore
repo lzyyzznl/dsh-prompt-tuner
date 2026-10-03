@@ -1,0 +1,7 @@
+# `lib/` is this plugin's source, not build output — it is committed on purpose
+# (there is no build step, and a git-based install ships exactly these files).
+node_modules/
+*.tsbuildinfo
+*.tgz
+*.log
+.DS_Store
