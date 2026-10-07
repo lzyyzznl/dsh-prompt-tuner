@@ -184,7 +184,7 @@
 ## 自检与基准
 
 ```sh
-npm run check                 # 257 项，含宿主路由与浏览器半区
+npm run check                 # 259 项，含宿主路由与浏览器半区
 node scripts/bench.mjs --runs 3 --effort off
 node scripts/bench.mjs --runs 3 --effort auto     # 对照：省掉字段要多花多少时间
 ```

@@ -1194,6 +1194,30 @@ const assistantNode = (text) => ({ kind: 'assistant', seq: 2, time: 2, turns: 1,
 }
 
 {
+  // The narrowed modes still work and say so: only "all" claims "all".
+  const fetchImpl = makeFetch()
+  const bundle = loadClientBundle(fetchImpl)
+  STATE.value.settings.btwContextTurns = 4
+  await bundle.settingsStore.load(true)
+  const input = makeInput({}, [userNode('一'), assistantNode('二'), userNode('三'), assistantNode('四'), userNode('五'), assistantNode('六')])
+  bundle.openBtw('session-a')
+  const panel = bundle.BtwPanel(input.props)
+  const text = textOf(panel)
+  check('收窄到最近 N 条时如实标注条数', text.includes('已带最近 4 条会话消息') && !text.includes('已带全部'))
+  bundle.patchBtw('session-a', { draft: '只看最近几条' })
+  const asking = bundle.BtwPanel(input.props)
+  buttonsOf(asking).find((candidate) => labelOf(candidate).trim() === '提问').props.onClick()
+  const started = Date.now()
+  while (bundle.readBtw('session-a').phase === 'asking' && Date.now() - started < 4000) {
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  const request = fetchImpl.seen.find((entry) => entry.action === 'btw.stream')
+  check('收窄时只发最近 N 条消息', request?.body?.context.includes('三') && !request.body.context.includes('一'))
+  STATE.value.settings.btwContextTurns = 'all'
+  bundle.__restore()
+}
+
+{
   const fetchImpl = makeFetch()
   const bundle = loadClientBundle(fetchImpl)
   await bundle.settingsStore.load(true)
