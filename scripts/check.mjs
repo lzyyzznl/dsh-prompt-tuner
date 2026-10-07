@@ -111,6 +111,13 @@ check('client 读 draftRev 实现「只在草稿未变时自动替换」', clien
 const cssText = /const CSS = `([\s\S]*?)`\n/.exec(clientSource)?.[1] ?? ''
 check('CSS 无字面色值（只用主题 token）', !/#[0-9a-fA-F]{3,8}\b/.test(cssText) && !/\brgba?\(/.test(cssText))
 check('CSS 定义了卡片 / 面板 / 设置页三组类', ['dspo-btn', 'dspo-card', 'dspo-set'].every((name) => cssText.includes(`.${name}`)))
+// The tabbed settings page brought its own three classes. `.dspo-tabs` would
+// satisfy a bare `.dspo-tab` substring test, so the tab selector is matched
+// with its own boundary.
+check('CSS 定义了标签栏 / 页签 / 面板三组类',
+  /\.dspo-tabs\s*\{/.test(cssText)
+  && /\.dspo-tab(?![\w-])/.test(cssText)
+  && /\.dspo-tabpanel\s*\{/.test(cssText))
 // The panel scrolls itself, so its head has to be pinned inside that scroller:
 // a plain flow child rides the wheel away with the transcript.
 check('旁路面板自己滚动、头部固定（sticky + 不透明背景）',
@@ -1000,6 +1007,12 @@ function makeFetch(options = {}) {
       if (typeof options.json === 'function') return new Response(JSON.stringify(options.json(seen[seen.length - 1])), { status: 200 })
       return new Response(JSON.stringify({ ok: true, value: { text: 'JSON 回退结果', assumptions: null, timings: { totalMs: 900, firstTextMs: 300 }, originalChars: 4, optimizedChars: 6 } }), { status: 200 })
     }
+    // Settings writes fail by default — the settings page's error line is
+    // checked against exactly that. `saveOk` accepts them, so the ok toast can
+    // be checked as well.
+    if (action === 'save' && options.saveOk === true) {
+      return new Response(JSON.stringify({ ok: true, value: STATE.value }), { status: 200 })
+    }
     if (action === 'btw.stream') {
       if (options.noStream === true) return new Response('nope', { status: 404 })
       if (options.btwFailed === true) {
@@ -1253,23 +1266,286 @@ function makeInput(initial = {}, chatNodes = []) {
 }
 
 {
-  // Settings page surface.
+  // Settings page surface. The page is tabbed now, so only the active panel is
+  // in the tree: every surface assertion has to be collected by walking the
+  // tabs. The walk goes through `mountClient` because both the selected tab and
+  // the set of already-visited (still mounted) panels live in `useState` — a
+  // bare render would restart from the first tab on every call.
   const fetchImpl = makeFetch()
   const bundle = loadClientBundle(fetchImpl)
   await bundle.settingsStore.load(true)
-  const page = bundle.SettingsPanel({ close() {} })
-  const text = textOf(page)
-  check('设置页含模型 / 强度 / 档位 / 应用方式 / 路由 / 提示词', ['优化模型', '思考强度', '默认档位', '改写完成后', '改写方式', '自定义优化提示词'].every((label) => text.includes(label)))
-  check('设置页提供「跟随当前会话的模型」开关', text.includes('跟随当前会话的模型'))
-  check('设置页提供快捷键开关', text.includes('Alt+O'))
-  const selects = findAll(page, (node) => node.type === 'select')
+  const render = mountClient(bundle, bundle.SettingsPanel)
+  const page = () => render({ close() {} })
+
+  const TAB_IDS = ['model', 'rewrite', 'prompt', 'btw']
+  const TAB_KEYS = ['tabModel', 'tabRewrite', 'tabPrompt', 'tabBtw']
+  const TAB_LABELS = TAB_KEYS.map((key) => bundle.DICT.zh[key])
+  const PAGE_NODES = ['dspo-meta', 'dspo-set-ok', 'dspo-set-error']
+  const tabButton = (tree, id) => findAll(tree, (node) => node.props?.id === `dspo-tab-${id}`)[0]
+  const tabsOf = (tree) => findAll(tree, (node) => node.props?.role === 'tab')
+  const panelsOf = (tree) => findAll(tree, (node) => node.props?.role === 'tabpanel')
+  const visiblePanel = (tree) => panelsOf(tree).find((panel) => panel.props.hidden !== true)
+  const selectedTab = (tree) => tabsOf(tree).find((tab) => tab.props['aria-selected'] === true)
+  const selectedTabs = (tree) => tabsOf(tree).filter((tab) => tab.props['aria-selected'] === true)
+  const visiblePanels = (tree) => panelsOf(tree).filter((panel) => panel.props.hidden !== true)
+  const rowLabels = (panel) => findAll(panel, (node) => node.props?.className === 'dspo-set-label').map(textOf)
+  /** The page's own furniture: children of the root that belong to no panel. */
+  const pageLevel = (tree) => (tree.children ?? []).filter((child) => PAGE_NODES.includes(child?.props?.className))
+  /** Anything that leaked into a panel although it is page-level. */
+  const pageLevelInsidePanels = (tree) => panelsOf(tree)
+    .flatMap((panel) => findAll(panel, (node) => PAGE_NODES.includes(node.props?.className)))
+  /** Click one tab and re-render; every tab is reached through the same rail. */
+  const clickTab = (tree, id) => {
+    tabButton(tree, id).props.onClick()
+    return page()
+  }
+  /** Press one key on a tab button; returns whether the handler claimed it. */
+  const press = (tree, id, key) => {
+    let prevented = false
+    tabButton(tree, id).props.onKeyDown({ key, preventDefault: () => { prevented = true } })
+    return prevented
+  }
+
+  /* ── the rail ── */
+  const first = page()
+  const rail = findAll(first, (node) => node.props?.role === 'tablist')[0]
+  const firstTabs = tabsOf(first)
+  check('设置页有 role="tablist" 的标签栏', rail !== undefined && rail.props.className === 'dspo-tabs'
+    && rail.props['aria-label'] === bundle.DICT.zh.settingsTabs, JSON.stringify(rail?.props))
+  check('标签栏恰好四个 role="tab" 按钮', firstTabs.length === 4, String(firstTabs.length))
+  check('四个页签按文档顺序排列，id 与文案各自对应',
+    JSON.stringify(firstTabs.map((tab) => tab.props.id)) === JSON.stringify(TAB_IDS.map((id) => `dspo-tab-${id}`))
+      && JSON.stringify(firstTabs.map(labelOf)) === JSON.stringify(TAB_LABELS),
+    firstTabs.map((tab) => `${tab.props.id}=${labelOf(tab)}`).join(' '))
+  check('页签文案就是文档写死的四个中文标签',
+    JSON.stringify(TAB_LABELS) === JSON.stringify(['模型', '改写', '提示词', '旁路提问']), TAB_LABELS.join(','))
+  check('每个页签都是 button，aria-controls 指向自己的面板',
+    firstTabs.every((tab) => tab.props.type === 'button'
+      && tab.props['aria-controls'] === `dspo-panel-${tab.props.id.slice('dspo-tab-'.length)}`))
+
+  /* ── selection invariants, on the very first render ── */
+  check('任意时刻恰好一个页签 aria-selected="true"', selectedTabs(first).length === 1, String(selectedTabs(first).length))
+  check('任意时刻恰好一个已渲染面板不带 hidden', visiblePanels(first).length === 1, String(visiblePanels(first).length))
+  check('data-active 只在活动页签上是 "true"',
+    firstTabs.filter((tab) => tab.props['data-active'] === 'true').length === 1
+      && firstTabs.find((tab) => tab.props['data-active'] === 'true') === selectedTab(first))
+  check('tabIndex 在活动页签上是 0、其余都是 -1',
+    firstTabs.every((tab) => tab.props.tabIndex === (tab.props['aria-selected'] === true ? 0 : -1)),
+    firstTabs.map((tab) => String(tab.props.tabIndex)).join(','))
+  check('活动页签与可见面板互相指向（aria-controls / aria-labelledby）',
+    selectedTab(first).props['aria-controls'] === visiblePanel(first).props.id
+      && visiblePanel(first).props['aria-labelledby'] === selectedTab(first).props.id,
+    `${selectedTab(first).props['aria-controls']} vs ${visiblePanel(first).props.id}`)
+
+  /* ── lazy mounting: visited panels stay, unvisited ones do not exist ── */
+  check('首次渲染只挂载 model 面板',
+    panelsOf(first).length === 1 && panelsOf(first)[0].props.id === 'dspo-panel-model',
+    panelsOf(first).map((panel) => panel.props.id).join(','))
+  check('没访问过的页签根本没有面板（btw 还不存在）',
+    !panelsOf(first).some((panel) => panel.props.id === 'dspo-panel-btw'))
+
+  const afterRewrite = clickTab(first, 'rewrite')
+  check('点击页签同时移动选中与可见面板',
+    selectedTab(afterRewrite).props.id === 'dspo-tab-rewrite'
+      && visiblePanel(afterRewrite).props.id === 'dspo-panel-rewrite'
+      && selectedTabs(afterRewrite).length === 1
+      && visiblePanels(afterRewrite).length === 1)
+  check('访问过的面板继续挂载、只是 hidden',
+    panelsOf(afterRewrite).length === 2
+      && panelsOf(afterRewrite).filter((panel) => panel.props.hidden === true).length === 1
+      && panelsOf(afterRewrite).find((panel) => panel.props.id === 'dspo-panel-model').props.hidden === true,
+    panelsOf(afterRewrite).map((panel) => `${panel.props.id}:${panel.props.hidden}`).join(' '))
+
+  const afterPrompt = clickTab(afterRewrite, 'prompt')
+  check('访问 rewrite 与 prompt 后恰好三个面板，早先的都是 hidden',
+    panelsOf(afterPrompt).length === 3
+      && panelsOf(afterPrompt).filter((panel) => panel.props.hidden === true).length === 2
+      && visiblePanel(afterPrompt).props.id === 'dspo-panel-prompt',
+    panelsOf(afterPrompt).map((panel) => `${panel.props.id}:${panel.props.hidden}`).join(' '))
+  check('btw 面板在访问它之前始终不存在',
+    !panelsOf(afterPrompt).some((panel) => panel.props.id === 'dspo-panel-btw'))
+  const allTabs = clickTab(afterPrompt, 'btw')
+  check('访问 btw 后四个面板齐备', panelsOf(allTabs).length === 4, String(panelsOf(allTabs).length))
+
+  /* ── one walk that collects each tab's rows and re-checks the wiring ── */
+  const labelsByTab = {}
+  let walk = allTabs
+  for (const [index, id] of TAB_IDS.entries()) {
+    walk = clickTab(walk, id)
+    const selected = selectedTab(walk)
+    const visible = visiblePanel(walk)
+    check(`点「${bundle.DICT.zh[TAB_KEYS[index]]}」页签后选中与可见面板都指向它，且各自唯一`,
+      selected.props.id === `dspo-tab-${id}`
+        && selectedTabs(walk).length === 1
+        && visiblePanels(walk).length === 1
+        && selected.props['aria-controls'] === visible.props.id
+        && visible.props.id === `dspo-panel-${id}`
+        && visible.props['aria-labelledby'] === selected.props.id,
+      `${selected.props.id} / ${visible.props.id}`)
+    labelsByTab[id] = rowLabels(visible)
+  }
+
+  /* ── every original surface assertion, unioned over the tabs ── */
+  const panelsById = Object.fromEntries(panelsOf(walk).map((panel) => [panel.props.id, panel]))
+  const panelText = TAB_IDS.map((id) => textOf(panelsById[`dspo-panel-${id}`])).join('\n')
+  check('设置页含模型 / 强度 / 档位 / 应用方式 / 路由 / 提示词',
+    ['优化模型', '思考强度', '默认档位', '改写完成后', '改写方式', '自定义优化提示词'].every((label) => panelText.includes(label)))
+  check('设置页提供「跟随当前会话的模型」开关',
+    panelText.includes('跟随当前会话的模型')
+      && findAll(walk, (node) => node.props?.id === 'dspo-follow' && node.props?.type === 'checkbox').length === 1)
+  check('设置页提供快捷键开关',
+    panelText.includes('Alt+O')
+      && findAll(walk, (node) => node.props?.id === 'dspo-shortcut' && node.props?.type === 'checkbox').length === 1)
+  const selects = findAll(walk, (node) => node.type === 'select')
+  const effortSelect = selects.find((select) => select.props.id === 'dspo-effort')
   check('设置页渲染出多个下拉', selects.length >= 4, String(selects.length))
-  check('思考强度下拉列出适配器自报的档位', selects.some((select) => (select.children ?? []).length === 3))
-  const textarea = findAll(page, (node) => node.type === 'textarea')[0]
+  check('思考强度下拉列出适配器自报的档位',
+    selects.some((select) => (select.children ?? []).length === 3)
+      && effortSelect !== undefined
+      && (effortSelect.children ?? []).length === STATE.value.reasoning.efforts.length,
+    `${(effortSelect?.children ?? []).length} / ${STATE.value.reasoning.efforts.length}`)
+  const textarea = findAll(walk, (node) => node.type === 'textarea')[0]
   check('自定义提示词框留空（不预填默认）', textarea !== undefined && textarea.props.value === '')
-  check('设置页可展开查看内置默认', textOf(page).includes('查看内置默认提示词'))
-  check('设置页的上下文下拉默认选中「全部历史消息」', textOf(page).includes('全部历史消息')
-    && (findAll(page, (node) => node.type === 'select').some((select) => select.props.value === 'all')))
+  check('设置页可展开查看内置默认', textOf(walk).includes('查看内置默认提示词'))
+  check('设置页的上下文下拉默认选中「全部历史消息」', textOf(walk).includes('全部历史消息')
+    && findAll(walk, (node) => node.type === 'select').some((select) => select.props.value === 'all'))
+
+  // What the lazy mounting buys: the panel is never unmounted, so a half-typed
+  // prompt draft is still there after a round trip through another tab.
+  const promptArea = (tree) => findAll(
+    findAll(tree, (node) => node.props?.role === 'tabpanel' && node.props.id === 'dspo-panel-prompt')[0],
+    (node) => node.type === 'textarea',
+  )[0]
+  promptArea(walk).props.onChange({ target: { value: '半截草稿' } })
+  walk = clickTab(clickTab(walk, 'model'), 'prompt')
+  const keptDraft = promptArea(walk)
+  check('切到别的页签再切回来，半截的提示词草稿没被重置',
+    keptDraft.props.value === '半截草稿', String(keptDraft.props.value))
+
+  /* ── the split's acceptance criterion: no omission, no duplication ── */
+  // Keyed off the `dspo-set-label` nodes on purpose: the 说明 blocks re-print
+  // some of these names, so raw text would double-count them. The shortcut row
+  // renders `shortcutToggle` ("启用 Alt+O 触发优化"); `shortcutLabel` ("快捷键")
+  // is in the dictionary but is not a row name, so it is not in this list.
+  const ROW_KEYS = ['followSession', 'modelLabel', 'effortLabel', 'styleLabelSetting', 'applyModeLabel', 'routeLabel', 'shortcutToggle', 'promptLabel', 'btwContextLabel', 'btwSaveHistoryLabel']
+  const expectedRows = ROW_KEYS.map((key) => bundle.DICT.zh[key])
+  const sets = TAB_IDS.map((id) => labelsByTab[id])
+  const summary = TAB_IDS.map((id) => `${id}:[${labelsByTab[id].join('|')}]`).join(' ')
+  check('每个页签都渲染出设置行', sets.every((labels) => labels.length > 0), summary)
+  check('四个页签的设置行两两不相交、页签内部也不重复',
+    sets.every((labels) => new Set(labels).size === labels.length)
+      && sets.every((labels, index) => sets.slice(index + 1).every((other) => labels.every((label) => !other.includes(label)))),
+    summary)
+  const union = [...new Set(sets.flat())].sort()
+  check('四个页签的行标签并集恰好是词典里的 10 行（无遗漏、无重复）',
+    union.length === ROW_KEYS.length && JSON.stringify(union) === JSON.stringify([...expectedRows].sort()),
+    `${union.length}: ${union.join('|')}`)
+
+  /* ── page-level facts stay outside every panel, on every tab ── */
+  const configFile = STATE.value.configFile
+  check('配置文件路径行是页级节点（面板之外）',
+    pageLevel(allTabs).some((node) => textOf(node).includes(bundle.DICT.zh.configFile) && textOf(node).includes(configFile))
+      && pageLevelInsidePanels(allTabs).length === 0,
+    pageLevel(allTabs).map(textOf).join(' | '))
+  const perTab = TAB_IDS.map((id) => {
+    walk = clickTab(walk, id)
+    return {
+      id,
+      ok: selectedTab(walk).props.id === `dspo-tab-${id}`
+        && pageLevel(walk).some((node) => textOf(node).includes(configFile))
+        && pageLevelInsidePanels(walk).length === 0,
+    }
+  })
+  check('配置文件路径每个页签下都在、且都在面板之外',
+    perTab.every((entry) => entry.ok), perTab.filter((entry) => !entry.ok).map((entry) => entry.id).join(','))
+
+  // A failed save paints the page-level error line; it is page furniture too.
+  walk = clickTab(walk, 'rewrite')
+  findAll(visiblePanel(walk), (node) => node.type === 'select' && node.props.id === 'dspo-style')[0]
+    .props.onChange({ target: { value: 'slim' } })
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  const errored = page()
+  const errorLine = pageLevel(errored).find((node) => node.props.className === 'dspo-set-error')
+  const errorPerTab = TAB_IDS.map((id) => {
+    const active = clickTab(errored, id)
+    return pageLevel(active).some((node) => node.props.className === 'dspo-set-error')
+      && pageLevelInsidePanels(active).length === 0
+  })
+  check('保存失败时的错误行同样是页级节点（面板之外、每个页签下都在）',
+    bundle.settingsStore.get().error !== null
+      && errorLine !== undefined
+      && textOf(errorLine) === bundle.settingsStore.get().error
+      && errorPerTab.every((ok) => ok === true),
+    `${bundle.settingsStore.get().error} / ${errorLine === undefined ? 'missing' : textOf(errorLine)}`)
+
+  // The other half of that feedback pair: a save the host accepted paints the
+  // ok line. It needs its own mount — the store above now carries the failure —
+  // and a host that accepts `/save`.
+  const okBundle = loadClientBundle(makeFetch({ saveOk: true }))
+  await okBundle.settingsStore.load(true)
+  const okRender = mountClient(okBundle, okBundle.SettingsPanel)
+  const okPage = () => okRender({ close() {} })
+  const okRail = (tree, id) => findAll(tree, (node) => node.props?.id === `dspo-tab-${id}`)[0]
+  const okPanel = (tree, id) => findAll(tree, (node) => node.props?.role === 'tabpanel' && node.props.id === `dspo-panel-${id}`)[0]
+  const okClickTab = (tree, id) => {
+    okRail(tree, id).props.onClick()
+    return okPage()
+  }
+  let okTree = okClickTab(okPage(), 'prompt')
+  findAll(okPanel(okTree, 'prompt'), (node) => node.type === 'textarea')[0]
+    .props.onChange({ target: { value: '自定义提示词' } })
+  okTree = okPage()
+  const okSave = findAll(okPanel(okTree, 'prompt'), (node) => node.type === 'button' && node.props['data-kind'] === 'primary')[0]
+  const okSaveEnabled = okSave.props.disabled === false
+  okSave.props.onClick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  okTree = okPage()
+  const okLine = (okTree.children ?? []).find((child) => child?.props?.className === 'dspo-set-ok')
+  const okPerTab = TAB_IDS.map((id) => {
+    const active = okClickTab(okTree, id)
+    return (active.children ?? []).some((child) => child?.props?.className === 'dspo-set-ok')
+      && panelsOf(active).every((panel) => findAll(panel, (node) => node.props?.className === 'dspo-set-ok').length === 0)
+  })
+  check('保存成功的提示行同样是页级节点（面板之外、切页签后仍在）',
+    okSaveEnabled && okLine !== undefined && textOf(okLine) === okBundle.DICT.zh.saved && okPerTab.every((ok) => ok === true),
+    `${okSaveEnabled ? '' : 'disabled '}${textOf(okLine ?? 'missing')}`)
+  okBundle.__restore()
+
+  /* ── the rail walks with the keyboard, like the shell's own ── */
+  let keys = clickTab(page(), 'model')
+  const steppedRight = press(keys, 'model', 'ArrowRight')
+  keys = page()
+  check('ArrowRight 选中下一个页签', steppedRight === true
+    && selectedTab(keys).props.id === 'dspo-tab-rewrite' && selectedTabs(keys).length === 1)
+  const steppedLeft = press(keys, 'rewrite', 'ArrowLeft')
+  keys = page()
+  check('ArrowLeft 选中上一个页签', steppedLeft === true && selectedTab(keys).props.id === 'dspo-tab-model')
+  const wrappedBack = press(keys, 'model', 'ArrowLeft')
+  keys = page()
+  check('ArrowLeft 从第一个页签回绕到最后一个',
+    wrappedBack === true && selectedTab(keys).props.id === 'dspo-tab-btw')
+  const wrappedForward = press(keys, 'btw', 'ArrowRight')
+  keys = page()
+  check('ArrowRight 从最后一个页签回绕到第一个',
+    wrappedForward === true && selectedTab(keys).props.id === 'dspo-tab-model')
+  const ended = press(keys, 'model', 'End')
+  keys = page()
+  check('End 选中最后一个页签', ended === true && selectedTab(keys).props.id === 'dspo-tab-btw')
+  const homed = press(keys, 'btw', 'Home')
+  keys = page()
+  check('Home 选中第一个页签', homed === true && selectedTab(keys).props.id === 'dspo-tab-model')
+  const untouched = press(keys, 'model', 'Enter')
+  keys = page()
+  check('未处理的按键不调用 preventDefault、也不改选中',
+    untouched === false && selectedTab(keys).props.id === 'dspo-tab-model')
+  check('键盘移动后 data-active / tabIndex / 唯一性都跟着选中走',
+    selectedTabs(keys).length === 1
+      && tabsOf(keys).every((tab) => tab.props.tabIndex === (tab.props['aria-selected'] === true ? 0 : -1)
+        && tab.props['data-active'] === (tab.props['aria-selected'] === true ? 'true' : undefined))
+      && visiblePanels(keys).length === 1
+      && visiblePanel(keys).props['aria-labelledby'] === selectedTab(keys).props.id)
   bundle.__restore()
 }
 
