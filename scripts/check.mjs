@@ -174,6 +174,41 @@ check('追问携带该话题的全部历史轮次（无条数截断）', longThr
   && longThread[0].content[0].text.includes('问0')
   && longThread[58].content[0].text === '问29')
 
+// DSH reads `message.source.replayState` on *every* assistant message while it
+// picks the adapter (`LlmRuntime#forAdapter` in `@deepseek-ai/dsh-llm`), so an
+// assistant turn built by hand without a `source` throws inside adapter
+// dispatch and the whole call dies with a terminal error chunk — that is what
+// broke the first follow-up. Verified against the installed package by
+// `_dsh-prompt-tuner-verify/btw-thread-shape.mjs`.
+const sourcedThread = prompt.buildBtwMessages({
+  question: '问题二',
+  context: '用户：上下文',
+  history: [{ question: '问题一', answer: '答案一' }],
+  provider: 'deepseek-official',
+  model: 'deepseek-flash',
+})
+check('追问里的 assistant 轮次带 source（DSH 适配器分发要求）',
+  sourcedThread[1].source?.kind === 'model'
+  && sourcedThread[1].source.provider === 'deepseek-official'
+  && sourcedThread[1].source.model === 'deepseek-flash')
+check('source 不带 replayState（不冒领原生重放元数据）', sourcedThread[1].source.replayState === undefined)
+check('只有模型产出的轮次带 source', sourcedThread[0].source === undefined && sourcedThread[2].source === undefined)
+
+const foldedThread = prompt.buildBtwThreadAsTurn({
+  question: '问题二',
+  context: '用户：上下文',
+  history: [{ question: '问题一', answer: '答案一' }, { question: '残缺', answer: '' }],
+})
+check('兜底形状折成一条用户消息（没有 assistant 轮次可被拒）',
+  foldedThread.length === 1 && foldedThread[0].role === 'user')
+check('兜底形状仍带上此前的问答与本次追问',
+  foldedThread[0].content[0].text.includes('问：问题一')
+  && foldedThread[0].content[0].text.includes('答：答案一')
+  && foldedThread[0].content[0].text.includes('本次追问：\n问题二'))
+check('兜底形状同样跳过残缺轮次', !foldedThread[0].content[0].text.includes('残缺'))
+check('没有历史时兜底形状与首轮消息完全一致',
+  prompt.buildBtwThreadAsTurn({ question: '问题一', context: '' })[0].content[0].text === prompt.buildBtwPayload('问题一', ''))
+
 check('旁路历史与设置分文件存放', store.BTW_HISTORY_FILE !== store.CONFIG_FILE && store.BTW_HISTORY_FILE.endsWith('prompt-tuner-btw.json'))
 check('旁路默认携带全部历史消息', store.DEFAULT_SETTINGS.btwContextTurns === store.BTW_CONTEXT_ALL && store.BTW_CONTEXT_ALL === 'all')
 check('旁路默认保存历史', store.DEFAULT_SETTINGS.btwSaveHistory === true)
@@ -545,6 +580,9 @@ store.clearBtwTopics('session-a')
   check('/btw 用旁路提示词而不是改写提示词', ctx.calls[0].system.includes('没有工具') && !ctx.calls[0].system.includes('待确认'))
   check('/btw 把上下文与问题拼成一条带分隔符的用户消息', ctx.calls[0].messages[0].content[0].text.includes('改一下登录页') && ctx.calls[0].messages[0].content[0].text.includes('上一问') && ctx.calls[0].messages[2].content[0].text === '登录页改了吗？')
   check('/btw 追问拼成真实的多轮消息', ctx.calls[0].messages.length === 3 && ctx.calls[0].messages[1].role === 'assistant')
+  check('/btw 追问的 assistant 轮次带上了路由来源', ctx.calls[0].messages[1].source?.provider === 'deepseek-official'
+    && ctx.calls[0].messages[1].source.model === 'deepseek-flash')
+  check('/btw 单轮回答标记为未经过形状兜底', value?.reshaped === false)
   check('/btw 回传上下文/轮次/耗时', value?.contextChars === '用户：改一下登录页'.length && value?.historyTurns === 1 && typeof value?.timings?.totalMs === 'number')
   check('/btw 默认发 off 思考强度与输出预算', ctx.calls[0].reasoningEffort === 'off' && typeof ctx.calls[0].maxTokens === 'number')
   check('/btw 走的是会话模型路由', ctx.calls[0].provider === 'deepseek-official' && ctx.calls[0].model === 'deepseek-flash')
@@ -554,6 +592,38 @@ store.clearBtwTopics('session-a')
   check('/btw 不给模型任何工具', ctx.calls[0].tools === undefined && ctx.calls[0].toolChoice === undefined)
   check('/btw 不需要任何写能力（宿主上下文里没有会话/agent/文件能力）',
     !('conversation' in ctx) && !('agent' in ctx) && !('fs' in ctx) && !('tools' in ctx))
+}
+
+{
+  // The shape fallback. An adapter is free to refuse a message list it cannot
+  // represent — that is exactly what killed follow-ups, with DSH reporting it
+  // as a terminal error chunk instead of throwing. Re-running the same call
+  // would fail identically, so the ladder re-asks with the thread folded into
+  // one turn, and the envelope says the answer came from the reshaped call.
+  const ctx = makeCtx((call) => (call.messages.some((message) => message.role === 'assistant')
+    ? ['throw']
+    : btwStep('折成单轮后的答案')))
+  registerRoutes(ctx)
+  const res = await call(ctx, '/btw', {
+    question: '第二个问题',
+    context: '用户：上下文',
+    history: [{ question: '第一个问题', answer: '第一个答案' }],
+  })
+  check('多轮形状被适配器拒绝时改用单轮重问', res.json?.value?.text === '折成单轮后的答案' && res.json.value.reshaped === true, JSON.stringify(res.json))
+  check('重问只带一条用户消息', ctx.calls.length === 2 && ctx.calls[1].messages.length === 1 && ctx.calls[1].messages[0].role === 'user')
+  check('重问仍带着上一轮问答', ctx.calls[1].messages[0].content[0].text.includes('问：第一个问题')
+    && ctx.calls[1].messages[0].content[0].text.includes('答：第一个答案'))
+  check('重问没有把上下文塞两遍', (ctx.calls[1].messages[0].content[0].text.match(/<<<会话上下文>>>/g) ?? []).length === 1)
+}
+
+{
+  // Without a thread there is only one shape, so the rewrite rung must not fire
+  // an identical second call; the failure still comes back as itself.
+  const ctx = makeCtx([['throw'], ['throw'], ['throw']])
+  registerRoutes(ctx)
+  const res = await call(ctx, '/btw', { question: '只有一个问题', context: '' })
+  check('没有历史时不触发无意义的重问（只走去参那一档）', ctx.calls.length === 2 && res.json?.value?.reshaped === undefined, String(ctx.calls.length))
+  check('适配器抛错时如实回显错误', res.json?.ok === false && res.json.error.message === 'adapter exploded', JSON.stringify(res.json?.error))
 }
 
 {
