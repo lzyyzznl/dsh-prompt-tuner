@@ -141,7 +141,8 @@ check('空提示词等价于「回到内置默认」', store.readSettings().syst
 
 const btwPrompt = prompt.BTW_SYSTEM_PROMPT
 check('旁路提示词声明「临时提问」定位', btwPrompt.includes('旁路提问'))
-check('旁路提示词禁止用工具', btwPrompt.includes('你没有工具'))
+check('旁路提示词禁止用工具', btwPrompt.includes('没有工具') && btwPrompt.includes('不能跑命令'))
+check('旁路提示词声明只回答、不写入', btwPrompt.includes('只回答') && btwPrompt.includes('不能写文件') && btwPrompt.includes('写会话'))
 check('旁路提示词禁止反问', btwPrompt.includes('不反问'))
 check('旁路提示词要求简短', btwPrompt.includes('简短'))
 check('旁路提示词要求只用给定上下文、不得编造', btwPrompt.includes('不要编造'))
@@ -164,18 +165,27 @@ const followMessages = prompt.buildBtwMessages({
 check('追问把上一轮拼成真实的 user/assistant 对', followMessages.length === 3 && followMessages[1].role === 'assistant' && followMessages[1].content[0].text === '答案一')
 check('追问不再重复上下文（只随首个问题发送）', !followMessages[2].content[0].text.includes('会话上下文') && followMessages[2].content[0].text === '问题二')
 check('历史里残缺的轮次被跳过', prompt.buildBtwMessages({ question: 'q', context: '', history: [{ question: '', answer: 'a' }] }).length === 1)
+const longThread = prompt.buildBtwMessages({
+  question: '第 31 问',
+  context: '用户：上下文',
+  history: Array.from({ length: 30 }, (_, index) => ({ question: `问${index}`, answer: `答${index}` })),
+})
+check('追问携带该话题的全部历史轮次（无条数截断）', longThread.length === 61
+  && longThread[0].content[0].text.includes('问0')
+  && longThread[58].content[0].text === '问29')
 
 check('旁路历史与设置分文件存放', store.BTW_HISTORY_FILE !== store.CONFIG_FILE && store.BTW_HISTORY_FILE.endsWith('prompt-tuner-btw.json'))
-check('旁路默认携带上下文（8 条）', store.DEFAULT_SETTINGS.btwContextTurns === 8)
+check('旁路默认携带全部历史消息', store.DEFAULT_SETTINGS.btwContextTurns === store.BTW_CONTEXT_ALL && store.BTW_CONTEXT_ALL === 'all')
 check('旁路默认保存历史', store.DEFAULT_SETTINGS.btwSaveHistory === true)
-check('上下文档位是 0/4/8/16（0 = 不读会话）', JSON.stringify([...store.BTW_CONTEXT_CHOICES]) === JSON.stringify([0, 4, 8, 16]))
+check('上下文档位是 全部/0/4/8/16（0 = 不读会话）', JSON.stringify([...store.BTW_CONTEXT_CHOICES]) === JSON.stringify(['all', 0, 4, 8, 16]))
 store.writeSettings({ btwContextTurns: 99, btwSaveHistory: 'yes' })
 const btwTolerant = store.readSettings()
-check('旁路设置对非法取值回退默认', btwTolerant.btwContextTurns === 8 && btwTolerant.btwSaveHistory === true)
+check('旁路设置对非法取值回退默认（全部历史）', btwTolerant.btwContextTurns === 'all' && btwTolerant.btwSaveHistory === true)
 store.writeSettings({ btwContextTurns: 0, btwSaveHistory: false })
 const btwWritten = store.readSettings()
 check('旁路设置可写入并读回', btwWritten.btwContextTurns === 0 && btwWritten.btwSaveHistory === false)
-store.writeSettings({ btwContextTurns: 8, btwSaveHistory: true })
+store.writeSettings({ btwContextTurns: 'all', btwSaveHistory: true })
+check('旁路设置可写回「全部历史」', store.readSettings().btwContextTurns === 'all')
 
 check('空历史文件读成空历史（不抛）', JSON.stringify(store.readBtwHistory()) === JSON.stringify({ version: 1, sessions: {} }))
 const appended = store.appendBtwTurn('session-a', { question: '问题一', answer: '答案一', at: 1 })
@@ -526,17 +536,42 @@ store.clearBtwTopics('session-a')
   check('/save 接受旁路设置', saved.value.settings.btwContextTurns === 4 && saved.value.settings.btwSaveHistory === false)
   check('/save 拒绝非法上下文档位', (await call(ctx, '/save', { btwContextTurns: 7 })).json?.error?.code === 'bad-request')
   check('/save 拒绝非布尔历史开关', (await call(ctx, '/save', { btwSaveHistory: 'yes' })).json?.error?.code === 'bad-request')
-  await call(ctx, '/save', { btwContextTurns: 8, btwSaveHistory: true })
+  check('/save 接受「全部历史」档位', (await call(ctx, '/save', { btwContextTurns: 'all' })).json?.value?.settings?.btwContextTurns === 'all')
+  await call(ctx, '/save', { btwContextTurns: 'all', btwSaveHistory: true })
 
   const res = await call(ctx, '/btw', { question: '登录页改了吗？', context: '用户：改一下登录页', history: [{ question: '上一问', answer: '上一答' }] })
   const value = res.json?.value
   check('/btw 返回答案', value?.text === '旁路答案', JSON.stringify(res.json))
-  check('/btw 用旁路提示词而不是改写提示词', ctx.calls[0].system.includes('你没有工具') && !ctx.calls[0].system.includes('待确认'))
+  check('/btw 用旁路提示词而不是改写提示词', ctx.calls[0].system.includes('没有工具') && !ctx.calls[0].system.includes('待确认'))
   check('/btw 把上下文与问题拼成一条带分隔符的用户消息', ctx.calls[0].messages[0].content[0].text.includes('改一下登录页') && ctx.calls[0].messages[0].content[0].text.includes('上一问') && ctx.calls[0].messages[2].content[0].text === '登录页改了吗？')
   check('/btw 追问拼成真实的多轮消息', ctx.calls[0].messages.length === 3 && ctx.calls[0].messages[1].role === 'assistant')
   check('/btw 回传上下文/轮次/耗时', value?.contextChars === '用户：改一下登录页'.length && value?.historyTurns === 1 && typeof value?.timings?.totalMs === 'number')
   check('/btw 默认发 off 思考强度与输出预算', ctx.calls[0].reasoningEffort === 'off' && typeof ctx.calls[0].maxTokens === 'number')
   check('/btw 走的是会话模型路由', ctx.calls[0].provider === 'deepseek-official' && ctx.calls[0].model === 'deepseek-flash')
+  // The read-only contract, asserted against the call the route actually makes:
+  // no tool list travels with it, and the fake host carries no write-capable
+  // service (no conversation, no agent, no filesystem) for the route to reach.
+  check('/btw 不给模型任何工具', ctx.calls[0].tools === undefined && ctx.calls[0].toolChoice === undefined)
+  check('/btw 不需要任何写能力（宿主上下文里没有会话/agent/文件能力）',
+    !('conversation' in ctx) && !('agent' in ctx) && !('fs' in ctx) && !('tools' in ctx))
+}
+
+{
+  // Whole-session context: nothing is dropped by count, at either end.
+  const ctx = makeCtx([btwStep('ok')])
+  registerRoutes(ctx)
+  const messages = Array.from({ length: 40 }, (_, index) => `用户：第 ${index} 条消息`)
+  const bigContext = messages.join('\n\n')
+  const history = Array.from({ length: 30 }, (_, index) => ({ question: `问${index}`, answer: `答${index}` }))
+  const res = await call(ctx, '/btw', { question: '全部历史都在吗？', context: bigContext, history })
+  check('/btw 原样收下全部上下文（无字符截断）', res.json?.value?.contextChars === bigContext.length)
+  check('/btw 携带该话题的全部追问轮次（无条数截断）', res.json?.value?.historyTurns === 30
+    && ctx.calls[0].messages.length === 61
+    && ctx.calls[0].messages[0].content[0].text.includes('第 0 条消息'))
+  const overLong = await call(ctx, '/btw', { question: '问题', context: 'x'.repeat(prompt.MAX_BTW_CONTEXT_CHARS + 1) })
+  check('/btw 超长上下文响亮拒绝而不是静默截断', overLong.json?.error?.code === 'bad-request'
+    && String(overLong.json.error.message).includes('携带上下文')
+    && ctx.calls.length === 1)
 }
 
 {
@@ -568,6 +603,21 @@ store.clearBtwTopics('session-a')
   check('/btw.stream 先 delta 后 done', names[0] === 'delta' && names[names.length - 1] === 'done', names.join(','))
   const done = JSON.parse(frames[frames.length - 1].split('\n').find((line) => line.startsWith('data:')).slice(5))
   check('/btw.stream 的 done 帧携带完整信封', done.ok === true && done.value.text === '流式答案')
+}
+
+{
+  // Every adapter delta gets its own frame: a short answer must still arrive
+  // token by token, not as two lumps (which is what a char threshold produced).
+  const ctx = makeCtx([[{ type: 'text-delta', text: '答' }, { type: 'text-delta', text: '案' }, { type: 'text-delta', text: '。' }, { type: 'finish', reason: { kind: 'stop' } }]])
+  registerRoutes(ctx)
+  const req = makeReq({ question: '问题' }, { url: `${ROUTE_PREFIX}/btw.stream` })
+  const res = makeRes()
+  await ctx.route.handler(req, res)
+  const frames = res.body.split('\n\n').filter((frame) => frame.trim() !== '')
+  const names = frames.map((frame) => /^event:\s*(.+)$/m.exec(frame)?.[1]?.trim())
+  const deltas = frames.filter((frame) => /^event:\s*delta$/m.test(frame)).length
+  check('/btw.stream 每个增量一帧（不做字数合并）', deltas === 4 && names[names.length - 1] === 'done', names.join(','))
+  check('/btw.stream 最后一帧带 final 标记', /"final":true/.test(frames[frames.length - 2]))
 }
 
 {
@@ -717,7 +767,7 @@ const STATE = {
       applyMode: 'auto',
       route: 'plugin',
       shortcut: true,
-      btwContextTurns: 8,
+      btwContextTurns: 'all',
       btwSaveHistory: true,
     },
     defaultSystemPrompt: prompt.DEFAULT_SYSTEM_PROMPT,
@@ -734,7 +784,7 @@ const STATE = {
     configFile: store.CONFIG_FILE,
     limits: { maxDraftChars: prompt.MAX_DRAFT_CHARS, maxSystemPromptChars: prompt.MAX_SYSTEM_PROMPT_CHARS },
     btw: {
-      contextTurns: 8,
+      contextTurns: 'all',
       saveHistory: true,
       contextTurnChoices: [...store.BTW_CONTEXT_CHOICES],
       maxQuestionChars: prompt.MAX_BTW_QUESTION_CHARS,
@@ -1049,6 +1099,8 @@ function makeInput(initial = {}, chatNodes = []) {
   const textarea = findAll(page, (node) => node.type === 'textarea')[0]
   check('自定义提示词框留空（不预填默认）', textarea !== undefined && textarea.props.value === '')
   check('设置页可展开查看内置默认', textOf(page).includes('查看内置默认提示词'))
+  check('设置页的上下文下拉默认选中「全部历史消息」', textOf(page).includes('全部历史消息')
+    && (findAll(page, (node) => node.type === 'select').some((select) => select.props.value === 'all')))
   bundle.__restore()
 }
 
@@ -1074,6 +1126,20 @@ const assistantNode = (text) => ({ kind: 'assistant', seq: 2, time: 2, turns: 1,
   check('上下文按条数截取最近的消息', bundle.btwContext(nodes, 2).text.includes('那用懒加载') && !bundle.btwContext(nodes, 2).text.includes('把登录页改快一点') && bundle.btwContext(nodes, 2).messages === 2)
   check('档位 0 时完全不读会话', bundle.btwContext(nodes, 0).text === '' && bundle.btwContext(nodes, 0).messages === 0)
   check('空记录不会报错', bundle.btwContext(undefined, 8).text === '')
+  // The default setting: everything, with no count cap and no character trimming.
+  const all = bundle.btwContext(nodes, 'all')
+  check('「全部历史」把这条会话的消息全部带上', all.messages === 3
+    && all.text.includes('用户：把登录页改快一点')
+    && all.text.includes('助手：好的，先看首屏加载')
+    && all.text.includes('用户：那用懒加载'))
+  const many = []
+  for (let index = 0; index < 120; index += 1) {
+    many.push(index % 2 === 0 ? userNode(`第 ${index} 条`) : assistantNode(`第 ${index} 条`))
+  }
+  many.push(assistantNode('长'.repeat(20_000)))
+  const everything = bundle.btwContext(many, 'all')
+  check('「全部历史」不按条数截断（120 条全在）', everything.messages === 121 && everything.text.includes('第 0 条'))
+  check('「全部历史」单条也不做字符截断', everything.text.includes('长'.repeat(20_000)))
   bundle.__restore()
 }
 
@@ -1120,7 +1186,10 @@ const assistantNode = (text) => ({ kind: 'assistant', seq: 2, time: 2, turns: 1,
   const answerSaved = fetchImpl.seen.find((entry) => entry.action === 'btw.save')
   check('答案落进旁路历史', answerSaved?.body?.answer === '旁路答案' && answerSaved.body.question === '登录页改了吗？')
   check('采用宿主回传的话题 id', session.topicId === 'topic-1' && session.topics.length === 1)
-  check('面板显示实际携带的消息条数', textOf(bundle.BtwPanel(input.props)).includes('已带 2 条会话消息'))
+  check('面板显示「全部历史」的条数', textOf(bundle.BtwPanel(input.props)).includes('已带全部 2 条会话消息'))
+  // The read-only contract on this half: asking never writes to the composer.
+  // (The composer is only touched by the explicit 「写入输入框」 button.)
+  check('提问本身不写输入框', input.writes.length === 0 && input.state.draftRev === 1)
   bundle.__restore()
 }
 
@@ -1179,6 +1248,7 @@ const assistantNode = (text) => ({ kind: 'assistant', seq: 2, time: 2, turns: 1,
   check('答案提供「写入输入框」', toComposer !== undefined)
   toComposer.props.onClick()
   check('写入走 inputActions.setDraft（不碰编辑器 DOM）', input.writes.includes('一条回答') && input.state.draft === '一条回答')
+  check('这是该面板唯一一次写入，且由用户点击触发', input.writes.length === 1)
   bundle.__restore()
 }
 
@@ -1198,6 +1268,7 @@ const assistantNode = (text) => ({ kind: 'assistant', seq: 2, time: 2, turns: 1,
   const session = bundle.readBtw('session-a')
   check('失败时如实显示错误而不是静默', session.phase === 'error' && session.thread[0].state === 'error')
   check('失败的时刻用错误文案回显', textOf(bundle.BtwPanel(input.props)).includes('超时'))
+  check('失败同样不写输入框', input.writes.length === 0)
   bundle.__restore()
 }
 
