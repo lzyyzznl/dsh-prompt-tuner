@@ -93,6 +93,18 @@ check('client 读 draftRev 实现「只在草稿未变时自动替换」', clien
 const cssText = /const CSS = `([\s\S]*?)`\n/.exec(clientSource)?.[1] ?? ''
 check('CSS 无字面色值（只用主题 token）', !/#[0-9a-fA-F]{3,8}\b/.test(cssText) && !/\brgba?\(/.test(cssText))
 check('CSS 定义了卡片 / 面板 / 设置页三组类', ['dspo-btn', 'dspo-card', 'dspo-set'].every((name) => cssText.includes(`.${name}`)))
+// The panel scrolls itself, so its head has to be pinned inside that scroller:
+// a plain flow child rides the wheel away with the transcript.
+check('旁路面板自己滚动、头部固定（sticky + 不透明背景）',
+  /\.dspo-btw\s*\{[^}]*overflow:\s*auto/.test(cssText)
+  && /\.dspo-btw-head\s*\{[^}]*position:\s*sticky[^}]*top:\s*0/.test(cssText)
+  && /\.dspo-btw-head\s*\{[^}]*background:/.test(cssText))
+// Measured failure mode: a sticky box pins to the scrollport's *content* edge,
+// so block-start padding on the scroller left an 11px strip above the head that
+// the transcript scrolled through. The spacing lives in the head instead.
+check('滚动容器不留 block-start 内边距（头部与滚动口齐平，不留缝）',
+  /\.dspo-btw\s*\{[^}]*padding:\s*0\s/.test(cssText)
+  && /\.dspo-btw-head\s*\{[^}]*padding:\s*10px/.test(cssText))
 
 /* ───────────────────────── 2. prompt + store ───────────────────────── */
 
@@ -719,6 +731,14 @@ store.clearBtwTopics('session-a')
 
 section('4. 浏览器半区')
 
+/** Cleanups the harness's effects returned; see `flushEffects`. */
+const effectCleanups = []
+
+/** Run every effect cleanup registered so far, the way React would on re-render. */
+function flushEffects() {
+  for (const cleanup of effectCleanups.splice(0)) if (typeof cleanup === 'function') cleanup()
+}
+
 /** Just enough React to execute a component function once and walk its tree. */
 function makeReact() {
   const React = {
@@ -731,9 +751,10 @@ function makeReact() {
     },
     useEffect(effect) {
       try {
-        effect()
+        effectCleanups.push(effect())
       } catch {
         /* effects are exercised for their registration side effects only */
+        effectCleanups.push(undefined)
       }
       return undefined
     },
@@ -761,7 +782,21 @@ function loadClientBundle(fetchImpl) {
   const previousWindow = globalThis.window
   globalThis.window = windowStub
   globalThis.fetch = fetchImpl
-  globalThis.document = { querySelector: () => null, createElement: () => ({ setAttribute() {}, remove() {}, textContent: '' }), head: { appendChild() {} } }
+  // A document that really registers listeners, so a component's document-level
+  // keyboard handling can be driven (`bundle.__key`) instead of only existing.
+  const documentListeners = new Map()
+  globalThis.document = {
+    querySelector: () => null,
+    createElement: () => ({ setAttribute() {}, remove() {}, textContent: '' }),
+    head: { appendChild() {} },
+    addEventListener(type, handler) {
+      if (!documentListeners.has(type)) documentListeners.set(type, new Set())
+      documentListeners.get(type).add(handler)
+    },
+    removeEventListener(type, handler) {
+      documentListeners.get(type)?.delete(handler)
+    },
+  }
   // eslint-disable-next-line no-new-func
   new Function('window', clientSource)(windowStub)
   const React = makeReact()
@@ -769,6 +804,10 @@ function loadClientBundle(fetchImpl) {
     if (id === 'react') return React
     throw new Error(`unexpected module: ${id}`)
   })
+  bundle.__key = (event) => {
+    const full = { key: '', altKey: false, ctrlKey: false, metaKey: false, shiftKey: false, defaultPrevented: false, ...event }
+    for (const handler of [...(documentListeners.get('keydown') ?? [])]) handler(full)
+  }
   bundle.__restore = () => {
     globalThis.fetch = previousFetch
     globalThis.window = previousWindow
@@ -1225,7 +1264,13 @@ const assistantNode = (text) => ({ kind: 'assistant', seq: 2, time: 2, turns: 1,
   button.props.onClick()
   check('点按钮即打开该会话的面板', bundle.readBtw('session-a').open === true)
   const panel = bundle.BtwPanel(input.props)
-  check('打开后是浮层卡片而不是模态', panel !== null && panel.props.className === 'dspo-btw')
+  check('打开后是浮层卡片（不是挡住主对话的模态）', panel !== null && panel.props.className === 'dspo-btw')
+  // The shell's keyboard arbitration runs on window-capture, ahead of anything
+  // this plugin can register, and yields to `[role="dialog"][aria-modal="true"]`.
+  // The panel declares that marker so Escape belongs to it while it is open;
+  // otherwise a running main turn would eat the press as its `Esc Esc` chord.
+  check('面板声明宿主认得的模态标记（Esc 才归面板）',
+    panel.props.role === 'dialog' && panel.props['aria-modal'] === 'true')
   check('面板说明答案不会进入主对话', textOf(panel).includes('不写进主对话'))
   check('读不到会话记录时明说，而不是假装带了上下文', textOf(panel).includes('读不到会话记录'))
   bundle.__restore()
@@ -1324,6 +1369,62 @@ const assistantNode = (text) => ({ kind: 'assistant', seq: 2, time: 2, turns: 1,
   const newButton = buttonsOf(reopened).find((candidate) => labelOf(candidate).trim() === '新问题')
   newButton.props.onClick()
   check('「新问题」清空当前话题', bundle.readBtw('session-a').thread.length === 0 && bundle.readBtw('session-a').topicId === '')
+  bundle.__restore()
+}
+
+{
+  // Escape closes the panel, and the history list is a layer of its own.
+  const fetchImpl = makeFetch({ btwTopics: [{ id: 't-old', at: 1, turns: [{ q: '历史问题', a: '历史答案', at: 1 }] }] })
+  const bundle = loadClientBundle(fetchImpl)
+  await bundle.settingsStore.load(true)
+  const input = makeInput({}, [userNode('上下文')])
+  bundle.openBtw('session-a')
+  const started = Date.now()
+  while (bundle.readBtw('session-a').loaded !== true && Date.now() - started < 4000) {
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  const panel = bundle.BtwPanel(input.props)
+  check('面板关闭按钮标注 Esc 快捷键', buttonsOf(panel).some((candidate) => String(candidate.props.title ?? '').includes('Esc')))
+  buttonsOf(panel).find((candidate) => labelOf(candidate).trim() === '历史').props.onClick()
+  bundle.BtwPanel(input.props)
+  check('历史列表已展开', bundle.readBtw('session-a').historyOpen === true)
+  // The harness keeps every listener the render registered (React drops the
+  // previous one on re-render), so the stale ones go before the keystroke.
+  flushEffects()
+  bundle.BtwPanel(input.props)
+  bundle.__key({ key: 'Escape' })
+  check('第一次 Esc 先关历史列表、面板还开着',
+    bundle.readBtw('session-a').historyOpen === false && bundle.readBtw('session-a').open === true)
+  flushEffects()
+  bundle.BtwPanel(input.props)
+  bundle.__key({ key: 'Escape' })
+  check('再按 Esc 关掉面板', bundle.readBtw('session-a').open === false)
+  check('Esc 不写输入框（关闭不是一次写入）', input.writes.length === 0)
+  flushEffects()
+  bundle.__restore()
+}
+
+{
+  // Escape is the panel's, not the shell's: modifiers, an already-handled event
+  // and a closed panel all leave the listener alone.
+  const fetchImpl = makeFetch()
+  const bundle = loadClientBundle(fetchImpl)
+  await bundle.settingsStore.load(true)
+  const input = makeInput({}, [userNode('上下文')])
+  bundle.openBtw('session-a')
+  bundle.BtwPanel(input.props)
+  bundle.__key({ key: 'Escape', shiftKey: true })
+  check('带修饰键的 Esc 不关面板', bundle.readBtw('session-a').open === true)
+  bundle.__key({ key: 'Escape', defaultPrevented: true })
+  check('已被别的图层处理掉的 Esc 不再处理', bundle.readBtw('session-a').open === true)
+  bundle.__key({ key: 'b' })
+  check('非 Esc 按键不动面板', bundle.readBtw('session-a').open === true)
+  flushEffects()
+  bundle.closeBtw('session-a')
+  bundle.BtwPanel(input.props)
+  bundle.__key({ key: 'Escape' })
+  check('面板已关闭时 Esc 不报错也不改状态', bundle.readBtw('session-a').open === false)
+  flushEffects()
   bundle.__restore()
 }
 
