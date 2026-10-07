@@ -68,17 +68,16 @@ check('client 不静态 import @deepseek-ai（避免预发布 peer 冲突）', !
 check('host 四个源文件均无外部依赖', !/from '@deepseek-ai/.test(hostSource + routeSource + promptSource + storeSource))
 
 const registers = [...clientSource.matchAll(/slots\.register\(\{\s*name:\s*'([^']+)'/g)].map((m) => m[1])
-check('恰好 6 个字面 slots.register（预检按字面读取）', registers.length === 6, registers.join(','))
+check('恰好 5 个字面 slots.register（预检按字面读取）', registers.length === 5, registers.join(','))
 check(
-  '注册座位 = 工具行×2 + 输入卡浮层 + composer dock + 设置页 + 回合尾',
+  '注册座位 = 工具行×2 + 输入卡浮层 + composer dock + 设置页',
   registers.includes('conversation.input.left')
     && registers.includes('conversation.input.overlay')
     && registers.includes('conversation.input.dock')
-    && registers.includes('settings.section')
-    && registers.includes('conversation.chat.turnTail'),
+    && registers.includes('settings.section'),
   registers.join(','),
 )
-check('每个注册都带 id 与 order', (clientSource.match(/slots\.register\(\{[^}]*id: ID[^}]*order:/g) ?? []).length === 6)
+check('每个注册都带 id 与 order', (clientSource.match(/slots\.register\(\{[^}]*id: ID[^}]*order:/g) ?? []).length === 5)
 check('侧问座位用 session 作用域（浮层在输入卡内，拿得到 useChat）', clientSource.includes("const OVERLAY_SLOT = 'conversation.input.overlay'"))
 // A list slot rejects a second entry under an id it already holds, and that
 // rejection fails activation — so the two composer-row entries must not share one.
@@ -770,8 +769,8 @@ function makeReact() {
   // the next begins, and the harness does the same — a bare call from a check
   // gets the initial value every time, which is all a seat whose state lives in
   // an external store needs. A seat that really keeps state in `useState` (the
-  // rollback entry's busy flag and its notice) is rendered through `mountClient`,
-  // which hands the same frame back on every render.
+  // settings page's active tab and its visited set) is rendered through
+  // `mountClient`, which hands the same frame back on every render.
   let frame = null
   const React = {
     createElement(type, props, ...children) {
@@ -872,7 +871,7 @@ function loadClientBundle(fetchImpl) {
 /**
  * Mount one client component so a check can re-render it with its state kept.
  * The bare harness call every other check uses is a single render; a component
- * that keeps its own `useState` (the rollback entry) needs the frame instead.
+ * that keeps its own `useState` (the settings page) needs the frame instead.
  * @param {object} bundle - the loaded bundle.
  * @param {Function} Component - the component function to mount.
  * @returns {(props: object) => object} one render of that instance.
@@ -1825,46 +1824,15 @@ function makeSessionFace(pages, options = {}) {
   }
 }
 
-/**
- * A fake client context: the optional services a seat feature-detects (the
- * `sessions` face the history walk needs, plus anything `services` adds) and a
- * slot registry that runs `apply`'s factories and records what they registered.
- * @param {object|null} face - the session face `sessions.scope()` answers with.
- * @param {object} [services] - extra services by name (`sessions`, `uiWorkspace`).
- * @returns {object} the fake context, with `registrations` and `asked` recorded.
- */
-function makeClientCtx(face, services = {}) {
-  const registrations = []
-  const asked = []
-  let slot = ''
+/** A fake client context exposing the `sessions` service the walk needs. */
+function makeClientCtx(face) {
   return {
-    registrations,
-    asked,
-    get(name) {
-      asked.push(name)
-      if (name in services) return services[name]
-      if (name === 'sessions' && face !== null) return { scope: () => face }
-      return undefined
-    },
+    get: (name) => (name === 'sessions' && face !== null ? { scope: () => face } : undefined),
     effect: (fn) => {
       fn()
       return () => {}
     },
-    slots: {
-      inject(name, factory) {
-        slot = name
-        try {
-          factory()
-        } finally {
-          slot = ''
-        }
-        return () => {}
-      },
-      register(entry, Component) {
-        registrations.push({ ...entry, slot, Component })
-        return () => {}
-      },
-    },
+    slots: { inject: () => () => {}, register: () => () => {} },
   }
 }
 
@@ -2000,235 +1968,6 @@ function makeClientCtx(face, services = {}) {
   check('失败时如实显示错误而不是静默', session.phase === 'error' && session.thread[0].state === 'error')
   check('失败的时刻用错误文案回显', textOf(bundle.BtwPanel(input.props)).includes('超时'))
   check('失败同样不写输入框', input.writes.length === 0)
-  bundle.__restore()
-}
-
-/* ── the rollback entry: one completed turn copied into a new session ── */
-
-/** One promise a check settles by hand, so an async call can be held mid-flight. */
-function makeGate() {
-  const gate = { promise: null, resolve: null, reject: null }
-  gate.promise = new Promise((resolve, reject) => {
-    gate.resolve = resolve
-    gate.reject = reject
-  })
-  return gate
-}
-
-{
-  // The registration, read off `apply` rather than off the source: the entry has
-  // to go in under an id of its own, or it would replace one of the shell's own
-  // turn-tail entries instead of sitting beside them.
-  const bundle = loadClientBundle(makeFetch())
-  const ctx = makeClientCtx(null)
-  bundle.apply(ctx)
-  const registered = ctx.registrations.filter((entry) => entry.slot === 'conversation.chat.turnTail')
-  check('回退入口注册在 conversation.chat.turnTail 上',
-    registered.length === 1 && registered[0].name === 'conversation.chat.turnTail' && registered[0].Component === bundle.RewindTail,
-    JSON.stringify(ctx.registrations.map((entry) => `${entry.slot}|${entry.name}`)))
-  check('回退入口用独占 id（不覆盖别的尾部条目）', registered[0]?.id === 'prompt-optimizer-rewind', String(registered[0]?.id))
-  check('回退入口排在尾部条目之后（order 500）', registered[0]?.order === 500, String(registered[0]?.order))
-  bundle.__restore()
-}
-
-{
-  // The happy path: the exact payload, the child opened as soon as the host
-  // catalogues it, and the notice that says so.
-  const bundle = loadClientBundle(makeFetch())
-  const forks = []
-  const opened = []
-  const ctx = makeClientCtx(null, {
-    sessions: {
-      fork(payload) {
-        forks.push(payload)
-        payload.onCreated('session-child')
-        return Promise.resolve()
-      },
-    },
-    uiWorkspace: { openSession: (id) => opened.push(id) },
-  })
-  bundle.apply(ctx)
-  const render = mountClient(bundle, bundle.RewindTail)
-  const props = { sessionId: 'session-a', seq: 42 }
-  const button = buttonsOf(render(props))[0]
-  check('回合尾渲染出「⤴ 回退到此」按钮', labelOf(button) === '⤴ 回退到此' && button.props.disabled === false, labelOf(button))
-  button.props.onClick()
-  await settleTicks()
-  check('回退把这一轮的结束 seq 交给 sessions.fork',
-    forks.length === 1
-    && forks[0].sessionId === 'session-a'
-    && forks[0].atSeq === 42
-    && forks[0].increaseTitle === true
-    && typeof forks[0].onCreated === 'function',
-    JSON.stringify({ ...forks[0], onCreated: typeof forks[0]?.onCreated }))
-  check('分叉出来的子会话立刻被打开', opened.length === 1 && opened[0] === 'session-child', opened.join(','))
-  check('打开成功后提示「已创建、正在打开」', textOf(render(props)).includes('已从这一轮创建新会话，正在打开'), textOf(render(props)))
-  bundle.__restore()
-}
-
-{
-  // No closing seq means no boundary to copy up to, so the seat renders nothing
-  // at all rather than a button that cannot work.
-  const bundle = loadClientBundle(makeFetch())
-  const render = mountClient(bundle, bundle.RewindTail)
-  check('没有 seq 时回合尾不渲染任何东西', render({ sessionId: 'session-a' }) === null)
-  check('seq 不是有限数时同样不渲染',
-    render({ sessionId: 'session-a', seq: Number.NaN }) === null && render({ sessionId: 'session-a', seq: '42' }) === null)
-  bundle.__restore()
-}
-
-{
-  // No fork verb: say it plainly instead of failing silently, and do not go
-  // looking for the workspace on the way out.
-  const bundle = loadClientBundle(makeFetch())
-  const ctx = makeClientCtx(null)
-  bundle.apply(ctx)
-  const render = mountClient(bundle, bundle.RewindTail)
-  const props = { sessionId: 'session-a', seq: 7 }
-  buttonsOf(render(props))[0].props.onClick()
-  await settleTicks()
-  check('没有 sessions 服务时说明「无法回退」', textOf(render(props)).includes('当前宿主没有提供会话分叉能力'), textOf(render(props)))
-  check('没有 sessions 服务时不尝试分叉，也不去找工作区',
-    ctx.asked.includes('sessions') && !ctx.asked.includes('uiWorkspace'),
-    ctx.asked.join(','))
-  // A sessions service that exists without a fork verb degrades identically.
-  const forkless = makeClientCtx(null, { sessions: {} })
-  bundle.apply(forkless)
-  const forklessRender = mountClient(bundle, bundle.RewindTail)
-  buttonsOf(forklessRender(props))[0].props.onClick()
-  await settleTicks()
-  check('sessions 没有 fork 能力时同样只说无法回退',
-    textOf(forklessRender(props)).includes('当前宿主没有提供会话分叉能力') && !forkless.asked.includes('uiWorkspace'),
-    textOf(forklessRender(props)))
-  bundle.__restore()
-}
-
-{
-  // The copy exists even when nothing can switch to it: the notice says where it
-  // went instead of claiming to have opened it.
-  const bundle = loadClientBundle(makeFetch())
-  const forks = []
-  const ctx = makeClientCtx(null, {
-    sessions: {
-      fork(payload) {
-        forks.push(payload)
-        payload.onCreated('session-child')
-        return Promise.resolve()
-      },
-    },
-  })
-  bundle.apply(ctx)
-  const render = mountClient(bundle, bundle.RewindTail)
-  const props = { sessionId: 'session-a', seq: 9 }
-  buttonsOf(render(props))[0].props.onClick()
-  await settleTicks()
-  const text = textOf(render(props))
-  check('没有 uiWorkspace 时照样分叉，提示指向会话列表',
-    forks.length === 1 && text.includes('已从这一轮创建新会话，见会话列表') && !text.includes('正在打开'),
-    text)
-  bundle.__restore()
-}
-
-{
-  // An open that throws must not turn a copy that exists into a failure: the
-  // fork is the durable half, and the notice still says where the child went.
-  const bundle = loadClientBundle(makeFetch())
-  const ctx = makeClientCtx(null, {
-    sessions: {
-      fork(payload) {
-        payload.onCreated('session-child')
-        return Promise.resolve()
-      },
-    },
-    uiWorkspace: {
-      openSession() {
-        throw new Error('no such view')
-      },
-    },
-  })
-  bundle.apply(ctx)
-  const render = mountClient(bundle, bundle.RewindTail)
-  const props = { sessionId: 'session-a', seq: 13 }
-  buttonsOf(render(props))[0].props.onClick()
-  await settleTicks()
-  check('打开子会话抛错时仍报「已创建」，提示指向会话列表',
-    textOf(render(props)).includes('已从这一轮创建新会话，见会话列表'),
-    textOf(render(props)))
-  bundle.__restore()
-}
-
-{
-  const bundle = loadClientBundle(makeFetch())
-  const ctx = makeClientCtx(null, { sessions: { fork: () => Promise.reject(new Error('host refused')) } })
-  bundle.apply(ctx)
-  const render = mountClient(bundle, bundle.RewindTail)
-  const props = { sessionId: 'session-a', seq: 11 }
-  buttonsOf(render(props))[0].props.onClick()
-  await settleTicks()
-  check('分叉失败时把宿主给的原因带进提示', textOf(render(props)).includes('创建新会话失败：host refused'), textOf(render(props)))
-  bundle.__restore()
-}
-
-{
-  // `fork` renames an inherited title *after* the child exists, so it can reject
-  // while the copy is already made and open. Reporting that as "the session was
-  // not created" would be a lie about the one fact the user cares about.
-  const bundle = loadClientBundle(makeFetch())
-  const opened = []
-  const ctx = makeClientCtx(null, {
-    sessions: {
-      fork(payload) {
-        payload.onCreated('session-child')
-        return Promise.reject(new Error('fork child rename failed: session/title-invalid'))
-      },
-    },
-    uiWorkspace: { openSession: (id) => opened.push(id) },
-  })
-  bundle.apply(ctx)
-  const render = mountClient(bundle, bundle.RewindTail)
-  const props = { sessionId: 'session-a', seq: 12 }
-  buttonsOf(render(props))[0].props.onClick()
-  await settleTicks()
-  const text = textOf(render(props))
-  check('副本已建、只是改名失败时不报「创建失败」',
-    text.includes('已从这一轮创建新会话，正在打开') && !text.includes('创建新会话失败') && opened.length === 1,
-    `${text} / opened=${opened.join(',')}`)
-  bundle.__restore()
-}
-
-{
-  // While the fork is in flight the entry is busy: the label says so, the button
-  // is disabled, and a second click cannot start a second fork.
-  const bundle = loadClientBundle(makeFetch())
-  const gate = makeGate()
-  const forks = []
-  const ctx = makeClientCtx(null, {
-    sessions: {
-      fork(payload) {
-        forks.push(payload)
-        return gate.promise
-      },
-    },
-    uiWorkspace: { openSession() {} },
-  })
-  bundle.apply(ctx)
-  const render = mountClient(bundle, bundle.RewindTail)
-  const props = { sessionId: 'session-a', seq: 3 }
-  buttonsOf(render(props))[0].props.onClick()
-  const busyButton = buttonsOf(render(props))[0]
-  check('分叉未落定时按钮禁用并显示「正在创建…」',
-    busyButton.props.disabled === true && labelOf(busyButton) === '正在创建…',
-    labelOf(busyButton))
-  await settleTicks()
-  busyButton.props.onClick()
-  await settleTicks()
-  check('等待期间重复点击不会分叉第二次', forks.length === 1, String(forks.length))
-  gate.resolve()
-  await settleTicks()
-  const idleButton = buttonsOf(render(props))[0]
-  check('落定后按钮恢复为「⤴ 回退到此」',
-    idleButton.props.disabled === false && labelOf(idleButton) === '⤴ 回退到此',
-    labelOf(idleButton))
   bundle.__restore()
 }
 
