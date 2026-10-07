@@ -185,6 +185,7 @@
 
 ```sh
 npm run check                 # 274 项，含宿主路由与浏览器半区
+npm run check:shape           # 对**已安装**的 DSH 复核旁路提问的消息形状（需要本机有 DSH）
 node scripts/bench.mjs --runs 3 --effort off
 node scripts/bench.mjs --runs 3 --effort auto     # 对照：省掉字段要多花多少时间
 ```
@@ -198,7 +199,7 @@ node scripts/bench.mjs --runs 3 --effort auto     # 对照：省掉字段要多�
 - **`maxTokens` 是按字符数估的**：极长的草稿会落在 8192 上限，可能截断后再走第 2 档重试。
 - **路由只服务回环地址**，且不做速率限制：本机任意页面若拿到同源能力，可以消耗你的模型额度。
 - 本仓库**没有自动化视觉验证**：自检覆盖渲染路径与点击链路，但不含真实浏览器截图。旁路提问浮层在真实 GUI 里手动验证过（按钮、浮层、流式答案与光标、追问带全部轮次、写入输入框、历史列表）。
-- **追问依赖 DSH 的 assistant 消息契约**：手搓的多轮消息必须给 assistant 轮次带 `source`，否则会在适配器分发阶段失败（自检锁住这个形状，`_dsh-prompt-tuner-verify/btw-thread-shape.mjs` 直接驱动已安装包的 `forAdapter` 复核）。这条契约不在插件的控制范围内，所以阶梯还留了「折成单轮」的兜底：即使形状被拒，追问也答得出来，只是面板会注明这一轮走了兜底。
+- **追问依赖 DSH 的 assistant 消息契约**：手搓的多轮消息必须给 assistant 轮次带 `source`，否则会在适配器分发阶段失败（自检锁住这个形状，`npm run check:shape` 直接驱动**已安装**包的 `LlmRuntime#forAdapter` 复核，含一条「不带 source 必须被拒」的反向对照）。这条契约不在插件的控制范围内，所以阶梯还留了「折成单轮」的兜底：即使形状被拒，追问也答得出来，只是面板会注明这一轮走了兜底。
 - 收录进 awesome 列表**不等于**安全审查。
 
 ## 安装

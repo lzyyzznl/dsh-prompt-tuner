@@ -29,6 +29,7 @@
   ],
   "scripts": {
     "check": "node scripts/check.mjs",
+    "check:shape": "node scripts/check-thread-shape.mjs",
     "bench": "node scripts/bench.mjs"
   },
   "exports": {
