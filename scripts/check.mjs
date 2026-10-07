@@ -68,9 +68,21 @@ check('client 不静态 import @deepseek-ai（避免预发布 peer 冲突）', !
 check('host 四个源文件均无外部依赖', !/from '@deepseek-ai/.test(hostSource + routeSource + promptSource + storeSource))
 
 const registers = [...clientSource.matchAll(/slots\.register\(\{\s*name:\s*'([^']+)'/g)].map((m) => m[1])
-check('恰好 3 个字面 slots.register（预检按字面读取）', registers.length === 3, registers.join(','))
-check('注册座位 = 工具行 + composer dock + 设置页', registers.includes('conversation.input.left') && registers.includes('conversation.input.dock') && registers.includes('settings.section'), registers.join(','))
-check('每个注册都带 id 与 order', (clientSource.match(/slots\.register\(\{[^}]*id: ID[^}]*order:/g) ?? []).length === 3)
+check('恰好 5 个字面 slots.register（预检按字面读取）', registers.length === 5, registers.join(','))
+check(
+  '注册座位 = 工具行×2 + 输入卡浮层 + composer dock + 设置页',
+  registers.includes('conversation.input.left')
+    && registers.includes('conversation.input.overlay')
+    && registers.includes('conversation.input.dock')
+    && registers.includes('settings.section'),
+  registers.join(','),
+)
+check('每个注册都带 id 与 order', (clientSource.match(/slots\.register\(\{[^}]*id: ID[^}]*order:/g) ?? []).length === 5)
+check('侧问座位用 session 作用域（浮层在输入卡内，拿得到 useChat）', clientSource.includes("const OVERLAY_SLOT = 'conversation.input.overlay'"))
+// A list slot rejects a second entry under an id it already holds, and that
+// rejection fails activation — so the two composer-row entries must not share one.
+const seatIds = [...clientSource.matchAll(/slots\.register\(\{\s*name:\s*'([^']+)',\s*id:\s*([^,]+),/g)].map((m) => `${m[1]}|${m[2].trim()}`)
+check('同一座位内没有重复的注册 id', new Set(seatIds).size === seatIds.length, seatIds.join(' '))
 check('无 execCommand（不碰编辑器 DOM 内部）', !clientSource.includes('execCommand'))
 check('无 textarea.value 直接写值', !/\.value\s*=/.test(clientSource))
 check('草稿唯一写入口是 inputActions.setDraft', (clientSource.match(/setDraft\?\.\(/g) ?? []).length >= 3)
@@ -124,6 +136,63 @@ const written = store.readSettings()
 check('writeSettings 落盘并读回', written.style === 'slim' && written.shortcut === false && written.followSessionModel === false && written.systemPrompt === '自定义')
 store.writeSettings({ systemPrompt: '', provider: null, model: null, reasoningEffort: 'off', followSessionModel: true, style: 'standard', applyMode: 'auto', route: 'plugin', shortcut: true })
 check('空提示词等价于「回到内置默认」', store.readSettings().systemPrompt === null)
+
+/* ── 旁路提问（/btw）：提示词、消息拼装、历史文件 ── */
+
+const btwPrompt = prompt.BTW_SYSTEM_PROMPT
+check('旁路提示词声明「临时提问」定位', btwPrompt.includes('旁路提问'))
+check('旁路提示词禁止用工具', btwPrompt.includes('你没有工具'))
+check('旁路提示词禁止反问', btwPrompt.includes('不反问'))
+check('旁路提示词要求简短', btwPrompt.includes('简短'))
+check('旁路提示词要求只用给定上下文、不得编造', btwPrompt.includes('不要编造'))
+check('旁路提示词与改写提示词不同（一个是回答、一个是改写）', btwPrompt !== defaultPrompt && !btwPrompt.includes('只产出更好的提示词'))
+
+const noContext = prompt.buildBtwPayload('这是什么？', '')
+check('空上下文时显式声明「没有携带上下文」', noContext.includes('没有携带会话上下文') && noContext.includes('这是什么？'))
+const withContext = prompt.buildBtwPayload('这是什么？', '用户：改一下登录页\n\n助手：好的')
+check('上下文用配对分隔符包裹后随问题一起发送', withContext.indexOf('改一下登录页') < withContext.indexOf('这是什么？'))
+check('上下文与问题各有一对分隔符', (withContext.match(/<<<会话上下文>>>/g) ?? []).length === 1 && (withContext.match(/<<<旁路问题>>>/g) ?? []).length === 1)
+
+const firstMessages = prompt.buildBtwMessages({ question: '问题一', context: '用户：上下文', history: [] })
+check('首轮只有一条用户消息', firstMessages.length === 1 && firstMessages[0].role === 'user')
+check('首轮消息里带上下文与问题', firstMessages[0].content[0].text.includes('上下文') && firstMessages[0].content[0].text.includes('问题一'))
+const followMessages = prompt.buildBtwMessages({
+  question: '问题二',
+  context: '用户：上下文',
+  history: [{ question: '问题一', answer: '答案一' }],
+})
+check('追问把上一轮拼成真实的 user/assistant 对', followMessages.length === 3 && followMessages[1].role === 'assistant' && followMessages[1].content[0].text === '答案一')
+check('追问不再重复上下文（只随首个问题发送）', !followMessages[2].content[0].text.includes('会话上下文') && followMessages[2].content[0].text === '问题二')
+check('历史里残缺的轮次被跳过', prompt.buildBtwMessages({ question: 'q', context: '', history: [{ question: '', answer: 'a' }] }).length === 1)
+
+check('旁路历史与设置分文件存放', store.BTW_HISTORY_FILE !== store.CONFIG_FILE && store.BTW_HISTORY_FILE.endsWith('prompt-tuner-btw.json'))
+check('旁路默认携带上下文（8 条）', store.DEFAULT_SETTINGS.btwContextTurns === 8)
+check('旁路默认保存历史', store.DEFAULT_SETTINGS.btwSaveHistory === true)
+check('上下文档位是 0/4/8/16（0 = 不读会话）', JSON.stringify([...store.BTW_CONTEXT_CHOICES]) === JSON.stringify([0, 4, 8, 16]))
+store.writeSettings({ btwContextTurns: 99, btwSaveHistory: 'yes' })
+const btwTolerant = store.readSettings()
+check('旁路设置对非法取值回退默认', btwTolerant.btwContextTurns === 8 && btwTolerant.btwSaveHistory === true)
+store.writeSettings({ btwContextTurns: 0, btwSaveHistory: false })
+const btwWritten = store.readSettings()
+check('旁路设置可写入并读回', btwWritten.btwContextTurns === 0 && btwWritten.btwSaveHistory === false)
+store.writeSettings({ btwContextTurns: 8, btwSaveHistory: true })
+
+check('空历史文件读成空历史（不抛）', JSON.stringify(store.readBtwHistory()) === JSON.stringify({ version: 1, sessions: {} }))
+const appended = store.appendBtwTurn('session-a', { question: '问题一', answer: '答案一', at: 1 })
+check('appendBtwTurn 新建话题并回传 topics', appended.topicId !== '' && appended.topics.length === 1 && appended.saved === true)
+const appendedAgain = store.appendBtwTurn('session-a', { topicId: appended.topicId, question: '问题二', answer: '答案二', at: 2 })
+check('同话题追问落在同一 topic 上', appendedAgain.topicId === appended.topicId && appendedAgain.topics[0].turns.length === 2)
+check('两个会话的历史互不覆盖', store.appendBtwTurn('session-b', { question: 'b1', answer: 'b2', at: 3 }).topics.length === 1 && store.btwTopics('session-a')[0].turns.length === 2)
+check('按会话读回历史', store.btwTopics('session-a')[0].turns[0].q === '问题一' && store.btwTopics('nope').length === 0)
+store.clearBtwTopics('session-a')
+check('clearBtwTopics 只清一个会话', store.btwTopics('session-a').length === 0 && store.btwTopics('session-b').length === 1)
+writeFileSync(store.BTW_HISTORY_FILE, '{"sessions": "not an object"}')
+check('坏历史文件退化为空历史', store.btwTopics('session-b').length === 0)
+for (let i = 0; i < store.BTW_LIMITS.topicsPerSession + 5; i += 1) {
+  store.appendBtwTurn('session-c', { question: `q${i}`, answer: `a${i}`, at: i + 10 })
+}
+check(`每个会话最多保留 ${store.BTW_LIMITS.topicsPerSession} 个话题`, store.btwTopics('session-c').length === store.BTW_LIMITS.topicsPerSession)
+check('话题裁剪保留的是最新的', store.btwTopics('session-c').at(-1).turns[0].q === `q${store.BTW_LIMITS.topicsPerSession + 4}`)
 
 /* ───────────────────────── 3. host routes ───────────────────────── */
 
@@ -439,6 +508,93 @@ const textStep = (text) => [{ type: 'text-delta', text }, { type: 'finish', reas
   check('SSE 失败也走事件帧而非裸 500', res.body.includes('event: failed') && res.status === 200)
 }
 
+/* ── 旁路提问路由（/btw*） ── */
+
+const btwStep = (text) => [{ type: 'text-delta', text }, { type: 'finish', reason: { kind: 'stop' } }]
+store.clearBtwTopics('session-a')
+
+{
+  const ctx = makeCtx([btwStep('旁路答案')])
+  registerRoutes(ctx)
+  const state = (await call(ctx, '/state', {})).json
+  check('/state 带旁路提问契约（档位、上限、历史文件、提示词）', Array.isArray(state.value.btw?.contextTurnChoices)
+    && state.value.btw.maxQuestionChars > 0
+    && typeof state.value.btw.historyFile === 'string'
+    && typeof state.value.btw.prompt === 'string')
+
+  const saved = (await call(ctx, '/save', { btwContextTurns: 4, btwSaveHistory: false })).json
+  check('/save 接受旁路设置', saved.value.settings.btwContextTurns === 4 && saved.value.settings.btwSaveHistory === false)
+  check('/save 拒绝非法上下文档位', (await call(ctx, '/save', { btwContextTurns: 7 })).json?.error?.code === 'bad-request')
+  check('/save 拒绝非布尔历史开关', (await call(ctx, '/save', { btwSaveHistory: 'yes' })).json?.error?.code === 'bad-request')
+  await call(ctx, '/save', { btwContextTurns: 8, btwSaveHistory: true })
+
+  const res = await call(ctx, '/btw', { question: '登录页改了吗？', context: '用户：改一下登录页', history: [{ question: '上一问', answer: '上一答' }] })
+  const value = res.json?.value
+  check('/btw 返回答案', value?.text === '旁路答案', JSON.stringify(res.json))
+  check('/btw 用旁路提示词而不是改写提示词', ctx.calls[0].system.includes('你没有工具') && !ctx.calls[0].system.includes('待确认'))
+  check('/btw 把上下文与问题拼成一条带分隔符的用户消息', ctx.calls[0].messages[0].content[0].text.includes('改一下登录页') && ctx.calls[0].messages[0].content[0].text.includes('上一问') && ctx.calls[0].messages[2].content[0].text === '登录页改了吗？')
+  check('/btw 追问拼成真实的多轮消息', ctx.calls[0].messages.length === 3 && ctx.calls[0].messages[1].role === 'assistant')
+  check('/btw 回传上下文/轮次/耗时', value?.contextChars === '用户：改一下登录页'.length && value?.historyTurns === 1 && typeof value?.timings?.totalMs === 'number')
+  check('/btw 默认发 off 思考强度与输出预算', ctx.calls[0].reasoningEffort === 'off' && typeof ctx.calls[0].maxTokens === 'number')
+  check('/btw 走的是会话模型路由', ctx.calls[0].provider === 'deepseek-official' && ctx.calls[0].model === 'deepseek-flash')
+}
+
+{
+  const ctx = makeCtx([btwStep('x')])
+  registerRoutes(ctx)
+  check('/btw 拒绝空问题且不调用模型', (await call(ctx, '/btw', { question: '   ' })).json?.error?.code === 'bad-request' && ctx.calls.length === 0)
+  const long = await call(ctx, '/btw', { question: 'x'.repeat(prompt.MAX_BTW_QUESTION_CHARS + 1) })
+  check('/btw 拒绝超长问题且不调用模型', long.json?.error?.code === 'bad-request' && ctx.calls.length === 0)
+  check('/btw 接受空上下文（0 条设置）', (await call(ctx, '/btw', { question: '问题', context: '' })).json?.ok === true && ctx.calls.length === 1)
+}
+
+{
+  const ctx = makeCtx([btwStep('x')], { sessionModel: null })
+  ctx.llm.listModels = async () => []
+  registerRoutes(ctx)
+  await call(ctx, '/save', { provider: null, model: null, followSessionModel: true })
+  const res = await call(ctx, '/btw', { question: '问题' })
+  check('/btw 无可用模型时回 no-model', res.json?.error?.code === 'no-model' && ctx.calls.length === 0)
+}
+
+{
+  const ctx = makeCtx([btwStep('流式答案')])
+  registerRoutes(ctx)
+  const req = makeReq({ question: '问题', context: '上下文' }, { url: `${ROUTE_PREFIX}/btw.stream` })
+  const res = makeRes()
+  await ctx.route.handler(req, res)
+  const frames = res.body.split('\n\n').filter((frame) => frame.trim() !== '')
+  const names = frames.map((frame) => /^event:\s*(.+)$/m.exec(frame)?.[1]?.trim())
+  check('/btw.stream 先 delta 后 done', names[0] === 'delta' && names[names.length - 1] === 'done', names.join(','))
+  const done = JSON.parse(frames[frames.length - 1].split('\n').find((line) => line.startsWith('data:')).slice(5))
+  check('/btw.stream 的 done 帧携带完整信封', done.ok === true && done.value.text === '流式答案')
+}
+
+{
+  const ctx = makeCtx([btwStep('ok')])
+  registerRoutes(ctx)
+  check('/btw.history 对新会话回空历史', JSON.stringify((await call(ctx, '/btw.history', { sessionId: 'session-a' })).json?.value?.topics) === '[]')
+  const saved = (await call(ctx, '/btw.save', { sessionId: 'session-a', question: '一问', answer: '一答' })).json
+  check('/btw.save 新建话题并回传 id', saved?.value?.topicId !== '' && saved.value.topics.length === 1 && saved.value.disabled === false)
+  const topicId = saved.value.topicId
+  const again = (await call(ctx, '/btw.save', { sessionId: 'session-a', topicId, question: '二问', answer: '二答' })).json
+  check('/btw.save 带 topicId 时追加到同一话题', again.value.topicId === topicId && again.value.topics[0].turns.length === 2)
+  const history = (await call(ctx, '/btw.history', { sessionId: 'session-a' })).json
+  check('/btw.history 读回已保存的轮次', history.value.topics[0].turns[1].q === '二问' && history.value.saveHistory === true)
+  check('/btw.save 拒绝空答案', (await call(ctx, '/btw.save', { sessionId: 'session-a', question: 'q', answer: '  ' })).json?.error?.code === 'bad-request')
+  check('/btw.clear 清空该会话历史', (await call(ctx, '/btw.clear', { sessionId: 'session-a' })).json?.value?.topics.length === 0
+    && store.btwTopics('session-a').length === 0)
+}
+
+{
+  const ctx = makeCtx([btwStep('ok')])
+  registerRoutes(ctx)
+  await call(ctx, '/save', { btwSaveHistory: false })
+  const res = await call(ctx, '/btw.save', { sessionId: 'session-off', question: 'q', answer: 'a' })
+  check('关闭历史保存时不落盘、也不报错', res.json?.value?.disabled === true && res.json.value.saved === false && store.btwTopics('session-off').length === 0)
+  await call(ctx, '/save', { btwSaveHistory: true })
+}
+
 /* ───────────────────────── 4. browser half ───────────────────────── */
 
 section('4. 浏览器半区')
@@ -561,6 +717,8 @@ const STATE = {
       applyMode: 'auto',
       route: 'plugin',
       shortcut: true,
+      btwContextTurns: 8,
+      btwSaveHistory: true,
     },
     defaultSystemPrompt: prompt.DEFAULT_SYSTEM_PROMPT,
     custom: false,
@@ -575,6 +733,15 @@ const STATE = {
     agentTemplate: { text: prompt.AGENT_TEMPLATE, placeholder: prompt.AGENT_TEMPLATE_PLACEHOLDER },
     configFile: store.CONFIG_FILE,
     limits: { maxDraftChars: prompt.MAX_DRAFT_CHARS, maxSystemPromptChars: prompt.MAX_SYSTEM_PROMPT_CHARS },
+    btw: {
+      contextTurns: 8,
+      saveHistory: true,
+      contextTurnChoices: [...store.BTW_CONTEXT_CHOICES],
+      maxQuestionChars: prompt.MAX_BTW_QUESTION_CHARS,
+      maxContextChars: prompt.MAX_BTW_CONTEXT_CHARS,
+      historyFile: store.BTW_HISTORY_FILE,
+      prompt: prompt.BTW_SYSTEM_PROMPT,
+    },
   },
 }
 
@@ -614,6 +781,49 @@ function makeFetch(options = {}) {
       if (typeof options.json === 'function') return new Response(JSON.stringify(options.json(seen[seen.length - 1])), { status: 200 })
       return new Response(JSON.stringify({ ok: true, value: { text: 'JSON 回退结果', assumptions: null, timings: { totalMs: 900, firstTextMs: 300 }, originalChars: 4, optimizedChars: 6 } }), { status: 200 })
     }
+    if (action === 'btw.stream') {
+      if (options.noStream === true) return new Response('nope', { status: 404 })
+      if (options.btwFailed === true) {
+        return sseResponse([['failed', { ok: false, error: { code: 'timeout', message: '超时' } }]])
+      }
+      return sseResponse([
+        ['delta', { text: '旁路' }],
+        ['delta', { text: options.btwAnswer ?? '旁路答案', final: true }],
+        ['done', {
+          ok: true,
+          value: {
+            text: options.btwAnswer ?? '旁路答案',
+            provider: 'deepseek-official',
+            model: 'deepseek-flash',
+            effort: 'off',
+            historyTurns: 0,
+            contextChars: 0,
+            timings: { routeMs: 1, totalMs: 800, firstTextMs: 260, reasoningChars: 0, attempts: 1 },
+          },
+        }],
+      ])
+    }
+    if (action === 'btw') {
+      return new Response(JSON.stringify({ ok: true, value: { text: 'JSON 旁路回退', timings: { totalMs: 700, firstTextMs: 240 } } }), { status: 200 })
+    }
+    if (action === 'btw.history') {
+      return new Response(JSON.stringify({ ok: true, value: { topics: options.btwTopics ?? [], saveHistory: options.btwSaveHistory !== false } }), { status: 200 })
+    }
+    if (action === 'btw.save') {
+      const body = seen[seen.length - 1].body ?? {}
+      return new Response(JSON.stringify({
+        ok: true,
+        value: {
+          topicId: options.btwTopicId ?? 'topic-1',
+          topics: [{ id: options.btwTopicId ?? 'topic-1', at: 1, turns: [{ q: body.question, a: body.answer, at: 1 }] }],
+          saved: true,
+          disabled: false,
+        },
+      }), { status: 200 })
+    }
+    if (action === 'btw.clear') {
+      return new Response(JSON.stringify({ ok: true, value: { topics: [], saved: true } }), { status: 200 })
+    }
     return new Response('{}', { status: 404 })
   }
   fetchImpl.seen = seen
@@ -621,7 +831,7 @@ function makeFetch(options = {}) {
 }
 
 /** Fake slot props around a mutable input state. */
-function makeInput(initial = {}) {
+function makeInput(initial = {}, chatNodes = []) {
   const state = { draft: '', phase: 'plain', draftRev: 1, occurrences: [], ...initial }
   const writes = []
   return {
@@ -630,6 +840,7 @@ function makeInput(initial = {}) {
     props: {
       sessionId: 'session-a',
       useInput: (selector) => (selector === undefined ? state : selector(state)),
+      useChat: (selector) => selector({ legacy: { nodes: chatNodes } }),
       inputActions: {
         setDraft(text) {
           writes.push(text)
@@ -838,6 +1049,155 @@ function makeInput(initial = {}) {
   const textarea = findAll(page, (node) => node.type === 'textarea')[0]
   check('自定义提示词框留空（不预填默认）', textarea !== undefined && textarea.props.value === '')
   check('设置页可展开查看内置默认', textOf(page).includes('查看内置默认提示词'))
+  bundle.__restore()
+}
+
+/* ── 旁路提问（浏览器半区） ── */
+
+/** One conversation node in the shape the chat snapshot publishes. */
+const userNode = (text) => ({ kind: 'user', seq: 1, time: 1, content: [{ type: 'text', text }] })
+const assistantNode = (text) => ({ kind: 'assistant', seq: 2, time: 2, turns: 1, blocks: [{ kind: 'text', text }], turn: 1, step: 1 })
+
+{
+  // The context reducer is pure, so it is checked without a component.
+  const bundle = loadClientBundle(makeFetch())
+  const nodes = [
+    userNode('把登录页改快一点'),
+    assistantNode('好的，先看首屏加载'),
+    { kind: 'tool', seq: 3, time: 3 }, // tool rows never travel
+    { kind: 'context', seq: 4, time: 4, content: [{ type: 'text', text: '系统注入' }] },
+    userNode('那用懒加载'),
+  ]
+  const carried = bundle.btwContext(nodes, 8)
+  check('上下文带用户与助手文本', carried.text.includes('用户：把登录页改快一点') && carried.text.includes('助手：好的，先看首屏加载'))
+  check('上下文丢掉工具行与系统注入', !carried.text.includes('系统注入') && !carried.text.includes('tool'))
+  check('上下文按条数截取最近的消息', bundle.btwContext(nodes, 2).text.includes('那用懒加载') && !bundle.btwContext(nodes, 2).text.includes('把登录页改快一点') && bundle.btwContext(nodes, 2).messages === 2)
+  check('档位 0 时完全不读会话', bundle.btwContext(nodes, 0).text === '' && bundle.btwContext(nodes, 0).messages === 0)
+  check('空记录不会报错', bundle.btwContext(undefined, 8).text === '')
+  bundle.__restore()
+}
+
+{
+  const fetchImpl = makeFetch()
+  const bundle = loadClientBundle(fetchImpl)
+  await bundle.settingsStore.load(true)
+  const input = makeInput({ draft: '' })
+  const button = buttonsOf(bundle.BtwButton(input.props))[0]
+  check('工具行渲染出旁路提问按钮', labelOf(button).includes('旁路提问'))
+  check('按钮标题带 Alt+B', String(button.props.title).includes('Alt+B'))
+  check('面板默认不渲染（关闭态零占位）', bundle.BtwPanel(input.props) === null)
+  button.props.onClick()
+  check('点按钮即打开该会话的面板', bundle.readBtw('session-a').open === true)
+  const panel = bundle.BtwPanel(input.props)
+  check('打开后是浮层卡片而不是模态', panel !== null && panel.props.className === 'dspo-btw')
+  check('面板说明答案不会进入主对话', textOf(panel).includes('不写进主对话'))
+  check('读不到会话记录时明说，而不是假装带了上下文', textOf(panel).includes('读不到会话记录'))
+  bundle.__restore()
+}
+
+{
+  const fetchImpl = makeFetch()
+  const bundle = loadClientBundle(fetchImpl)
+  await bundle.settingsStore.load(true)
+  const input = makeInput({}, [userNode('把登录页改快一点'), assistantNode('好的')])
+  bundle.openBtw('session-a')
+  bundle.patchBtw('session-a', { draft: '登录页改了吗？' })
+  const panel = bundle.BtwPanel(input.props)
+  const askButton = buttonsOf(panel).find((candidate) => labelOf(candidate).trim() === '提问')
+  check('面板提供「提问」按钮', askButton !== undefined)
+  askButton.props.onClick()
+  const started = Date.now()
+  while (bundle.readBtw('session-a').phase === 'asking' && Date.now() - started < 4000) {
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  const session = bundle.readBtw('session-a')
+  check('旁路提问流出答案', session.phase === 'done' && session.thread[0].a === '旁路答案', JSON.stringify(session.thread))
+  const request = fetchImpl.seen.find((entry) => entry.action === 'btw.stream')
+  check('请求带上问题、上下文与会话 id', request?.body?.question === '登录页改了吗？'
+    && request.body.context.includes('把登录页改快一点')
+    && request.body.sessionId === 'session-a')
+  check('问题发出后输入框被清空（避免重复提交）', session.draft === '')
+  const answerSaved = fetchImpl.seen.find((entry) => entry.action === 'btw.save')
+  check('答案落进旁路历史', answerSaved?.body?.answer === '旁路答案' && answerSaved.body.question === '登录页改了吗？')
+  check('采用宿主回传的话题 id', session.topicId === 'topic-1' && session.topics.length === 1)
+  check('面板显示实际携带的消息条数', textOf(bundle.BtwPanel(input.props)).includes('已带 2 条会话消息'))
+  bundle.__restore()
+}
+
+{
+  const fetchImpl = makeFetch()
+  const bundle = loadClientBundle(fetchImpl)
+  await bundle.settingsStore.load(true)
+  const input = makeInput({}, [userNode('上下文')])
+  bundle.openBtw('session-a')
+  bundle.patchBtw('session-a', { draft: '空问题不该发出' })
+  bundle.patchBtw('session-a', { draft: '   ' })
+  const panel = bundle.BtwPanel(input.props)
+  const askButton = buttonsOf(panel).find((candidate) => labelOf(candidate).trim() === '提问')
+  check('空白问题禁用「提问」', askButton.props.disabled === true)
+  bundle.__restore()
+}
+
+{
+  const fetchImpl = makeFetch({ btwTopics: [{ id: 't-old', at: 1, turns: [{ q: '历史问题', a: '历史答案', at: 1 }] }] })
+  const bundle = loadClientBundle(fetchImpl)
+  await bundle.settingsStore.load(true)
+  const input = makeInput({}, [userNode('上下文')])
+  bundle.openBtw('session-a')
+  const started = Date.now()
+  while (bundle.readBtw('session-a').loaded !== true && Date.now() - started < 4000) {
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  const panel = bundle.BtwPanel(input.props)
+  const historyButton = buttonsOf(panel).find((candidate) => labelOf(candidate).trim() === '历史')
+  check('面板提供「历史」入口', historyButton !== undefined)
+  historyButton.props.onClick()
+  const withHistory = bundle.BtwPanel(input.props)
+  const topicButton = buttonsOf(withHistory).find((candidate) => labelOf(candidate).includes('历史问题'))
+  check('历史列出已存话题', topicButton !== undefined)
+  topicButton.props.onClick()
+  const reopened = bundle.BtwPanel(input.props)
+  check('点历史话题即载回该话题的轮次', textOf(reopened).includes('历史答案'))
+  const newButton = buttonsOf(reopened).find((candidate) => labelOf(candidate).trim() === '新问题')
+  newButton.props.onClick()
+  check('「新问题」清空当前话题', bundle.readBtw('session-a').thread.length === 0 && bundle.readBtw('session-a').topicId === '')
+  bundle.__restore()
+}
+
+{
+  const fetchImpl = makeFetch()
+  const bundle = loadClientBundle(fetchImpl)
+  await bundle.settingsStore.load(true)
+  const input = makeInput({}, [userNode('上下文')])
+  bundle.openBtw('session-a')
+  bundle.patchBtw('session-a', {
+    thread: [{ q: '问题', a: '一条回答', state: 'done' }],
+    phase: 'done',
+  })
+  const panel = bundle.BtwPanel(input.props)
+  const toComposer = buttonsOf(panel).find((candidate) => labelOf(candidate).trim() === '写入输入框')
+  check('答案提供「写入输入框」', toComposer !== undefined)
+  toComposer.props.onClick()
+  check('写入走 inputActions.setDraft（不碰编辑器 DOM）', input.writes.includes('一条回答') && input.state.draft === '一条回答')
+  bundle.__restore()
+}
+
+{
+  const fetchImpl = makeFetch({ btwFailed: true })
+  const bundle = loadClientBundle(fetchImpl)
+  await bundle.settingsStore.load(true)
+  const input = makeInput({}, [userNode('上下文')])
+  bundle.openBtw('session-a')
+  bundle.patchBtw('session-a', { draft: '会失败的问题' })
+  const panel = bundle.BtwPanel(input.props)
+  buttonsOf(panel).find((candidate) => labelOf(candidate).trim() === '提问').props.onClick()
+  const started = Date.now()
+  while (bundle.readBtw('session-a').phase === 'asking' && Date.now() - started < 4000) {
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  const session = bundle.readBtw('session-a')
+  check('失败时如实显示错误而不是静默', session.phase === 'error' && session.thread[0].state === 'error')
+  check('失败的时刻用错误文案回显', textOf(bundle.BtwPanel(input.props)).includes('超时'))
   bundle.__restore()
 }
 
