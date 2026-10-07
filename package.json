@@ -1,7 +1,7 @@
 {
   "name": "dsh-prompt-tuner",
   "version": "0.1.0",
-  "description": "Composer prompt tuner for the DSH Web GUI: rewrites the input draft through a model you choose (by default the session's own), with the model, reasoning effort, rewrite style and optimization prompt configured on a settings page",
+  "description": "A personal DSH Web plugin suite for the composer: prompt rewriting (streamed through a model you choose, by default the session's own) plus read-only side questions, with every knob on one settings page",
   "type": "module",
   "main": "./lib/index.js",
   "files": [
@@ -23,6 +23,7 @@
   "keywords": [
     "dsh",
     "dsh-plugin",
+    "dsh-plugin-suite",
     "deepseek-harness",
     "prompt",
     "composer"

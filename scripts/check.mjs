@@ -87,6 +87,23 @@ check('无 execCommand（不碰编辑器 DOM 内部）', !clientSource.includes(
 check('无 textarea.value 直接写值', !/\.value\s*=/.test(clientSource))
 check('草稿唯一写入口是 inputActions.setDraft', (clientSource.match(/setDraft\?\.\(/g) ?? []).length >= 3)
 check('client 路由前缀与 host 一致', clientSource.includes("const ROUTE = 'dsh-prompt-optimizer/'") && routeSource.includes("export const ROUTE_PREFIX = '/dsh-prompt-optimizer'"))
+
+// The project was repositioned from a single-purpose prompt optimizer to a
+// personal DSH plugin suite. The old display name must not survive anywhere —
+// so it is spelled out of pieces here: a literal would make this very file the
+// one remaining hit of the search the rename has to pass.
+const OLD_PROJECT_NAME = ['提示词', '优化'].join('')
+const readmeSource = read('README.md')
+check('旧项目名在仓库里已无残留（README / 两个半区 / 清单）',
+  [readmeSource, clientSource, hostSource, routeSource, promptSource, storeSource, JSON.stringify(pkg)]
+    .every((text) => !text.includes(OLD_PROJECT_NAME)))
+check('设置页用集合名（导航与标题）',
+  clientSource.includes("settingsNav: '插件优化集合'")
+  && clientSource.includes("settingsTitle: 'DSH 插件优化集合'")
+  && clientSource.includes("settingsNav: 'Plugin suite'"))
+check('指向设置页的报错文案已跟着改名', !routeSource.includes(OLD_PROJECT_NAME) && routeSource.includes('设置 → 插件优化集合'))
+check('README 以集合定位起头并留下标识符不变的说明',
+  readmeSource.startsWith('# DSH 插件优化集合') && readmeSource.includes('标识符保持不变'))
 check('client 读草稿芯片（occurrences）以守卫整稿替换', clientSource.includes('state.occurrences'))
 check('client 读 draftRev 实现「只在草稿未变时自动替换」', clientSource.includes('state.draftRev'))
 
@@ -1301,6 +1318,9 @@ const assistantNode = (text) => ({ kind: 'assistant', seq: 2, time: 2, turns: 1,
   const answerSaved = fetchImpl.seen.find((entry) => entry.action === 'btw.save')
   check('答案落进旁路历史', answerSaved?.body?.answer === '旁路答案' && answerSaved.body.question === '登录页改了吗？')
   check('采用宿主回传的话题 id', session.topicId === 'topic-1' && session.topics.length === 1)
+  // The walk is what makes "all" true; this case checks the seat's own label for
+  // a completed window (the walk has its own cases further down).
+  bundle.patchBtw('session-a', { historyStatus: 'complete' })
   check('面板显示「全部历史」的条数', textOf(bundle.BtwPanel(input.props)).includes('已带全部 2 条会话消息'))
   // The read-only contract on this half: asking never writes to the composer.
   // (The composer is only touched by the explicit 「写入输入框」 button.)
@@ -1444,6 +1464,172 @@ const assistantNode = (text) => ({ kind: 'assistant', seq: 2, time: 2, turns: 1,
   toComposer.props.onClick()
   check('写入走 inputActions.setDraft（不碰编辑器 DOM）', input.writes.includes('一条回答') && input.state.draft === '一条回答')
   check('这是该面板唯一一次写入，且由用户点击触发', input.writes.length === 1)
+  bundle.__restore()
+}
+
+/* ── the transcript window: entering a conversation loads all of it ── */
+
+/** A tick long enough for the walk's awaits to settle. */
+const settleTicks = () => new Promise((resolve) => setTimeout(resolve, 20))
+
+/**
+ * A fake shell session face: `loadOlder()` prepends one fixture page into the
+ * very array the panel reads as chat nodes, which is what the real window does
+ * to the chat snapshot. `stall` models a page request that never changes
+ * anything (an exhausted window that keeps claiming more).
+ */
+function makeSessionFace(pages, options = {}) {
+  const state = { hasMore: options.hasMore ?? pages.length > 0, loadingOlder: false, calls: 0 }
+  const listeners = new Set()
+  // The real face caches its snapshot reference until the window changes; the
+  // walk's no-progress guard compares references, so the fixture must too.
+  let snapshot = { hasMore: state.hasMore, loadingOlder: false }
+  const publish = () => {
+    snapshot = { hasMore: state.hasMore, loadingOlder: state.loadingOlder }
+    for (const listener of [...listeners]) listener()
+  }
+  return {
+    state,
+    loadOlder: async () => {
+      state.calls += 1
+      if (options.stall === true) return
+      const page = pages.shift() ?? []
+      if (options.into !== undefined) options.into.unshift(...page)
+      state.hasMore = pages.length > 0
+      publish()
+    },
+    getSnapshot: () => snapshot,
+    subscribe: (listener) => {
+      listeners.add(listener)
+      return () => listeners.delete(listener)
+    },
+  }
+}
+
+/** A fake client context exposing the `sessions` service the walk needs. */
+function makeClientCtx(face) {
+  return {
+    get: (name) => (name === 'sessions' && face !== null ? { scope: () => face } : undefined),
+    effect: (fn) => {
+      fn()
+      return () => {}
+    },
+    slots: { inject: () => () => {}, register: () => () => {} },
+  }
+}
+
+{
+  // The whole point: nobody scrolled, and the window still ends up covering the
+  // session's first event.
+  const bundle = loadClientBundle(makeFetch())
+  const nodes = []
+  const face = makeSessionFace(
+    [
+      [assistantNode('最早的一条'), userNode('第二条')],
+      [assistantNode('第三条'), userNode('最近一条')],
+    ],
+    { into: nodes },
+  )
+  const result = await bundle.ensureFullHistory('session-a', makeClientCtx(face))
+  check('补历史：一路拉回最早一页', result.status === 'complete' && result.pages === 2 && face.state.calls === 2, JSON.stringify(result))
+  check('补历史：拉完后不再有更早的分页', face.state.hasMore === false)
+  check('补历史：窗口里现在连最早那条都在', bundle.btwContext(nodes, 'all').messages === 4
+    && bundle.btwContext(nodes, 'all').text.includes('最早的一条'))
+  check('补历史：状态写成 complete', bundle.readBtw('session-a').historyStatus === 'complete')
+}
+
+{
+  // A page that changes nothing must end the walk, not spin it.
+  const bundle = loadClientBundle(makeFetch())
+  const face = makeSessionFace([], { stall: true, hasMore: true })
+  const result = await bundle.ensureFullHistory('session-a', makeClientCtx(face))
+  check('补历史：分页不前进时不打转，如实报 partial', result.status === 'partial' && face.state.calls === 1, JSON.stringify(result))
+  check('补历史：partial 写进面板状态', bundle.readBtw('session-a').historyStatus === 'partial')
+}
+
+{
+  // Two seats mounting at once (a session switch mid-walk, an ask that arrives
+  // early) must join one walk, not page the same window twice.
+  const bundle = loadClientBundle(makeFetch())
+  const nodes = []
+  const face = makeSessionFace([[assistantNode('更早的')]], { into: nodes })
+  const [first, second] = await Promise.all([
+    bundle.ensureFullHistory('session-a', makeClientCtx(face)),
+    bundle.ensureFullHistory('session-a', makeClientCtx(face)),
+  ])
+  check('并发补历史只走一遍（两个座位挂载时）', face.state.calls === 1 && first === second && first.status === 'complete', String(face.state.calls))
+}
+
+{
+  // A shell without the sessions service is not an activation failure: the
+  // panel just has to stop calling a window "all of it".
+  const bundle = loadClientBundle(makeFetch())
+  const result = await bundle.ensureFullHistory('session-a', { get: () => undefined })
+  check('补历史：读不到 sessions 服务时报 unavailable', result.status === 'unavailable'
+    && bundle.readBtw('session-a').historyStatus === 'unavailable')
+}
+
+{
+  // Mounting the seat is the trigger, and the accept path carries the grown
+  // transcript — the acceptance criterion for this feature.
+  const fetchImpl = makeFetch({ btwAnswer: '好的' })
+  const bundle = loadClientBundle(fetchImpl)
+  await bundle.settingsStore.load(true)
+  const nodes = [assistantNode('最近一条')]
+  const face = makeSessionFace([[assistantNode('最早的一条'), userNode('第二条')]], { into: nodes })
+  bundle.apply(makeClientCtx(face))
+  const input = makeInput({}, nodes)
+  bundle.BtwButton(input.props)
+  await settleTicks()
+  check('进入会话即自动补历史（无需滚动）', face.state.calls === 1 && face.state.hasMore === false)
+  bundle.openBtw('session-a')
+  bundle.patchBtw('session-a', { draft: '最早那条讲的是什么？' })
+  check('补完后面板报「已带全部」', textOf(bundle.BtwPanel(input.props)).includes('已带全部 3 条会话消息'))
+  const panel = bundle.BtwPanel(input.props)
+  await buttonsOf(panel).find((candidate) => labelOf(candidate).trim() === '提问').props.onClick()
+  await settleTicks()
+  const request = fetchImpl.seen.find((entry) => entry.action === 'btw.stream')
+  check('提问带的是完整历史（含最早那条，不只是已加载的一页）',
+    request !== undefined && String(request.body.context).includes('最早的一条'))
+  check('提问回传的条数就是完整历史的条数', bundle.readBtw('session-a').carried === 3, String(bundle.readBtw('session-a').carried))
+  bundle.__restore()
+}
+
+{
+  // The labels are the honest half of the feature: while the window is short,
+  // the panel must not claim the whole transcript.
+  const bundle = loadClientBundle(makeFetch())
+  await bundle.settingsStore.load(true)
+  const input = makeInput({}, [userNode('第一条'), userNode('第二条')])
+  bundle.openBtw('session-a')
+  bundle.patchBtw('session-a', { historyStatus: 'loading' })
+  check('载入中时报「正在载入更早的历史…」', textOf(bundle.BtwPanel(input.props)).includes('正在载入更早的历史'))
+  bundle.patchBtw('session-a', { historyStatus: 'partial' })
+  check('没载完时报「已带当前已加载的 N 条（更早的历史未载完）」',
+    textOf(bundle.BtwPanel(input.props)).includes('已带当前已加载的 2 条会话消息（更早的历史未载完）'))
+  bundle.patchBtw('session-a', { historyStatus: 'unavailable' })
+  check('读不到加载器时只说手里有多少、不声称「全部」也不断言还缺',
+    textOf(bundle.BtwPanel(input.props)).includes('已带当前已加载的 2 条会话消息')
+    && !textOf(bundle.BtwPanel(input.props)).includes('已带全部')
+    && !textOf(bundle.BtwPanel(input.props)).includes('更早的历史未载完'))
+  bundle.patchBtw('session-a', { historyStatus: 'complete' })
+  check('载完了才说「已带全部」', textOf(bundle.BtwPanel(input.props)).includes('已带全部 2 条会话消息'))
+  bundle.__restore()
+}
+
+{
+  // "Carry nothing" means the transcript is not walked at all.
+  const bundle = loadClientBundle(makeFetch())
+  const face = makeSessionFace([[userNode('更早的')]], { into: [] })
+  bundle.apply(makeClientCtx(face))
+  STATE.value.settings.btwContextTurns = 0
+  await bundle.settingsStore.load(true)
+  const input = makeInput({}, [userNode('已加载的')])
+  bundle.BtwButton(input.props)
+  await settleTicks()
+  check('设置成「不带上下文」时不拉整段历史', face.state.calls === 0, String(face.state.calls))
+  STATE.value.settings.btwContextTurns = 'all'
+  await bundle.settingsStore.load(true)
   bundle.__restore()
 }
 
