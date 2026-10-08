@@ -629,6 +629,54 @@ store.clearBtwTopics('session-a')
   check('/btw 不给模型任何工具', ctx.calls[0].tools === undefined && ctx.calls[0].toolChoice === undefined)
   check('/btw 不需要任何写能力（宿主上下文里没有会话/agent/文件能力）',
     !('conversation' in ctx) && !('agent' in ctx) && !('fs' in ctx) && !('tools' in ctx))
+
+  // The side-question half's own model and effort. They are saved under `btw*`,
+  // applied to the next question, and read by nothing else — the rewrite keeps
+  // its own pair, and "not chosen" still falls back exactly like the rewrite's.
+  check('/btw 不设置旁路模型时回落到会话模型（与「优化提示词」的默认一致）',
+    ctx.calls[0].provider === 'deepseek-official' && ctx.calls[0].model === 'deepseek-flash'
+      && ctx.calls[0].reasoningEffort === 'off')
+  const rewriteBefore = await call(ctx, '/optimize', { text: '把登录页改快一点' })
+  const rewriteBeforeCall = ctx.calls.at(-1)
+  const settingsBefore = (await call(ctx, '/state', {})).json.value.settings
+  const btwSaved = (await call(ctx, '/save', { btwProvider: 'ccx', btwModel: 'ccx-1', btwReasoningEffort: 'high' })).json
+  check('/save 接受旁路提问自己的模型与强度',
+    btwSaved.value.settings.btwProvider === 'ccx' && btwSaved.value.settings.btwModel === 'ccx-1'
+      && btwSaved.value.settings.btwReasoningEffort === 'high')
+  check('/save 不因为旁路设置而改动「优化提示词」的设置',
+    ['provider', 'model', 'reasoningEffort', 'followSessionModel']
+      .every((key) => btwSaved.value.settings[key] === settingsBefore[key]),
+    ['provider', 'model', 'reasoningEffort', 'followSessionModel']
+      .map((key) => `${key}:${settingsBefore[key]}->${btwSaved.value.settings[key]}`).join(' '))
+  check('/state 分别上报两半的路由（btw.active 是旁路自己的那一份）',
+    btwSaved.value.btw.active?.provider === 'ccx' && btwSaved.value.btw.active?.model === 'ccx-1'
+      && (btwSaved.value.active?.provider !== 'ccx' || btwSaved.value.active?.model !== 'ccx-1'))
+  check('/state 的 btw.reasoning 是旁路路由自报的强度',
+    Array.isArray(btwSaved.value.btw.reasoning?.efforts) && btwSaved.value.btw.reasoning.efforts.includes('high'))
+  check('/save 拒绝非法旁路强度与非法旁路模型取值',
+    (await call(ctx, '/save', { btwReasoningEffort: 'ultra' })).json?.error?.code === 'bad-request'
+      && (await call(ctx, '/save', { btwProvider: 7 })).json?.error?.code === 'bad-request'
+      && (await call(ctx, '/save', { btwModel: 7 })).json?.error?.code === 'bad-request')
+  const btwCall = await call(ctx, '/btw', { question: '换个模型问问', context: '' })
+  const btwUsed = ctx.calls.at(-1)
+  check('/btw 用旁路提问自己的模型路由', btwUsed.provider === 'ccx' && btwUsed.model === 'ccx-1', `${btwUsed.provider}/${btwUsed.model}`)
+  check('/btw 用旁路提问自己的思考强度', btwUsed.reasoningEffort === 'high' && btwCall.json?.value?.effort === 'high')
+  const rewriteAfter = await call(ctx, '/optimize', { text: '把登录页改快一点' })
+  const rewriteAfterCall = ctx.calls.at(-1)
+  check('/btw 的模型与强度选择都不影响「优化提示词」',
+    rewriteAfter.json?.ok === true
+      && rewriteAfterCall.provider === rewriteBeforeCall.provider
+      && rewriteAfterCall.model === rewriteBeforeCall.model
+      && rewriteAfterCall.reasoningEffort === rewriteBeforeCall.reasoningEffort,
+    `${rewriteBeforeCall.provider}/${rewriteBeforeCall.model}/${rewriteBeforeCall.reasoningEffort} -> ${rewriteAfterCall.provider}/${rewriteAfterCall.model}/${rewriteAfterCall.reasoningEffort}`)
+  // Back to "not chosen": the fallback must be the rewrite's own fallback, which
+  // is what the acceptance criterion means by identical behaviour when unset.
+  await call(ctx, '/save', { btwProvider: null, btwModel: null, btwReasoningEffort: 'off' })
+  const backToDefault = await call(ctx, '/btw', { question: '回到默认', context: '' })
+  const fallbackUsed = ctx.calls.at(-1)
+  check('清空旁路模型后回落行为与「优化提示词」不设置时一致',
+    fallbackUsed.provider === 'deepseek-official' && fallbackUsed.model === 'deepseek-flash'
+      && fallbackUsed.reasoningEffort === 'off' && backToDefault.json?.value?.effort === 'off')
 }
 
 {
@@ -1431,7 +1479,7 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
   // some of these names, so raw text would double-count them. The shortcut row
   // renders `shortcutToggle` ("启用 Alt+O 触发优化"); `shortcutLabel` ("快捷键")
   // is in the dictionary but is not a row name, so it is not in this list.
-  const ROW_KEYS = ['followSession', 'modelLabel', 'effortLabel', 'styleLabelSetting', 'applyModeLabel', 'routeLabel', 'shortcutToggle', 'promptLabel', 'btwContextLabel', 'btwSaveHistoryLabel']
+  const ROW_KEYS = ['followSession', 'modelLabel', 'effortLabel', 'styleLabelSetting', 'applyModeLabel', 'routeLabel', 'shortcutToggle', 'promptLabel', 'btwModelLabel', 'btwEffortLabel', 'btwContextLabel', 'btwSaveHistoryLabel']
   const expectedRows = ROW_KEYS.map((key) => bundle.DICT.zh[key])
   const sets = TAB_IDS.map((id) => labelsByTab[id])
   const summary = TAB_IDS.map((id) => `${id}:[${labelsByTab[id].join('|')}]`).join(' ')
@@ -1441,7 +1489,7 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
       && sets.every((labels, index) => sets.slice(index + 1).every((other) => labels.every((label) => !other.includes(label)))),
     summary)
   const union = [...new Set(sets.flat())].sort()
-  check('四个页签的行标签并集恰好是词典里的 10 行（无遗漏、无重复）',
+  check('四个页签的行标签并集恰好是词典里的这 12 行（无遗漏、无重复）',
     union.length === ROW_KEYS.length && JSON.stringify(union) === JSON.stringify([...expectedRows].sort()),
     `${union.length}: ${union.join('|')}`)
 
@@ -1550,6 +1598,73 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
         && tab.props['data-active'] === (tab.props['aria-selected'] === true ? 'true' : undefined))
       && visiblePanels(keys).length === 1
       && visiblePanel(keys).props['aria-labelledby'] === selectedTab(keys).props.id)
+  bundle.__restore()
+}
+
+{
+  // 「旁路提问」自己的模型与强度：与「优化提示词」同形、同值、互不影响。
+  // Its own bundle with a host that accepts saves, so what the two pickers write
+  // is read off the requests themselves rather than off a fixture echo.
+  const fetchImpl = makeFetch({ saveOk: true })
+  const bundle = loadClientBundle(fetchImpl)
+  await bundle.settingsStore.load(true)
+  const render = mountClient(bundle, bundle.SettingsPanel)
+  const page = () => render({ close() {} })
+  const rail = (tree, id) => findAll(tree, (node) => node.props?.id === `dspo-tab-${id}`)[0]
+  const panelOf = (tree, id) => findAll(tree, (node) => node.props?.role === 'tabpanel' && node.props.id === `dspo-panel-${id}`)[0]
+  const openTab = (tree, id) => {
+    rail(tree, id).props.onClick()
+    return page()
+  }
+  const settle = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  }
+
+  let walk = openTab(page(), 'model')
+  walk = openTab(walk, 'btw')
+  const btwPanel = panelOf(walk, 'btw')
+  const modelPanel = panelOf(walk, 'model')
+  const btwProvider = findAll(btwPanel, (node) => node.props?.id === 'dspo-btw-provider')[0]
+  const btwModel = findAll(btwPanel, (node) => node.props?.id === 'dspo-btw-model-pick')[0]
+  const btwEffort = findAll(btwPanel, (node) => node.props?.id === 'dspo-btw-effort')[0]
+  const modelProvider = findAll(modelPanel, (node) => node.props?.id === 'dspo-provider')[0]
+  const modelPick = findAll(modelPanel, (node) => node.props?.id === 'dspo-model')[0]
+  const modelEffort = findAll(modelPanel, (node) => node.props?.id === 'dspo-effort')[0]
+  const labelsOf = (select) => (select?.children ?? []).map(textOf)
+  const valuesOf = (select) => (select?.children ?? []).map((option) => option.props.value)
+
+  check('旁路提问页签里有模型选择项（provider + model 两个下拉）',
+    btwProvider?.type === 'select' && btwModel?.type === 'select')
+  check('旁路提问页签里有思考强度选择项', btwEffort?.type === 'select')
+  check('两处模型可选值完全一致（同一份目录，逐个相同）',
+    JSON.stringify(labelsOf(btwProvider)) === JSON.stringify(labelsOf(modelProvider))
+      && JSON.stringify(labelsOf(btwModel)) === JSON.stringify(labelsOf(modelPick)),
+    `${labelsOf(btwModel).join(',')} vs ${labelsOf(modelPick).join(',')}`)
+  check('两处思考等级可选值完全一致（逐个相同）',
+    JSON.stringify(labelsOf(btwEffort)) === JSON.stringify(labelsOf(modelEffort))
+      && JSON.stringify(valuesOf(btwEffort)) === JSON.stringify(valuesOf(modelEffort)),
+    `${labelsOf(btwEffort).join(',')} vs ${labelsOf(modelEffort).join(',')}`)
+  check('两处的强度档位就是适配器自报的那一组',
+    JSON.stringify(valuesOf(btwEffort)) === JSON.stringify(STATE.value.reasoning.efforts))
+  check('旁路的模型与强度默认未选择（模型空值、强度 off，与「优化提示词」的默认一致）',
+    btwModel.props.value === '' && btwEffort.props.value === 'off' && modelEffort.props.value === 'off')
+
+  const lastSave = () => fetchImpl.seen.filter((entry) => entry.action === 'save').at(-1)?.body ?? null
+  btwEffort.props.onChange({ target: { value: 'high' } })
+  await settle()
+  check('改旁路思考强度只发 btwReasoningEffort',
+    JSON.stringify(lastSave()) === JSON.stringify({ btwReasoningEffort: 'high' }), JSON.stringify(lastSave()))
+  findAll(panelOf(page(), 'btw'), (node) => node.props?.id === 'dspo-btw-model-pick')[0]
+    .props.onChange({ target: { value: 'deepseek-pro' } })
+  await settle()
+  const patch = lastSave()
+  check('改旁路模型只发 btwProvider / btwModel',
+    JSON.stringify(patch) === JSON.stringify({ btwProvider: 'deepseek-official', btwModel: 'deepseek-pro' }),
+    JSON.stringify(patch))
+  check('改旁路的两项设置都不携带「优化提示词」的键',
+    patch !== null && !('provider' in patch) && !('model' in patch)
+      && !('reasoningEffort' in patch) && !('followSessionModel' in patch))
   bundle.__restore()
 }
 
