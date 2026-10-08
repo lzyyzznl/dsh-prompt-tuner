@@ -598,8 +598,9 @@ store.clearBtwTopics('session-a')
   const ctx = makeCtx([btwStep('旁路答案')])
   registerRoutes(ctx)
   const state = (await call(ctx, '/state', {})).json
-  check('/state 带旁路提问契约（档位、上限、历史文件、提示词）', Array.isArray(state.value.btw?.contextTurnChoices)
+  check('/state 带旁路提问契约（档位、历史文件、提示词；上下文无上限）', Array.isArray(state.value.btw?.contextTurnChoices)
     && state.value.btw.maxQuestionChars > 0
+    && state.value.btw.maxContextChars === undefined
     && typeof state.value.btw.historyFile === 'string'
     && typeof state.value.btw.prompt === 'string')
 
@@ -663,7 +664,8 @@ store.clearBtwTopics('session-a')
 }
 
 {
-  // Whole-session context: nothing is dropped by count, at either end.
+  // Whole-session context: nothing is dropped by count, at either end, and the
+  // host keeps no length ceiling of its own for the record to trip over.
   const ctx = makeCtx([btwStep('ok')])
   registerRoutes(ctx)
   const messages = Array.from({ length: 40 }, (_, index) => `用户：第 ${index} 条消息`)
@@ -674,10 +676,14 @@ store.clearBtwTopics('session-a')
   check('/btw 携带该话题的全部追问轮次（无条数截断）', res.json?.value?.historyTurns === 30
     && ctx.calls[0].messages.length === 61
     && ctx.calls[0].messages[0].content[0].text.includes('第 0 条消息'))
-  const overLong = await call(ctx, '/btw', { question: '问题', context: 'x'.repeat(prompt.MAX_BTW_CONTEXT_CHARS + 1) })
-  check('/btw 超长上下文响亮拒绝而不是静默截断', overLong.json?.error?.code === 'bad-request'
-    && String(overLong.json.error.message).includes('携带上下文')
-    && ctx.calls.length === 1)
+  // A session record can be longer than any budget the plugin could name, and
+  // refusing it would be a cap on the context by another name.
+  const hugeContext = `{"kind":"tool-result","content":[{"type":"text","text":"${'x'.repeat(1_200_000)}"}]}`
+  const huge = await call(ctx, '/btw', { question: '问题', context: hugeContext })
+  check('/btw 不再对上下文设上限（超长也原样收下，不拒绝也不截断）', huge.json?.ok === true
+    && huge.json.value.contextChars === hugeContext.length
+    && ctx.calls.at(-1).messages[0].content[0].text.includes(hugeContext)
+    && ctx.calls.length === 2)
 }
 
 {
@@ -963,7 +969,6 @@ const STATE = {
       saveHistory: true,
       contextTurnChoices: [...store.BTW_CONTEXT_CHOICES],
       maxQuestionChars: prompt.MAX_BTW_QUESTION_CHARS,
-      maxContextChars: prompt.MAX_BTW_CONTEXT_CHARS,
       historyFile: store.BTW_HISTORY_FILE,
       prompt: prompt.BTW_SYSTEM_PROMPT,
     },
@@ -1062,7 +1067,7 @@ function makeFetch(options = {}) {
 }
 
 /** Fake slot props around a mutable input state. */
-function makeInput(initial = {}, chatNodes = []) {
+function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
   const state = { draft: '', phase: 'plain', draftRev: 1, occurrences: [], ...initial }
   const writes = []
   return {
@@ -1071,7 +1076,7 @@ function makeInput(initial = {}, chatNodes = []) {
     props: {
       sessionId: 'session-a',
       useInput: (selector) => (selector === undefined ? state : selector(state)),
-      useChat: (selector) => selector({ legacy: { nodes: chatNodes } }),
+      useChat: (selector) => selector({ legacy: { nodes: chatNodes, ...legacyExtra } }),
       inputActions: {
         setDraft(text) {
           writes.push(text)
@@ -1406,7 +1411,7 @@ function makeInput(initial = {}, chatNodes = []) {
   const textarea = findAll(walk, (node) => node.type === 'textarea')[0]
   check('自定义提示词框留空（不预填默认）', textarea !== undefined && textarea.props.value === '')
   check('设置页可展开查看内置默认', textOf(walk).includes('查看内置默认提示词'))
-  check('设置页的上下文下拉默认选中「全部历史消息」', textOf(walk).includes('全部历史消息')
+  check('设置页的上下文下拉默认选中「全部历史记录」', textOf(walk).includes('全部历史记录')
     && findAll(walk, (node) => node.type === 'select').some((select) => select.props.value === 'all'))
 
   // What the lazy mounting buys: the panel is never unmounted, so a half-typed
@@ -1553,37 +1558,62 @@ function makeInput(initial = {}, chatNodes = []) {
 /** One conversation node in the shape the chat snapshot publishes. */
 const userNode = (text) => ({ kind: 'user', seq: 1, time: 1, content: [{ type: 'text', text }] })
 const assistantNode = (text) => ({ kind: 'assistant', seq: 2, time: 2, turns: 1, blocks: [{ kind: 'text', text }], turn: 1, step: 1 })
+/** A settled tool row: the real shape is the `tool-result` root of a `tool-call` node. */
+const toolNode = (callId, name, output) => ({
+  kind: 'tool-result',
+  seq: 3,
+  time: 3,
+  callId,
+  call: { name, argsRaw: `{"path":"${callId}.ts"}` },
+  content: [{ type: 'text', text: output }],
+  isError: false,
+  subCalls: [],
+})
 
 {
   // The context reducer is pure, so it is checked without a component.
   const bundle = loadClientBundle(makeFetch())
+  const mixedAssistant = {
+    ...assistantNode('好的，先看首屏加载'),
+    blocks: [
+      { kind: 'text', text: '好的，先看首屏加载' },
+      { kind: 'reasoning', text: '内部推理' },
+      { kind: 'tool-call', callId: 'call-1', name: 'read', argsRaw: '{"path":"src/login.tsx"}' },
+    ],
+  }
   const nodes = [
     userNode('把登录页改快一点'),
-    assistantNode('好的，先看首屏加载'),
-    { kind: 'tool', seq: 3, time: 3 }, // tool rows never travel
+    mixedAssistant,
+    toolNode('call-1', 'read', 'TOOL_OUTPUT'),
     { kind: 'context', seq: 4, time: 4, content: [{ type: 'text', text: '系统注入' }] },
     userNode('那用懒加载'),
   ]
   const carried = bundle.btwContext(nodes, 8)
-  check('上下文带用户与助手文本', carried.text.includes('用户：把登录页改快一点') && carried.text.includes('助手：好的，先看首屏加载'))
-  check('上下文丢掉工具行与系统注入', !carried.text.includes('系统注入') && !carried.text.includes('tool'))
-  check('上下文按条数截取最近的消息', bundle.btwContext(nodes, 2).text.includes('那用懒加载') && !bundle.btwContext(nodes, 2).text.includes('把登录页改快一点') && bundle.btwContext(nodes, 2).messages === 2)
+  check('上下文带用户与助手文本', carried.text.includes('把登录页改快一点') && carried.text.includes('好的，先看首屏加载'))
+  check('上下文是会话的原始记录（逐行 JSON，字段一个不少）',
+    carried.text.split('\n').every((line) => line.startsWith('{') && JSON.parse(line) !== null)
+    && carried.text.includes(JSON.stringify(nodes[2]))
+    && carried.text.includes(JSON.stringify(mixedAssistant)))
+  check('上下文原样带上工具调用与结果', carried.text.includes('src/login.tsx') && carried.text.includes('TOOL_OUTPUT'))
+  check('上下文原样带上推理与上下文注入（不再丢弃）', carried.text.includes('内部推理') && carried.text.includes('系统注入'))
+  check('上下文按条数截取最近的记录', bundle.btwContext(nodes, 2).text.includes('那用懒加载') && !bundle.btwContext(nodes, 2).text.includes('把登录页改快一点') && bundle.btwContext(nodes, 2).messages === 2)
   check('档位 0 时完全不读会话', bundle.btwContext(nodes, 0).text === '' && bundle.btwContext(nodes, 0).messages === 0)
   check('空记录不会报错', bundle.btwContext(undefined, 8).text === '')
-  // The default setting: everything, with no count cap and no character trimming.
+  // The default setting: every record, with no count cap and no character trimming.
   const all = bundle.btwContext(nodes, 'all')
-  check('「全部历史」把这条会话的消息全部带上', all.messages === 3
-    && all.text.includes('用户：把登录页改快一点')
-    && all.text.includes('助手：好的，先看首屏加载')
-    && all.text.includes('用户：那用懒加载'))
+  check('「全部历史」把这条会话的记录全部带上', all.messages === 5
+    && all.text.includes('把登录页改快一点')
+    && all.text.includes('TOOL_OUTPUT')
+    && all.text.includes('系统注入')
+    && all.text.includes('那用懒加载'))
   const many = []
   for (let index = 0; index < 120; index += 1) {
     many.push(index % 2 === 0 ? userNode(`第 ${index} 条`) : assistantNode(`第 ${index} 条`))
   }
-  many.push(assistantNode('长'.repeat(20_000)))
+  many.push(toolNode('call-big', 'read', '长'.repeat(20_000)))
   const everything = bundle.btwContext(many, 'all')
   check('「全部历史」不按条数截断（120 条全在）', everything.messages === 121 && everything.text.includes('第 0 条'))
-  check('「全部历史」单条也不做字符截断', everything.text.includes('长'.repeat(20_000)))
+  check('「全部历史」单条也不做字符截断（工具结果也一样）', everything.text.includes('长'.repeat(20_000)))
   bundle.__restore()
 }
 
@@ -1615,7 +1645,10 @@ const assistantNode = (text) => ({ kind: 'assistant', seq: 2, time: 2, turns: 1,
   const fetchImpl = makeFetch()
   const bundle = loadClientBundle(fetchImpl)
   await bundle.settingsStore.load(true)
-  const input = makeInput({}, [userNode('把登录页改快一点'), assistantNode('好的')])
+  const input = makeInput({}, [userNode('把登录页改快一点'), assistantNode('好的')], {
+    runningCalls: [{ phase: 'start', callId: 'call-9', name: 'bash', argsRaw: '{"command":"npm test"}', turn: 1, step: 2, time: 9, subCalls: [] }],
+    partial: { turn: 1, step: 2, blocks: [{ kind: 'text', text: '正在跑测试' }] },
+  })
   bundle.openBtw('session-a')
   bundle.patchBtw('session-a', { draft: '登录页改了吗？' })
   const panel = bundle.BtwPanel(input.props)
@@ -1632,6 +1665,8 @@ const assistantNode = (text) => ({ kind: 'assistant', seq: 2, time: 2, turns: 1,
   check('请求带上问题、上下文与会话 id', request?.body?.question === '登录页改了吗？'
     && request.body.context.includes('把登录页改快一点')
     && request.body.sessionId === 'session-a')
+  check('进行中的工具调用与流式文本也随上下文发出', request?.body?.context.includes('npm test')
+    && request.body.context.includes('正在跑测试'))
   check('问题发出后输入框被清空（避免重复提交）', session.draft === '')
   const answerSaved = fetchImpl.seen.find((entry) => entry.action === 'btw.save')
   check('答案落进旁路历史', answerSaved?.body?.answer === '旁路答案' && answerSaved.body.question === '登录页改了吗？')
@@ -1639,7 +1674,7 @@ const assistantNode = (text) => ({ kind: 'assistant', seq: 2, time: 2, turns: 1,
   // The walk is what makes "all" true; this case checks the seat's own label for
   // a completed window (the walk has its own cases further down).
   bundle.patchBtw('session-a', { historyStatus: 'complete' })
-  check('面板显示「全部历史」的条数', textOf(bundle.BtwPanel(input.props)).includes('已带全部 2 条会话消息'))
+  check('面板显示「全部历史」的条数', textOf(bundle.BtwPanel(input.props)).includes('已带全部 4 条会话记录'))
   // The read-only contract on this half: asking never writes to the composer.
   // (The composer is only touched by the explicit 「写入输入框」 button.)
   check('提问本身不写输入框', input.writes.length === 0 && input.state.draftRev === 1)
@@ -1656,7 +1691,7 @@ const assistantNode = (text) => ({ kind: 'assistant', seq: 2, time: 2, turns: 1,
   bundle.openBtw('session-a')
   const panel = bundle.BtwPanel(input.props)
   const text = textOf(panel)
-  check('收窄到最近 N 条时如实标注条数', text.includes('已带最近 4 条会话消息') && !text.includes('已带全部'))
+  check('收窄到最近 N 条时如实标注条数', text.includes('已带最近 4 条会话记录') && !text.includes('已带全部'))
   bundle.patchBtw('session-a', { draft: '只看最近几条' })
   const asking = bundle.BtwPanel(input.props)
   buttonsOf(asking).find((candidate) => labelOf(candidate).trim() === '提问').props.onClick()
@@ -1665,7 +1700,7 @@ const assistantNode = (text) => ({ kind: 'assistant', seq: 2, time: 2, turns: 1,
     await new Promise((resolve) => setTimeout(resolve, 5))
   }
   const request = fetchImpl.seen.find((entry) => entry.action === 'btw.stream')
-  check('收窄时只发最近 N 条消息', request?.body?.context.includes('三') && !request.body.context.includes('一'))
+  check('收窄时只发最近 N 条记录', request?.body?.context.includes('三') && !request.body.context.includes('一'))
   STATE.value.settings.btwContextTurns = 'all'
   bundle.__restore()
 }
@@ -1902,7 +1937,7 @@ function makeClientCtx(face) {
   check('进入会话即自动补历史（无需滚动）', face.state.calls === 1 && face.state.hasMore === false)
   bundle.openBtw('session-a')
   bundle.patchBtw('session-a', { draft: '最早那条讲的是什么？' })
-  check('补完后面板报「已带全部」', textOf(bundle.BtwPanel(input.props)).includes('已带全部 3 条会话消息'))
+  check('补完后面板报「已带全部」', textOf(bundle.BtwPanel(input.props)).includes('已带全部 3 条会话记录'))
   const panel = bundle.BtwPanel(input.props)
   await buttonsOf(panel).find((candidate) => labelOf(candidate).trim() === '提问').props.onClick()
   await settleTicks()
@@ -1924,14 +1959,14 @@ function makeClientCtx(face) {
   check('载入中时报「正在载入更早的历史…」', textOf(bundle.BtwPanel(input.props)).includes('正在载入更早的历史'))
   bundle.patchBtw('session-a', { historyStatus: 'partial' })
   check('没载完时报「已带当前已加载的 N 条（更早的历史未载完）」',
-    textOf(bundle.BtwPanel(input.props)).includes('已带当前已加载的 2 条会话消息（更早的历史未载完）'))
+    textOf(bundle.BtwPanel(input.props)).includes('已带当前已加载的 2 条会话记录（更早的历史未载完）'))
   bundle.patchBtw('session-a', { historyStatus: 'unavailable' })
   check('读不到加载器时只说手里有多少、不声称「全部」也不断言还缺',
-    textOf(bundle.BtwPanel(input.props)).includes('已带当前已加载的 2 条会话消息')
+    textOf(bundle.BtwPanel(input.props)).includes('已带当前已加载的 2 条会话记录')
     && !textOf(bundle.BtwPanel(input.props)).includes('已带全部')
     && !textOf(bundle.BtwPanel(input.props)).includes('更早的历史未载完'))
   bundle.patchBtw('session-a', { historyStatus: 'complete' })
-  check('载完了才说「已带全部」', textOf(bundle.BtwPanel(input.props)).includes('已带全部 2 条会话消息'))
+  check('载完了才说「已带全部」', textOf(bundle.BtwPanel(input.props)).includes('已带全部 2 条会话记录'))
   bundle.__restore()
 }
 
