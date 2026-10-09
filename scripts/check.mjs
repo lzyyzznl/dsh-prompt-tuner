@@ -147,13 +147,15 @@ const notifySummary = await import('../lib/notify-summary.js')
 section('2. 提示词与设置')
 
 const defaultPrompt = prompt.DEFAULT_SYSTEM_PROMPT
-for (const marker of ['判定', '保真', '补全', '冲突', '裁剪', '输出', '待确认', '不编造', '上下文', '输出语言']) {
+for (const marker of ['判定', '保真', '补全', '冲突', '裁剪', '输出', '待确认', '不编造', '上下文', '输出语言', '不替他加要求', '不替用户设禁止项', '补清用户已经想做的事', '不是输出的章节模板']) {
   check(`默认提示词含「${marker}」`, defaultPrompt.includes(marker))
 }
 // The six steps are the prompt's whole shape: read → keep → fill → resolve →
-// cut → state the contract. The measured text is shorter than the 22-rule
-// version it replaced (1379 vs 2187 chars), so the band is tightened to catch a
-// prompt that silently grows back into a rule list.
+// cut → state the contract. Two measurements shaped this text. The six-step
+// rewrite took it from 2187 to 1379 chars; the attribution audit that followed
+// found the field list being transcribed into the output as section headings and
+// answer contracts, which cost it three prohibitions. The band stays tight
+// enough to catch a prompt that grows back into a rule list.
 check('默认提示词长度在 1000-2200 字之间（六步骨架，测量后收紧）', defaultPrompt.length > 1000 && defaultPrompt.length < 2200, String(defaultPrompt.length))
 // One mode: the prompt is not specialized by any style directive any more, and
 // the old agent-route template is gone with the route itself.
