@@ -820,6 +820,48 @@ store.clearBtwTopics('session-a')
 
 section('3b. 压缩阈值与桌面通知')
 
+/**
+ * A context that behaves like cordis does for a service this plugin did NOT
+ * declare: reading `ctx.<name>` throws, while `ctx.get(name)` answers.
+ *
+ * That is the exact shape that made the completion watcher a silent no-op —
+ * `ctx.remote` threw, the throw was read as "no remote service", and the
+ * subscription was never installed. Both halves' guards are driven through it.
+ */
+function cordisLikeContext(services) {
+  const ctx = { get: (name) => services[name] }
+  return new Proxy(ctx, {
+    get(target, prop, receiver) {
+      if (typeof prop === 'string' && prop in services && prop !== 'get') {
+        throw new Error(`cannot get property "${prop}" without inject`)
+      }
+      return Reflect.get(target, prop, receiver)
+    },
+  })
+}
+
+{
+  const remote = { $on: () => () => {} }
+  const ctx = cordisLikeContext({ remote })
+  let bareThrew = false
+  try {
+    void ctx.remote
+  } catch {
+    bareThrew = true
+  }
+  check('守卫的对照：裸读 ctx.remote 抛错，ctx.get("remote") 才拿得到（cordis 语义）',
+    bareThrew === true && ctx.get('remote') === remote)
+  check('host 侧 configEditorOf 优先 ctx.get，裸读抛错时仍拿得到服务',
+    compaction.configEditorOf(cordisLikeContext({
+      configEditor: { entries: () => [], edit: async () => {} },
+    })) !== null)
+  check('host 侧 configEditorOf 对真正缺席的服务返回 null（不抛）',
+    compaction.configEditorOf(cordisLikeContext({})) === null)
+  check('host 侧 serviceOf 在 ctx.get 不可用时回落到属性读',
+    compaction.serviceOf({ plain: true }, 'plain') === true
+      && compaction.serviceOf({ get: () => undefined, plain: true }, 'plain') === true)
+}
+
 /* ── the fixed-token → ratio conversion ── */
 {
   const exact = compaction.compactionPolicy('deepseek-official', 'deepseek-pro', 250_000, 1_000_000)
@@ -1064,6 +1106,34 @@ section('3b. 压缩阈值与桌面通知')
       probe.json?.ok === true && probe.json.value.sent === false && typeof probe.json.value.skipped === 'string',
       JSON.stringify(probe.json?.value ?? null))
   }
+
+  // The regression this whole block guards: a host whose bare `ctx.configEditor`
+  // throws (cordis, because the plugin does not inject it) while `ctx.get` works.
+  // Reading the property first used to look exactly like "no config editor".
+  const editorCtx = makeCtx([], { contextWindow: 1_000_000 })
+  const editor = {
+    entries: () => [{ options: { id: 'compaction-basic', name: '@deepseek-ai/dsh-compaction-basic' } }],
+    edit: async () => {},
+  }
+  Object.defineProperty(editorCtx, 'configEditor', {
+    configurable: true,
+    get() {
+      throw new Error('cannot get property "configEditor" without inject')
+    },
+  })
+  Object.defineProperty(editorCtx, 'get', {
+    configurable: true,
+    value: (name) => (name === 'configEditor' ? editor : editorCtx[name]),
+  })
+  registerRoutes(editorCtx)
+  const strictState = await call(editorCtx, '/state', {})
+  check('/state 在「裸读抛错、只能 get」的宿主上仍报 configEditor 可用',
+    strictState.json?.value?.compaction?.configEditor === true,
+    JSON.stringify(strictState.json?.value?.compaction?.configEditor))
+  const strictApply = await call(editorCtx, '/compaction.apply', {})
+  check('/compaction.apply 在这种宿主上仍能写入（不再假报 unavailable）',
+    strictApply.json?.value?.applied?.ok === true && strictApply.json.value.applied.count === 1,
+    JSON.stringify(strictApply.json?.value?.applied ?? null))
 }
 
 
@@ -2503,17 +2573,32 @@ section('4b. 压缩与通知的浏览器半区')
   await wired.settingsStore.load(true)
   const handlers = []
   let disposed = false
-  const dispose = wired.watchCompletions({
-    remote: {
-      $on: (type, handler) => {
-        handlers.push({ type, handler })
-        return () => {
-          disposed = true
-        }
+  const remoteService = {
+    $on: (type, handler) => {
+      handlers.push({ type, handler })
+      return () => {
+        disposed = true
+      }
+    },
+  }
+  // The shape the real shell hands over: `remote` is not injected by this
+  // plugin, so a bare property read throws and only `ctx.get` answers. Reading
+  // the property first is what turned the watcher into a silent no-op.
+  const cordisCtx = new Proxy(
+    { get: (name) => (name === 'remote' ? remoteService : undefined) },
+    {
+      get(target, prop, receiver) {
+        if (prop === 'remote') throw new Error('cannot get property "remote" without inject')
+        return Reflect.get(target, prop, receiver)
       },
     },
-  })
-  check('订阅的是宿主会话状态通道', handlers.length === 1 && handlers[0].type === 'api-session/status', JSON.stringify(handlers.map((row) => row.type)))
+  )
+  const dispose = wired.watchCompletions(cordisCtx)
+  check('订阅的是宿主会话状态通道（裸读会抛错也照样订阅成功）',
+    handlers.length === 1 && handlers[0].type === 'api-session/status',
+    JSON.stringify(handlers.map((row) => row.type)))
+  check('client 侧 serviceOf 优先 ctx.get，裸读抛错时仍拿得到服务',
+    wired.serviceOf(cordisCtx, 'remote') === remoteService)
   handlers[0].handler('s1', false)
   await new Promise((resolve) => setTimeout(resolve, 0))
   check('会话首次为 false 是初始态，不当作完成', fetchCalls.filter((row) => row.action === 'notify').length === 0)

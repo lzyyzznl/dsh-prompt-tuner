@@ -262,13 +262,13 @@ thresholdRatio = 你要的 token 数 ÷ 该模型窗口大小
 ## 自检与基准
 
 ```sh
-npm run check                 # 435 项，含宿主路由、压缩/通知模块与浏览器半区
+npm run check                 # 442 项，含宿主路由、压缩/通知模块与浏览器半区
 npm run check:shape           # 对**已安装**的 DSH 复核旁路提问的消息形状（需要本机有 DSH）
 node scripts/bench.mjs --runs 3 --effort off
 node scripts/bench.mjs --runs 3 --effort auto     # 对照：省掉字段要多花多少时间
 ```
 
-自检不用测试框架，四层：**静态契约**（注入器按字面读取的 `slots.register` 调用（现为六处）、`dsh.bundle`、主题 token-only CSS、中英词典键一致、同座位不得重复 `id`、旧项目名已无残留）、**宿主路由**（假 `ctx`/假 HTTP 驱动真实 handler：失败阶梯、强度协商、预算、SSE 帧序、信任围栏、旁路提问的拒绝分支与历史落盘/清空，以及「全部历史原样收下、超长上下文既不拒绝也不截断、每个增量一帧、不给模型工具、assistant 轮次带 `source`、多轮形状被拒时改用单轮重问」，以及旁路提问自己的模型与强度：`/state` 分别上报两半的路由、`btw*` 只影响旁路提问、清空后回落与改写一致）、**压缩与通知模块**（固定 token → 该模型占比的换算与边界：窗口约掉后仍是同一个绝对数、超过窗口/超出范围/窗口未知分别被拒、`retainRatio` 恒小于 `thresholdRatio`、接近窗口上限时 capped、合并策略只覆盖同 route 并保留手写行、`configEditor` 写入与 `unavailable`/`entry-missing`/reconcile 抛错三条失败路径；平台判定 Linux/Windows/WSL/无桌面、Linux 命令 argv 无 shell、Windows `-EncodedCommand` 解回真实脚本且单引号翻倍、超长与控制字符先折叠；以及 `/state`、`/save`、`/compaction.windows`、`/compaction.apply`、`/notify`、`/notify.test` 六条路由的准入与拒绝）、**浏览器半区**（假 React + 假 fetch 执行真实组件：自动替换 vs 等待确认、会话隔离、撤销、芯片守卫、JSON 回退、i18n、旁路提问的原始记录携带与面板状态机，以及「进入会话就自动补齐历史、提问带的是补齐后的整段、工具调用及其结果原样在内、进行中的调用与流式文本也在内、分页不前进时如实报 partial、三种上下文标签各说各的真话、选『不带上下文』时不去拉历史」，以及设置页的页签分组：六组设置项**互不重叠、并集等于这 15 项**、两处模型/强度下拉的可选值逐个相同、写设置时只带 `btw*` 键、aria 连线与方向键走查、访问过的页签保持挂载，加上完成通知：摘要结构化提取、会话标题现读、`running → idle` 才发一次、初始 idle 与 idle → idle 都不发、无 `remote` 时静默降级）。
+自检不用测试框架，四层：**静态契约**（注入器按字面读取的 `slots.register` 调用（现为六处）、`dsh.bundle`、主题 token-only CSS、中英词典键一致、同座位不得重复 `id`、旧项目名已无残留）、**宿主路由**（假 `ctx`/假 HTTP 驱动真实 handler：失败阶梯、强度协商、预算、SSE 帧序、信任围栏、旁路提问的拒绝分支与历史落盘/清空，以及「全部历史原样收下、超长上下文既不拒绝也不截断、每个增量一帧、不给模型工具、assistant 轮次带 `source`、多轮形状被拒时改用单轮重问」，以及旁路提问自己的模型与强度：`/state` 分别上报两半的路由、`btw*` 只影响旁路提问、清空后回落与改写一致）、**压缩与通知模块**（固定 token → 该模型占比的换算与边界：窗口约掉后仍是同一个绝对数、超过窗口/超出范围/窗口未知分别被拒、`retainRatio` 恒小于 `thresholdRatio`、接近窗口上限时 capped、合并策略只覆盖同 route 并保留手写行、`configEditor` 写入与 `unavailable`/`entry-missing`/reconcile 抛错三条失败路径；平台判定 Linux/Windows/WSL/无桌面、Linux 命令 argv 无 shell、Windows `-EncodedCommand` 解回真实脚本且单引号翻倍、超长与控制字符先折叠；以及 `/state`、`/save`、`/compaction.windows`、`/compaction.apply`、`/notify`、`/notify.test` 六条路由的准入与拒绝）、**浏览器半区**（假 React + 假 fetch 执行真实组件：自动替换 vs 等待确认、会话隔离、撤销、芯片守卫、JSON 回退、i18n、旁路提问的原始记录携带与面板状态机，以及「进入会话就自动补齐历史、提问带的是补齐后的整段、工具调用及其结果原样在内、进行中的调用与流式文本也在内、分页不前进时如实报 partial、三种上下文标签各说各的真话、选『不带上下文』时不去拉历史」，以及设置页的页签分组：六组设置项**互不重叠、并集等于这 15 项**、两处模型/强度下拉的可选值逐个相同、写设置时只带 `btw*` 键、aria 连线与方向键走查、访问过的页签保持挂载，加上完成通知：摘要结构化提取、会话标题现读、`running → idle` 才发一次、初始 idle 与 idle → idle 都不发、无 `remote` 时静默降级，以及一条回归守卫——**服务只能经 `ctx.get` 拿到、裸读 `ctx.<name>` 会抛错**（cordis 对未 inject 的服务就是如此）时，订阅与写入仍必须成立）。
 
 **历史窗口**（浏览器半区里的独立一组）：用一个假会话面（`loadOlder()` 把 fixture 页前插进面板读的那个数组，`getSnapshot()` 像真实现一样缓存引用）驱动真实的 `ensureFullHistory`：一路拉回最早一页 → `complete`；页请求不前进 → 一次就停并报 `partial`；没有 `sessions` 服务 → `unavailable`；座位挂载即触发；提问时读的是补齐后的窗口。
 
