@@ -195,6 +195,15 @@ check('输出语言指令与 eval fixture 逐字一致，且追加在生效提�
     && prompt.composeSystemPrompt('x', 'de') === `x\n\n${langZh}`
     && prompt.composeSystemPrompt(null, 'en').endsWith(langEn)
     && defaultPrompt === candidateFixture && !candidateFixture.includes('本行优先级最高'))
+// The English arm was once measurably worse than the Chinese one, and the reason
+// is worth pinning down: the directive read as a translation order, so the
+// rewrite collapsed into a rendering of the draft. Both locales must say that the
+// line sets the language and nothing else, and that it is not a translation.
+check('输出语言指令声明只改语言、规则照旧，且明确不是翻译',
+  prompt.outputLanguageDirective('en').includes('every rule above still applies in full')
+    && prompt.outputLanguageDirective('en').includes('Do not translate the input')
+    && prompt.outputLanguageDirective('zh').includes('上文其余规则全部照旧适用')
+    && prompt.outputLanguageDirective('zh').includes('不要做翻译'))
 
 // The rewrite's whole settings surface: a prompt, an output language and a
 // record count. The keys the old multi-mode feature used (model pinning, effort,

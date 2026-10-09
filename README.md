@@ -65,7 +65,7 @@ dsh plugin add github:lzyyzznl/dsh-prompt-tuner
 仓库根有 `cordis.patch.yml`（一条 `insert`），`package.json` 声明 `dsh.bundle.patch` 与 `dsh.client.platform=web`；不含构建步骤，`lib/` 即源码。
 
 ```sh
-npm run check        # 自检（618 项），不需要本机装 DSH
+npm run check        # 自检（619 项），不需要本机装 DSH
 npm run eval:prompt  # 三臂盲评：只打印计划，加 --live / --judge 才发真实请求
 npm run eval:attribution  # 归因审计：读已有运行记录，量「改写加了什么用户没提的东西」
 ```
@@ -73,7 +73,7 @@ npm run eval:attribution  # 归因审计：读已有运行记录，量「改写�
 ## 文档
 
 - [历史改进记录](docs/HISTORY.md)：每个功能的设计取舍与固定行为、实测延迟与失败阶梯、与其他同类插件的差异、架构与文件职责、自检覆盖范围，以及全部已知限制。
-- [内置提示词的依据与实测](docs/prompt-rationale.md)：默认提示词为什么是这六步、三臂盲评的方法与数字，以及归因审计（改写里有多少东西是用户没提的）的口径、结果与偏差。
+- [内置提示词的依据与实测](docs/prompt-rationale.md)：默认提示词为什么是这六步、三臂盲评的方法与数字、归因审计（改写里有多少东西是用户没提的）的口径与结果，以及中英两条输出路径的对照与偏差。
 - [通知路径的实测记录](docs/notify-testing.md)：Windows toast 派发的实测与推断边界。
 
 ## 许可
