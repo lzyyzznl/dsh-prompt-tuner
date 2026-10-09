@@ -89,7 +89,7 @@ function resolveArms(names) {
     const prompt = readText(path)
     const line = def.lang === null ? null : readText(join(EVAL_DIR, `language-${def.lang}.txt`))
     const system = line === null ? prompt : `${prompt}\n\n${line}`
-    return { name: def.name, note: def.note, lang: def.lang, promptPath: path, promptChars: prompt.length, system, systemSha: sha(system) }
+    return { name: def.name, note: def.note, lang: def.lang, promptPath: path, prompt, promptChars: prompt.length, line, system, systemSha: sha(system) }
   })
 }
 
