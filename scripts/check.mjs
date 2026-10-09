@@ -1027,6 +1027,11 @@ function cordisLikeContext(services) {
       && bootstrap.includes("-Value 'Example'")
       && bootstrap.includes("-Value 'C:\\Example.exe'")
       && notify.windowsToastScript('T', 'B', { appId: "a'b" }).includes("$appId = 'a''b'"))
+  check('IconUri 只收 Windows 能解析的路径（WSL 下 process.execPath 是 /usr/bin/node）',
+    !notify.windowsToastScript('T', 'B', { iconUri: '/usr/bin/node' }).includes('IconUri')
+      && !notify.windowsToastScript('T', 'B', { iconUri: 'relative.exe' }).includes('IconUri')
+      && notify.windowsToastScript('T', 'B', { iconUri: 'C:\\Program Files\\DSH\\DSH.exe' }).includes("IconUri")
+      && notify.windowsToastScript('T', 'B', { iconUri: '\\\\server\\share\\a.exe' }).includes("IconUri"))
   check('windowsAppIdRegistryPath 指向 HKCU 的 AppUserModelId 键',
     notify.windowsAppIdRegistryPath('com.example.app') === 'HKCU:\\Software\\Classes\\AppUserModelId\\com.example.app'
       && notify.windowsAppIdRegistryPath() === 'HKCU:\\Software\\Classes\\AppUserModelId\\' + notify.WINDOWS_APP_ID)
@@ -1066,7 +1071,8 @@ function cordisLikeContext(services) {
   )
   check('AUMID 注册不上时如实报失败，而不是报一个没人看得见的成功',
     blockedNote.ok === false && blockedNote.registration === 'blocked'
-      && String(blockedNote.error).includes('com.example.ghost'),
+      && String(blockedNote.error).includes('com.example.ghost')
+      && String(blockedNote.error).includes('HKCU:\\Software\\Classes\\AppUserModelId\\com.example.ghost'),
     JSON.stringify(blockedNote))
   const unattested = await notify.sendNotification({ title: 'T', body: 'B' }, { platform: 'win32', run: async () => ({ error: null }) })
   check('没回报自举结果的 runner（测试替身）不编造 registration',

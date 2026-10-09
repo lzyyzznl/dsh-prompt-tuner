@@ -142,6 +142,22 @@ thresholdRatio = 你要的 token 数 ÷ 该模型窗口大小
 >
 > 它**不碰** `Notifications\Settings\<id>`——那个每应用开关归 Windows 和用户管，被静音的就该保持静音。脚本只用 5.1 从 Windows 8 起就有的 cmdlet 与 `HKCU:` provider（`Test-Path` / `New-Item` / `New-ItemProperty` / `Write-Output`），不用 `Add-Type`、不 `Import-Module`、不碰 `HKLM:`，所以在受约束语言模式（WDAC/AppLocker）下也只是注册失败、照常报 `blocked`，而不是把整条链路带崩。
 
+> **哪些是实测、哪些是推断**——这套东西的可信度边界，写在这里免得后来自欺。本机只有 **Windows 11 26300 + Windows PowerShell 5.1**，所以：
+>
+> | 结论 | 依据 |
+> | --- | --- |
+> | 只写 `Classes\AppUserModelId` 就能渲染 | **实测**：注册后 `Notifications\Settings\<id>` 才被创建、toast 进入通知历史 |
+> | 「先注册、再投递」放进同一个 PowerShell 进程可行 | **实测**：同进程注册后立刻投递，首次即渲染 |
+> | 第二次投递回报 `present` 且不重写已有键 | **实测** |
+> | `PushNotifications\Backup` 的三个值对不对 | **实测**：与 Windows **自己**为已注册应用写的那三个值逐字相同 |
+> | `pwsh` 7 跑不了这段脚本 | **实测**：7.6.6 报「找不到类型 `…ToastNotificationManager`」；5.1 原样跑通 |
+> | `IconUri` 是 POSIX 路径（WSL 下 `process.execPath`） | **实测**：不影响渲染、只是没图标；现在直接不写这个值 |
+> | **Windows 10 上只靠注册表键能否渲染** | **未验证**：本机没有 Win10。`PushNotifications\Backup` 就是为它准备的保险 |
+> | 受约束语言模式（WDAC/AppLocker）下的表现 | **未验证**：只保证失败被 `try`/`catch` 兜住并如实报 `blocked` |
+> | 宿主以服务 / 非交互会话运行 | **未验证**：那种会话里 toast 本来就不显示，且脚本侧探测不到 |
+>
+> 还有一条已知的取舍：`ai.deepseek.dsh.desktop` 恰好是 **stable 版安装器**注册过的 id，但它是*快捷方式*注册，**不写** `Classes\AppUserModelId` 键（本机实测 `.next` 与 `electron.app.DSH NEXT` 都没有这个键）。所以插件在 stable 版上会认为「没注册」并自己写一遍——正常机器上结果一样，只是 toast 的显示名取插件写的 `DSH`，而不是安装器给的名字。
+
 **完成判定**用的就是 shell 自己的会话状态通道：客户端订阅 `remote.$on('api-session/status', (sessionId, running) => …)`，只有在**真正发生 running → idle 跳变**时才发（会话第一次报 `false` 是初始态，不算完成；idle → idle 也不重复发）。因此**后台会话跑完一样会通知**——你通常正是在看别处的时候，之前启动的任务才跑完。摘要由会话座位从 chat 快照里**结构化**取出（最后一条带 assistant 标记的记录里的 `text` 字段，流式中的 `partial` 也算），取不到就如实说「没有可用的回答摘要」，不编造。
 
 > **为什么订阅要「等」而不是「读一次」**：插件自己的 bundle 与承载 `remote` 的 `dsh-api-gateway` **不是同一个 bundle**，各自独立装载，所以插件激活那一刻网关可能还没把服务提供出来。而且本插件**没有** inject `remote`——声明它会让「除了通知不要这个通道」的部署连输入框按钮一起装不上，这个功能可以自己等着。于是订阅端按 500ms 一次、最多 30 秒地重试（`ctx.get` 对「晚一步提供」的服务照样能读到，实测有效），拿到就订阅；始终等不到才在控制台写明这一项**已关闭**。这条曾经是静默的：读一次、抛错被吞、订阅从未安装，表面上就像「功能没问题但不发通知」。
@@ -285,13 +301,13 @@ thresholdRatio = 你要的 token 数 ÷ 该模型窗口大小
 ## 自检与基准
 
 ```sh
-npm run check                 # 472 项，含宿主路由、压缩/通知模块与浏览器半区
+npm run check                 # 473 项，含宿主路由、压缩/通知模块与浏览器半区
 npm run check:shape           # 对**已安装**的 DSH 复核旁路提问的消息形状（需要本机有 DSH）
 node scripts/bench.mjs --runs 3 --effort off
 node scripts/bench.mjs --runs 3 --effort auto     # 对照：省掉字段要多花多少时间
 ```
 
-自检不用测试框架，四层：**静态契约**（注入器按字面读取的 `slots.register` 调用（现为六处）、`dsh.bundle`、主题 token-only CSS、中英词典键一致、同座位不得重复 `id`、旧项目名已无残留）、**宿主路由**（假 `ctx`/假 HTTP 驱动真实 handler：失败阶梯、强度协商、预算、SSE 帧序、信任围栏、旁路提问的拒绝分支与历史落盘/清空，以及「全部历史原样收下、超长上下文既不拒绝也不截断、每个增量一帧、不给模型工具、assistant 轮次带 `source`、多轮形状被拒时改用单轮重问」，以及旁路提问自己的模型与强度：`/state` 分别上报两半的路由、`btw*` 只影响旁路提问、清空后回落与改写一致）、**压缩与通知模块**（固定 token → 该模型占比的换算与边界：窗口约掉后仍是同一个绝对数、超过窗口/超出范围/窗口未知分别被拒、`retainRatio` 恒小于 `thresholdRatio`、接近窗口上限时 capped、合并策略只覆盖同 route 并保留手写行、`configEditor` 写入与 `unavailable`/`entry-missing`/reconcile 抛错三条失败路径；平台判定 Linux/Windows/WSL/无桌面、Linux 命令 argv 无 shell、Windows `-EncodedCommand` 解回真实脚本且单引号翻倍、**自举脚本先注册 AppUserModelID 再投递、且用 `Test-Path` 保证已注册的 id 不被覆盖**、`created/present/blocked` 三种回报都能读回、**注册不上时按失败上报而不是报一个没人看得见的成功**、**跨 Win10/Win11 两个注册键都写、只用 5.1 就有的 cmdlet（不 `Add-Type`、不 `Import-Module`、不碰 `HKLM:`）、不碰用户的 `Notifications\Settings`、Windows 一律走 `powershell.exe`**、超长与控制字符先折叠、**缩写后长度不超过上限且以 `...` 结尾**、上限可被调用方覆盖、手改坏的字符数被夹回范围；以及 `/state`、`/save`、`/compaction.windows`、`/compaction.apply`、`/notify`、`/notify.test` 六条路由的准入与拒绝）、**浏览器半区**（假 React + 假 fetch 执行真实组件：自动替换 vs 等待确认、会话隔离、撤销、芯片守卫、JSON 回退、i18n、旁路提问的原始记录携带与面板状态机，以及「进入会话就自动补齐历史、提问带的是补齐后的整段、工具调用及其结果原样在内、进行中的调用与流式文本也在内、分页不前进时如实报 partial、三种上下文标签各说各的真话、选『不带上下文』时不去拉历史」，以及设置页的页签分组：六组设置项**互不重叠、并集等于这 16 项**、两处模型/强度下拉的可选值逐个相同、写设置时只带 `btw*` 键、aria 连线与方向键走查、访问过的页签保持挂载，加上完成通知：摘要结构化提取、会话标题现读、`running → idle` 才发一次、初始 idle 与 idle → idle 都不发、无 `remote` 时静默降级，以及一条回归守卫——**服务只能经 `ctx.get` 拿到、裸读 `ctx.<name>` 会抛错**（cordis 对未 inject 的服务就是如此）时，订阅与写入仍必须成立；再加上摘要字符上限：越界不保存且就地说明范围、改它只发 `notifyMaxChars` 一个键、清空输入框不算改设置、宿主没上报契约时这一项不出现）。
+自检不用测试框架，四层：**静态契约**（注入器按字面读取的 `slots.register` 调用（现为六处）、`dsh.bundle`、主题 token-only CSS、中英词典键一致、同座位不得重复 `id`、旧项目名已无残留）、**宿主路由**（假 `ctx`/假 HTTP 驱动真实 handler：失败阶梯、强度协商、预算、SSE 帧序、信任围栏、旁路提问的拒绝分支与历史落盘/清空，以及「全部历史原样收下、超长上下文既不拒绝也不截断、每个增量一帧、不给模型工具、assistant 轮次带 `source`、多轮形状被拒时改用单轮重问」，以及旁路提问自己的模型与强度：`/state` 分别上报两半的路由、`btw*` 只影响旁路提问、清空后回落与改写一致）、**压缩与通知模块**（固定 token → 该模型占比的换算与边界：窗口约掉后仍是同一个绝对数、超过窗口/超出范围/窗口未知分别被拒、`retainRatio` 恒小于 `thresholdRatio`、接近窗口上限时 capped、合并策略只覆盖同 route 并保留手写行、`configEditor` 写入与 `unavailable`/`entry-missing`/reconcile 抛错三条失败路径；平台判定 Linux/Windows/WSL/无桌面、Linux 命令 argv 无 shell、Windows `-EncodedCommand` 解回真实脚本且单引号翻倍、**自举脚本先注册 AppUserModelID 再投递、且用 `Test-Path` 保证已注册的 id 不被覆盖**、`created/present/blocked` 三种回报都能读回、**注册不上时按失败上报而不是报一个没人看得见的成功**、**跨 Win10/Win11 两个注册键都写、只用 5.1 就有的 cmdlet（不 `Add-Type`、不 `Import-Module`、不碰 `HKLM:`）、不碰用户的 `Notifications\Settings`、Windows 一律走 `powershell.exe`、`IconUri` 只收 Windows 能解析的路径（WSL 下 `process.execPath` 是 POSIX）**、超长与控制字符先折叠、**缩写后长度不超过上限且以 `...` 结尾**、上限可被调用方覆盖、手改坏的字符数被夹回范围；以及 `/state`、`/save`、`/compaction.windows`、`/compaction.apply`、`/notify`、`/notify.test` 六条路由的准入与拒绝）、**浏览器半区**（假 React + 假 fetch 执行真实组件：自动替换 vs 等待确认、会话隔离、撤销、芯片守卫、JSON 回退、i18n、旁路提问的原始记录携带与面板状态机，以及「进入会话就自动补齐历史、提问带的是补齐后的整段、工具调用及其结果原样在内、进行中的调用与流式文本也在内、分页不前进时如实报 partial、三种上下文标签各说各的真话、选『不带上下文』时不去拉历史」，以及设置页的页签分组：六组设置项**互不重叠、并集等于这 16 项**、两处模型/强度下拉的可选值逐个相同、写设置时只带 `btw*` 键、aria 连线与方向键走查、访问过的页签保持挂载，加上完成通知：摘要结构化提取、会话标题现读、`running → idle` 才发一次、初始 idle 与 idle → idle 都不发、无 `remote` 时静默降级，以及一条回归守卫——**服务只能经 `ctx.get` 拿到、裸读 `ctx.<name>` 会抛错**（cordis 对未 inject 的服务就是如此）时，订阅与写入仍必须成立；再加上摘要字符上限：越界不保存且就地说明范围、改它只发 `notifyMaxChars` 一个键、清空输入框不算改设置、宿主没上报契约时这一项不出现）。
 
 **历史窗口**（浏览器半区里的独立一组）：用一个假会话面（`loadOlder()` 把 fixture 页前插进面板读的那个数组，`getSnapshot()` 像真实现一样缓存引用）驱动真实的 `ensureFullHistory`：一路拉回最早一页 → `complete`；页请求不前进 → 一次就停并报 `partial`；没有 `sessions` 服务 → `unavailable`；座位挂载即触发；提问时读的是补齐后的窗口。
 
