@@ -2671,20 +2671,48 @@ section('4b. 压缩与通知的浏览器半区')
   await bundle.settingsStore.load(true)
 
   /* ── the summary extractor ── */
-  check('摘要取最后一条 assistant 记录的正文',
+  // Shapes below are the real ones, read out of the shell's own bundle
+  // (`dsh-client-ui-chat`: a settled assistant node is
+  // `{ kind: 'assistant', seq, blocks }`, and `toAssistantBlock` turns a wire
+  // content block into `{ kind: 'text'|'reasoning'|'tool-call', … }`).
+  const assistantNode = (seq, blocks) => ({ kind: 'assistant', seq, blocks })
+  check('摘要取的是正文块，不是推理块（推理排在同一记录的前面）',
     bundle.answerSummary([
-      { role: 'user', text: '问题' },
-      { role: 'assistant', content: [{ text: '第一段' }, { text: '第二段' }] },
-    ]) === '第一段\n第二段',
-    bundle.answerSummary([{ role: 'assistant', content: [{ text: '第一段' }, { text: '第二段' }] }]))
-  check('摘要跳过非 assistant 记录',
-    bundle.answerSummary([{ role: 'assistant', text: '答' }, { role: 'user', text: '又问' }]) === '答')
+      assistantNode(19, [{ kind: 'reasoning', text: '我先想想这个问题的边界' }, { kind: 'text', text: '答案在这里' }]),
+    ]) === '答案在这里',
+    bundle.answerSummary([assistantNode(19, [{ kind: 'reasoning', text: '推理' }, { kind: 'text', text: '答案' }])]))
+  check('一条记录里有多个正文块时取最后一个（AI 的最后一条消息）',
+    bundle.answerSummary([assistantNode(20, [{ kind: 'text', text: '先说的' }, { kind: 'text', text: '最后说的' }])]) === '最后说的')
+  check('取的是最后一条 assistant 记录',
+    bundle.answerSummary([
+      { kind: 'user', text: '问题' },
+      assistantNode(11, [{ kind: 'text', text: '上一轮' }]),
+      { kind: 'tool-call', text: '工具' },
+      assistantNode(42, [{ kind: 'reasoning', text: '想' }, { kind: 'text', text: '这一轮' }]),
+    ]) === '这一轮')
+  check('最后一条是提问时，正文是问题加选项',
+    bundle.answerSummary([assistantNode(30, [
+      { kind: 'reasoning', text: '该问用户了' },
+      { kind: 'tool-call', name: 'ask_user_question', argsRaw: JSON.stringify({ questions: [{ id: 'scope', header: '范围', question: '要装哪些插件？', options: [{ label: '全部' }, { label: '只装市场' }] }] }) },
+    ])]) === '要装哪些插件？ [选项: 全部 / 只装市场]',
+    bundle.answerSummary([assistantNode(30, [
+      { kind: 'tool-call', name: 'ask_user_question', argsRaw: JSON.stringify({ questions: [{ question: '选哪个？', options: [{ label: 'A' }, { label: 'B' }] }] }) },
+    ])]))
+  check('提问参数坏掉时回落成空串，不编造',
+    bundle.answerSummary([assistantNode(31, [{ kind: 'tool-call', name: 'ask_user_question', argsRaw: '{不是 JSON' }])]) === '')
+  check('普通工具调用不是给用户的消息，继续往前找',
+    bundle.answerSummary([
+      assistantNode(40, [{ kind: 'reasoning', text: '读文件' }, { kind: 'tool-call', name: 'read', argsRaw: '{}' }]),
+      assistantNode(44, [{ kind: 'reasoning', text: '再读一次' }, { kind: 'tool-call', name: 'grep', argsRaw: '{}' }]),
+    ]) === '')
   check('摘要把还在流式的 partial 也算进去',
-    bundle.answerSummary([{ role: 'assistant', text: '旧答' }], { role: 'assistant', text: '新答' }) === '新答')
+    bundle.answerSummary([assistantNode(9, [{ kind: 'text', text: '旧答' }])], { turn: 2, step: 1, blocks: [{ kind: 'text', text: '新答' }] }) === '新答')
   check('没有可读正文时返回空串（不编造摘要）',
-    bundle.answerSummary([{ role: 'assistant' }]) === '' && bundle.answerSummary([]) === '')
-  check('assistant 标记嵌在更深一层也能认出来',
-    bundle.answerSummary([{ message: { header: { role: 'assistant' }, body: [{ text: '深处' }] } }]) === '深处')
+    bundle.answerSummary([assistantNode(12, [{ kind: 'reasoning', text: '只有推理' }])]) === ''
+      && bundle.answerSummary([{ kind: 'assistant' }]) === ''
+      && bundle.answerSummary([]) === '')
+  check('assistant 记录嵌在更深一层也能认出来',
+    bundle.answerSummary([{ wrapper: { item: assistantNode(7, [{ kind: 'text', text: '深处' }]) } }]) === '深处')
   check('非数组输入不会抛异常', bundle.answerSummary(null) === '')
 
   /* ── the title reader ── */
@@ -2749,6 +2777,42 @@ section('4b. 压缩与通知的浏览器半区')
   handlers[0].handler('s1', false)
   await new Promise((resolve) => setTimeout(resolve, 0))
   check('idle → idle 不重复通知', fetchCalls.filter((row) => row.action === 'notify').length === 1)
+
+  // A session that stops and starts again without saying anything new used to
+  // re-send the previous answer verbatim — one session left fifteen identical
+  // toasts in the Windows notification history that way.
+  const settle = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  }
+  const notifyBodies = () => fetchCalls.filter((row) => row.action === 'notify').map((row) => row.body.body)
+  wired.completionSummaries.set('s1', { text: '同一条回答', seq: 42 })
+  handlers[0].handler('s1', true)
+  handlers[0].handler('s1', false)
+  await settle()
+  check('回答有 seq 时，第一次仍照常通知',
+    notifyBodies().length === 2 && notifyBodies().at(-1) === '同一条回答',
+    JSON.stringify(notifyBodies()))
+  handlers[0].handler('s1', true)
+  handlers[0].handler('s1', false)
+  await settle()
+  check('同一个回答再 idle 一次不重发（同一条会被反复推送的那个 bug）',
+    notifyBodies().length === 2,
+    JSON.stringify(notifyBodies()))
+  wired.completionSummaries.set('s1', { text: '下一条回答', seq: 43 })
+  handlers[0].handler('s1', true)
+  handlers[0].handler('s1', false)
+  await settle()
+  check('换了新的回答仍然通知（去重不吞真正的完成）',
+    notifyBodies().length === 3 && notifyBodies().at(-1) === '下一条回答',
+    JSON.stringify(notifyBodies()))
+  wired.completionSummaries.set('s1', { text: '', seq: 44 })
+  handlers[0].handler('s1', true)
+  handlers[0].handler('s1', false)
+  await settle()
+  check('读不到摘要时仍如实通知（正文回落成「没有可用的回答摘要」）',
+    notifyBodies().length === 4 && notifyBodies().at(-1) !== '',
+    JSON.stringify(notifyBodies()))
   check('返回的 disposer 就是 remote 给的取消订阅', typeof dispose === 'function')
   dispose()
   check('disposer 已转交', disposed === true)
