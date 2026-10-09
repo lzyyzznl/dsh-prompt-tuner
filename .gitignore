@@ -5,3 +5,8 @@ node_modules/
 *.tgz
 *.log
 .DS_Store
+
+# Eval run records hold model rewrites of real drafts: regenerate them with
+# `node scripts/eval-prompt.mjs --live`, do not ship them. The fixtures the run
+# needs (draft set, arms, judge prompt) ARE tracked under scripts/eval/.
+scripts/eval/runs/

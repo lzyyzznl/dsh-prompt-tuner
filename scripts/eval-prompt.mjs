@@ -348,9 +348,17 @@ async function runJudge(set) {
   }
   const summary = arms.map((arm) => {
     const rows = perArm[arm]
-    const mean = (key) => rows.length === 0 ? null : Number((rows.reduce((sum, row) => sum + row[key], 0) / rows.length).toFixed(2))
-    const total = rows.length === 0 ? null : Number((DIMENSIONS.reduce((sum, key) => sum + mean(key), 0) / DIMENSIONS.length).toFixed(2))
-    return { arm, n: rows.length, total, ...Object.fromEntries(DIMENSIONS.map((key) => [key, mean(key)])) }
+    // A judge that drops one dimension must not poison the whole mean, so every
+    // average is taken over the values that actually arrived, and `n` says how
+    // many rewrites contributed at all.
+    const mean = (key) => {
+      const values = rows.map((row) => row[key]).filter((value) => Number.isFinite(value))
+      return values.length === 0 ? null : Number((values.reduce((sum, value) => sum + value, 0) / values.length).toFixed(2))
+    }
+    const dims = Object.fromEntries(DIMENSIONS.map((key) => [key, mean(key)]))
+    const present = DIMENSIONS.map((key) => dims[key]).filter((value) => Number.isFinite(value))
+    const total = present.length === 0 ? null : Number((present.reduce((sum, value) => sum + value, 0) / present.length).toFixed(2))
+    return { arm, n: rows.length, total, ...dims }
   })
 
   mkdirSync(outDir, { recursive: true })
