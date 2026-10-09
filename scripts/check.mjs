@@ -275,15 +275,37 @@ check('没有历史时兜底形状与首轮消息完全一致',
 check('旁路历史与设置分文件存放', store.BTW_HISTORY_FILE !== store.CONFIG_FILE && store.BTW_HISTORY_FILE.endsWith('prompt-tuner-btw.json'))
 check('旁路默认携带全部历史消息', store.DEFAULT_SETTINGS.btwContextTurns === store.BTW_CONTEXT_ALL && store.BTW_CONTEXT_ALL === 'all')
 check('旁路默认保存历史', store.DEFAULT_SETTINGS.btwSaveHistory === true)
-check('上下文档位是 全部/0/4/8/16（0 = 不读会话）', JSON.stringify([...store.BTW_CONTEXT_CHOICES]) === JSON.stringify(['all', 0, 4, 8, 16]))
-store.writeSettings({ btwContextTurns: 99, btwSaveHistory: 'yes' })
+check('上下文档位是「全部」/「不带」/任意正整数条数（无 4/8/16 固定档、无上限）',
+  store.normalizeBtwContextTurns('all') === 'all'
+  && store.normalizeBtwContextTurns(0) === 0
+  && store.normalizeBtwContextTurns(1) === 1
+  && store.normalizeBtwContextTurns(37) === 37
+  && store.normalizeBtwContextTurns(9_007_199_254_740_991) === 9_007_199_254_740_991
+  && store.normalizeBtwContextTurns(-1) === 'all'
+  && store.normalizeBtwContextTurns(1.5) === 'all'
+  && store.normalizeBtwContextTurns('7') === 'all'
+  && store.normalizeBtwContextTurns(undefined, 12) === 12)
+check('路由接受的正整数与规范化一致', store.isBtwContextTurns('all') === true && store.isBtwContextTurns(0) === true
+  && store.isBtwContextTurns(37) === true && store.isBtwContextTurns(-1) === false
+  && store.isBtwContextTurns(1.5) === false && store.isBtwContextTurns('7') === false && store.isBtwContextTurns(null) === false)
+store.writeSettings({ btwContextTurns: 'nope', btwSaveHistory: 'yes' })
 const btwTolerant = store.readSettings()
 check('旁路设置对非法取值回退默认（全部历史）', btwTolerant.btwContextTurns === 'all' && btwTolerant.btwSaveHistory === true)
+store.writeSettings({ btwContextTurns: 37 })
+check('手动条数按原样写入并读回（不是固定档位）', store.readSettings().btwContextTurns === 37)
+check('手动条数成为「最近 N 条」记住的数', store.readSettings().btwContextCount === 37)
 store.writeSettings({ btwContextTurns: 0, btwSaveHistory: false })
 const btwWritten = store.readSettings()
 check('旁路设置可写入并读回', btwWritten.btwContextTurns === 0 && btwWritten.btwSaveHistory === false)
+check('切到「不带」后仍记得手动填过的条数', btwWritten.btwContextCount === 37)
 store.writeSettings({ btwContextTurns: 'all', btwSaveHistory: true })
-check('旁路设置可写回「全部历史」', store.readSettings().btwContextTurns === 'all')
+const btwAllAgain = store.readSettings()
+check('旁路设置可写回「全部历史」', btwAllAgain.btwContextTurns === 'all' && btwAllAgain.btwContextCount === 37)
+check('记住的条数有默认值、且对越界值回退',
+  store.DEFAULT_SETTINGS.btwContextCount === 8
+  && store.normalizeBtwContextCount(undefined) === 8 && store.normalizeBtwContextCount(0) === 8
+  && store.normalizeBtwContextCount(-4) === 8 && store.normalizeBtwContextCount(2.5) === 8
+  && store.normalizeBtwContextCount(200) === 200)
 
 check('空历史文件读成空历史（不抛）', JSON.stringify(store.readBtwHistory()) === JSON.stringify({ version: 1, sessions: {} }))
 const appended = store.appendBtwTurn('session-a', { question: '问题一', answer: '答案一', at: 1 })
@@ -1017,7 +1039,10 @@ store.clearBtwTopics('session-a')
   const ctx = makeCtx([btwStep('旁路答案')])
   registerRoutes(ctx)
   const state = (await call(ctx, '/state', {})).json
-  check('/state 带旁路提问契约（档位、历史文件、提示词；上下文无上限）', Array.isArray(state.value.btw?.contextTurnChoices)
+  check('/state 带旁路提问契约（条数下限、记忆条数、历史文件、提示词；上下文无上限）',
+    Number.isSafeInteger(state.value.btw?.minContextCount) && state.value.btw.minContextCount === 1
+    && Number.isSafeInteger(state.value.btw?.contextCount) && state.value.btw.contextCount >= 1
+    && state.value.btw.maxContextCount === undefined
     && state.value.btw.maxQuestionChars > 0
     && state.value.btw.maxContextChars === undefined
     && typeof state.value.btw.historyFile === 'string'
@@ -1025,9 +1050,18 @@ store.clearBtwTopics('session-a')
 
   const saved = (await call(ctx, '/save', { btwContextTurns: 4, btwSaveHistory: false })).json
   check('/save 接受旁路设置', saved.value.settings.btwContextTurns === 4 && saved.value.settings.btwSaveHistory === false)
-  check('/save 拒绝非法上下文档位', (await call(ctx, '/save', { btwContextTurns: 7 })).json?.error?.code === 'bad-request')
+  const odd = (await call(ctx, '/save', { btwContextTurns: 7 })).json
+  check('/save 接受固定档位之外的手动条数（7 不再被拒）', odd.value?.settings?.btwContextTurns === 7)
+  const big = (await call(ctx, '/save', { btwContextTurns: 12345 })).json
+  check('/save 接受很大的正整数条数（没有隐藏上限）', big.value?.settings?.btwContextTurns === 12345)
+  check('/save 记住最近填写的手动条数', big.value?.settings?.btwContextCount === 12345)
+  check('/save 拒绝非正整数条数',
+    (await call(ctx, '/save', { btwContextTurns: -1 })).json?.error?.code === 'bad-request'
+    && (await call(ctx, '/save', { btwContextTurns: 1.5 })).json?.error?.code === 'bad-request'
+    && (await call(ctx, '/save', { btwContextTurns: '7' })).json?.error?.code === 'bad-request')
   check('/save 拒绝非布尔历史开关', (await call(ctx, '/save', { btwSaveHistory: 'yes' })).json?.error?.code === 'bad-request')
   check('/save 接受「全部历史」档位', (await call(ctx, '/save', { btwContextTurns: 'all' })).json?.value?.settings?.btwContextTurns === 'all')
+  check('/save 接受「不带」档位', (await call(ctx, '/save', { btwContextTurns: 0 })).json?.value?.settings?.btwContextTurns === 0)
   await call(ctx, '/save', { btwContextTurns: 'all', btwSaveHistory: true })
 
   const res = await call(ctx, '/btw', { question: '登录页改了吗？', context: '用户：改一下登录页', history: [{ question: '上一问', answer: '上一答' }] })
@@ -2074,6 +2108,7 @@ const STATE = {
       systemPrompt: null,
       recentMessages: 8,
       btwContextTurns: 'all',
+      btwContextCount: 8,
       btwSaveHistory: true,
       compactionTokens: { 'deepseek-official/deepseek-flash': 250_000 },
       notifyOnComplete: true,
@@ -2101,8 +2136,9 @@ const STATE = {
     },
     btw: {
       contextTurns: 'all',
+      contextCount: 8,
+      minContextCount: store.MIN_BTW_CONTEXT_COUNT,
       saveHistory: true,
-      contextTurnChoices: [...store.BTW_CONTEXT_CHOICES],
       maxQuestionChars: prompt.MAX_BTW_QUESTION_CHARS,
       historyFile: store.BTW_HISTORY_FILE,
       prompt: prompt.BTW_SYSTEM_PROMPT,
@@ -2803,6 +2839,50 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
     (okFetch.seen.filter((entry) => entry.action === 'save').at(-1)?.body?.recentMessages ?? null) === 12
       && recentError !== undefined && textOf(recentError).includes('0–50'),
     `${JSON.stringify(okFetch.seen.filter((entry) => entry.action === 'save').at(-1)?.body ?? null)} / ${recentError === undefined ? 'no error line' : textOf(recentError)}`)
+  // The side question's count is typed, not picked: the select names the three
+  // modes and the number input beside it takes any positive integer. Typing one
+  // *is* choosing 「最近 N 条」, so the one save carries it.
+  okTree = okClickTab(okTree, 'btw')
+  const btwPanelOf = (tree) => okPanel(tree, 'btw')
+  const btwCountOf = (tree) => findAll(btwPanelOf(tree), (node) => node.props?.id === 'dspo-btw-context-count')[0]
+  const btwSelectOf = (tree) => findAll(btwPanelOf(tree), (node) => node.props?.id === 'dspo-btw-context')[0]
+  const btwOptionsOf = (tree) => (btwSelectOf(tree)?.children ?? [])
+    .map((option) => ({ value: option.props.value, label: textOf(option) }))
+  check('携带条数是一个可手动输入的数字框（下限 1、不设上限、非「最近 N 条」时仅置灰不禁用）',
+    btwCountOf(okTree)?.props.type === 'number' && btwCountOf(okTree).props.min === 1
+      && btwCountOf(okTree).props.max === undefined && btwCountOf(okTree).props.step === 1
+      && btwCountOf(okTree).props.disabled === undefined && btwCountOf(okTree).props['data-inactive'] === 'true'
+      && btwCountOf(okTree).props['aria-label'] === okBundle.DICT.zh.btwContextCountLabel,
+    JSON.stringify(btwCountOf(okTree)?.props ?? null))
+  check('上下文档位只剩 全部 / 最近 N 条（手动填）/ 不带 三个选项，没有 4/8/16 固定档',
+    JSON.stringify(btwOptionsOf(okTree).map((option) => option.label)) === JSON.stringify([
+      okBundle.DICT.zh.btwContextAllOption,
+      okBundle.DICT.zh.btwContextCountOption,
+      okBundle.DICT.zh.btwContextNone,
+    ]) && btwOptionsOf(okTree).every((option) => !['4', '8', '16'].includes(option.value)),
+    JSON.stringify(btwOptionsOf(okTree)))
+  check('默认仍选中「全部历史记录」，条数框显示记住的数',
+    btwSelectOf(okTree).props.value === 'all' && btwCountOf(okTree).props.value === '8')
+
+  btwCountOf(okTree).props.onChange({ target: { value: '37' } })
+  okTree = okPage()
+  btwCountOf(okTree).props.onKeyDown({ key: 'Enter' })
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  const btwCountBody = okFetch.seen.filter((entry) => entry.action === 'save').at(-1)?.body ?? null
+  check('手动条数只发 btwContextTurns 一个键、原样带上 37',
+    JSON.stringify(btwCountBody) === JSON.stringify({ btwContextTurns: 37 }), JSON.stringify(btwCountBody))
+
+  okTree = okPage()
+  btwCountOf(okTree).props.onChange({ target: { value: '0' } })
+  okTree = okPage()
+  btwCountOf(okTree).props.onKeyDown({ key: 'Enter' })
+  okTree = okPage()
+  const btwCountError = findAll(btwPanelOf(okTree), (node) => node.props?.className === 'dspo-set-status' && node.props['data-tone'] === 'error')[0]
+  check('条数必须是正整数：0 不保存、并就地说出下限',
+    (okFetch.seen.filter((entry) => entry.action === 'save').at(-1)?.body?.btwContextTurns ?? null) === 37
+      && btwCountError !== undefined && textOf(btwCountError).includes('不小于 1'),
+    `${JSON.stringify(okFetch.seen.filter((entry) => entry.action === 'save').at(-1)?.body ?? null)} / ${btwCountError === undefined ? 'no error line' : textOf(btwCountError)}`)
   okBundle.__restore()
 
   /* ── the rail walks with the keyboard, like the shell's own ── */
@@ -2955,6 +3035,15 @@ const toolNode = (callId, name, output) => ({
   check('上下文原样带上工具调用与结果', carried.text.includes('src/login.tsx') && carried.text.includes('TOOL_OUTPUT'))
   check('上下文原样带上推理与上下文注入（不再丢弃）', carried.text.includes('内部推理') && carried.text.includes('系统注入'))
   check('上下文按条数截取最近的记录', bundle.btwContext(nodes, 2).text.includes('那用懒加载') && !bundle.btwContext(nodes, 2).text.includes('把登录页改快一点') && bundle.btwContext(nodes, 2).messages === 2)
+  // The manual count is only a number: any positive integer — including ones the
+  // old fixed list never offered — narrows the window the same way, and each
+  // record inside it still travels whole (a tool result with the call it answers).
+  const manualCount = bundle.btwContext(nodes, 3)
+  check('手动填的条数（非旧固定档位）同样只取最近 N 条，且记录整条带上',
+    manualCount.messages === 3
+      && manualCount.text.includes('那用懒加载') && !manualCount.text.includes('把登录页改快一点')
+      && manualCount.text.includes(JSON.stringify(nodes[2])) && manualCount.text.includes('TOOL_OUTPUT')
+      && manualCount.text.includes('系统注入'))
   check('档位 0 时完全不读会话', bundle.btwContext(nodes, 0).text === '' && bundle.btwContext(nodes, 0).messages === 0)
   check('空记录不会报错', bundle.btwContext(undefined, 8).text === '')
   // The default setting: every record, with no count cap and no character trimming.
