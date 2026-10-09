@@ -1,8 +1,11 @@
 # 测试要点（供接手 agent 参考）
 
-> 主题：**Windows 桌面通知的端到端投递验证**。
+> 主题一：**Windows 桌面通知的端到端投递验证**。
 > 这是本仓库唯一一个「失败无声」的功能，所以测试方法与其它模块不同——
 > 命令返回成功**不代表**通知出现了。照本文档执行即可判断，无需再问。
+>
+> 主题二（第六之二节）：**通知正文的模型压缩**——推送的是压出来的一句话，
+> 不是助手原文。这一段需要一次真实模型调用，无法用返回码代替。
 
 ---
 
@@ -172,10 +175,50 @@ console.log(out)   // 期望：ok:true, registration:'created'
 
 ---
 
+## 六之二、正文压缩（2026-10-09 新增）怎么验
+
+通知正文不再原样推送，而是先由模型压成一句不超过上限的话。这一段**没有**独立按钮，
+因为它需要一次真实的模型调用：
+
+| 检查项 | 期望 |
+| --- | --- |
+| 跑完一轮真实回答后的宿主日志 | `[prompt-optimizer] notification shown (N title / M body chars, summary from provider/model in K attempt(s))`；`M <= notifyMaxChars` |
+| 日志末尾有没有 `, cut to fit` | 有 = 这一次仍然切过（两次都没压进上限）；正常应当是**没有** |
+| 桌面上那条 toast 的结尾 | 正常**没有** `...`（说明是模型按上限写的，不是被切出来的） |
+| 压缩失败时的日志 | `[prompt-optimizer] notification summary failed (code): message`，桌面正文是「本轮已结束，摘要不可用」——**不是**回答原文 |
+| 浏览器控制台 | `[prompt-tuner] session … notification body condensed to N chars in K attempt(s)` 或 `… has no summary (code)` |
+| `/notify` 的返回（可自己发一次） | `value.summary = { requested, ok, code, attempts, model, reasoningEffort, chars, truncated }`；`reasoningEffort` 必须是 `off`，`attempts` 是 1 或 2，`truncated` 为 `true` 时 `chars == notifyMaxChars` |
+| `/state` 的通知契约 | `value.notify.thinking === 'off'`（设置页据此决定是否显示「摘要模型」那一行）、`active` 是这次真要用的路由 |
+| 设置页「通知 → 摘要模型」 | 选了之后 `/state` 的 `notify.active` 跟着变；清掉两个键就回落成跟随会话模型 |
+
+手工发一次 `/notify`（会真的弹 toast，也会真的调一次模型）：
+
+```powershell
+$base = $env:DSH_WEB_URL
+Invoke-RestMethod -Uri "$base/dsh-prompt-optimizer/notify" -Method Post `
+  -ContentType 'application/json' -Headers @{ Origin = $base } `
+  -Body '{"title":"压缩验证","body":"这是一段刻意写得很长的回答……（换成几千字，看压出来的结果）","needsSummary":true}' |
+  ConvertTo-Json -Depth 6
+```
+
+`needsSummary:false` 是另一条路径：浏览器已经判定「本轮没有回答」，宿主**不调模型**、
+原样派发那句话。想验「不调模型」就把它设为 `false`，此时 `summary.code` 应为 `no-answer`。
+
+契约本身（关闭思考、上限进提示词、超长再压一次、两次都超长才 `truncated`、失败不退回原文、
+无原文不调模型）由 `scripts/check.mjs` 用**脚本化假适配器**覆盖，需要真模型才能回答的
+只有「某个具体模型是否一次就压到 120 字以内」——那条**本机尚未实测**，README 的
+「实测 / 推断」表里已按未验证记录。
+
+---
+
 ## 七、相关代码位置
 
 - 派发与自举：`lib/notify.js` — `windowsToastScript()`（生成注册+投递脚本）、
   `parseAppIdState()`（读回 `created|present|blocked`）、`sendNotification()`（汇总结果）
+- 正文压缩：`lib/notify-summary.js` — 两段提示词、输入组帧、回答清洗、上限判定与兜底裁剪；
+  调用与重试在 `lib/routes.js` — `askNotifySummary()`（固定 `pickEffort('off', …)`），
+  路由拼装在 `lib/routes.js` — `case '/notify'`
 - 路由：`lib/routes.js` — `/notify`、`/notify.test`
-- 自检：`scripts/check.mjs` — 搜 `AUMID` / `IconUri` / `parseAppIdState`
-  （这些断言是纯静态/纯伪 runner，**不会**真的弹通知，不能替代上面的真机验证）
+- 自检：`scripts/check.mjs` — 搜 `AUMID` / `IconUri` / `parseAppIdState`；
+  压缩契约搜 `摘要` / `askNotifySummary` / `NOTIFY_SUMMARY_FALLBACK_BODY`
+  （这些断言是纯静态/纯伪 runner，**不会**真的弹通知、也不会真的调模型，不能替代上面的真机验证）
