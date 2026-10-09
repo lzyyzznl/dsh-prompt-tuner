@@ -2883,6 +2883,32 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
     (okFetch.seen.filter((entry) => entry.action === 'save').at(-1)?.body?.btwContextTurns ?? null) === 37
       && btwCountError !== undefined && textOf(btwCountError).includes('不小于 1'),
     `${JSON.stringify(okFetch.seen.filter((entry) => entry.action === 'save').at(-1)?.body ?? null)} / ${btwCountError === undefined ? 'no error line' : textOf(btwCountError)}`)
+
+  // A rejected draft must not outlive the mode it was typed for. Switching modes
+  // replaces it, so the field cannot sit there contradicting the select, and the
+  // next blur cannot re-raise an error the user already moved on from.
+  btwSelectOf(okTree).props.onChange({ target: { value: 'count' } })
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  okTree = okPage()
+  const btwAfterSelect = okFetch.seen.filter((entry) => entry.action === 'save').at(-1)?.body ?? null
+  check('切档位会丢掉被拒绝的草稿：按记住的条数保存、错误行消失、框里回到该条数',
+    JSON.stringify(btwAfterSelect) === JSON.stringify({ btwContextTurns: 8 })
+      && findAll(btwPanelOf(okTree), (node) => node.props?.className === 'dspo-set-status' && node.props['data-tone'] === 'error').length === 0
+      && btwCountOf(okTree).props.value === '8',
+    `${JSON.stringify(btwAfterSelect)} / ${btwCountOf(okTree).props.value}`)
+
+  // A usable number still in the field wins over the remembered one: a click on
+  // the select blurs the field first, and that blur saves the same number, so the
+  // mode change following it in the same gesture must not undo it.
+  btwCountOf(okTree).props.onChange({ target: { value: '37' } })
+  okTree = okPage()
+  btwSelectOf(okTree).props.onChange({ target: { value: 'count' } })
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  const btwSameGesture = okFetch.seen.filter((entry) => entry.action === 'save').at(-1)?.body ?? null
+  check('同一手势里先填 37 再选「最近 N 条」不会被记住的 8 覆盖',
+    JSON.stringify(btwSameGesture) === JSON.stringify({ btwContextTurns: 37 }), JSON.stringify(btwSameGesture))
   okBundle.__restore()
 
   /* ── the rail walks with the keyboard, like the shell's own ── */
