@@ -2780,6 +2780,24 @@ section('4b. 压缩与通知的浏览器半区')
   await new Promise((resolve) => setTimeout(resolve, 0))
   check('清空输入框不算改设置（不改、不报错）',
     saves().length === 1 && charsOf(draw()).props.value === String(limits.bodyChars))
+
+  // A host that predates the cap advertises no bounds and stores nothing for
+  // `notifyMaxChars`: offering the field there would look saved and then revert
+  // on the next `/state`, so the row is left out instead.
+  {
+    const limitsBackup = { ...limits }
+    delete STATE.value.notify.limits.minBodyChars
+    delete STATE.value.notify.limits.maxBodyChars
+    await bundle.settingsStore.load(true)
+    const oldHost = draw()
+    check('宿主没上报字符上限契约时这一项不出现（不给你一个存不进去的数字）',
+      charsOf(oldHost) === undefined
+        && findAll(notifyPanelOf(oldHost), (node) => node.props?.id === 'dspo-notify').length === 1)
+    STATE.value.notify.limits = limitsBackup
+    await bundle.settingsStore.load(true)
+    check('宿主重新上报契约后这一项又回来了',
+      charsOf(draw())?.props.value === String(limits.bodyChars))
+  }
   bundle.__restore()
 }
 
