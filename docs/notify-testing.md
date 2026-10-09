@@ -205,9 +205,15 @@ Invoke-RestMethod -Uri "$base/dsh-prompt-optimizer/notify" -Method Post `
 原样派发那句话。想验「不调模型」就把它设为 `false`，此时 `summary.code` 应为 `no-answer`。
 
 契约本身（关闭思考、上限进提示词、超长再压一次、两次都超长才 `truncated`、失败不退回原文、
-无原文不调模型）由 `scripts/check.mjs` 用**脚本化假适配器**覆盖，需要真模型才能回答的
-只有「某个具体模型是否一次就压到 120 字以内」——那条**本机尚未实测**，README 的
-「实测 / 推断」表里已按未验证记录。
+无原文不调模型）由 `scripts/check.mjs` 用**脚本化假适配器**覆盖；「某个具体模型是否一次就压到
+120 字以内」只能真机量，本机已实测一次：
+
+| 日期 | 环境 | 输入 | 结果 |
+| --- | --- | --- | --- |
+| 2026-10-09 | 重装后的 desktop profile，`deepseek-account/deepseek-flash` | 240 字中文正文，`notifyMaxChars=120` | `sent:true`、`registration:"present"`、`attempts:1`、`reasoningEffort:"off"`、`truncated:false`，压成 35 字，桌面正文结尾**没有** `...` |
+
+这一次只说明「这个模型、这类回答一次到位」；换模型、换很长的回答仍可能走第二次调用，
+或落到 `truncated:true`，按上面的表读日志即可判断。
 
 ---
 

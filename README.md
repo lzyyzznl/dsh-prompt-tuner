@@ -157,7 +157,7 @@ thresholdRatio = 你要的 token 数 ÷ 该模型窗口大小
 > | **Windows 10 上只靠注册表键能否渲染** | **未验证**：本机没有 Win10。`PushNotifications\Backup` 就是为它准备的保险 |
 > | 受约束语言模式（WDAC/AppLocker）下的表现 | **未验证**：只保证失败被 `try`/`catch` 兜住并如实报 `blocked` |
 > | 宿主以服务 / 非交互会话运行 | **未验证**：那种会话里 toast 本来就不显示，且脚本侧探测不到 |
-> | 正文压缩在真实模型上一句压得进 120 字 | **未验证**：自检用脚本化假适配器量的是契约（关思考、上限进提示词、超长再压一次、失败不退回原文），真模型是否一次到位由模型决定，重装后跑一轮看日志的 `K attempt(s)` / `cut to fit` |
+> | 正文压缩在真实模型上一句压得进 120 字 | **已实测一次**：2026-10-09 重装后在 `deepseek-account/deepseek-flash` 上发一条 240 字正文，`attempts:1` / `truncated:false`，压成 35 字、桌面那条通知结尾没有 `...`（`registration:"present"`，即真的渲染了）。契约本身由脚本化假适配器逐条覆盖；「任意模型、任意回答都能一次到位」仍取决于模型，看日志的 `K attempt(s)` / `cut to fit` |
 >
 > 还有一条已知的取舍：`ai.deepseek.dsh.desktop` 恰好是 **stable 版安装器**注册过的 id，但它是*快捷方式*注册，**不写** `Classes\AppUserModelId` 键（本机实测 `.next` 与 `electron.app.DSH NEXT` 都没有这个键）。所以插件在 stable 版上会认为「没注册」并自己写一遍——正常机器上结果一样，只是 toast 的显示名取插件写的 `DSH`，而不是安装器给的名字。
 
@@ -179,7 +179,7 @@ thresholdRatio = 你要的 token 数 ÷ 该模型窗口大小
 
 压缩发生在**宿主**（浏览器把原文整段送来，由宿主压缩后再派发），所以桌面上看到的长度就是设置页上的数字；设置页里填超范围的数字**不会保存**，而是就地说明可填范围——把输入框里的数字悄悄改掉，只会让输入框和配置文件互相打架。这两项都只在宿主上报了各自的契约时才出现（正文上限看 `limits`，模型那一行看固定的 `thinking: 'off'`）：宿主还没带上这个契约（例如插件刚更新、`dsh web` 还没重启）时，设置页不会给你一个存不进去的值，而是说明这一项为什么不显示。`api` 上也一样：`/save` 拒绝越界的 `notifyMaxChars`，也拒绝非字符串非 null 的 `notifyProvider`/`notifyModel`，手改配置文件里的坏值则由读取端夹回范围或清理（`notifyMaxChars` 缺省 120，模型对缺省为「不选」）。
 
-宿主每次派发都会在响应里带上这次压缩的**明细**（`summary: { requested, ok, code, attempts, model, reasoningEffort, fits, truncated, chars }`），并按 `notify` 一行日志记下结果：成功时是「`notification shown (N title / M body chars, summary from provider/model in K attempt(s)`」——末尾带 `, cut to fit` 就说明这一次是切过的；失败时是「`notification summary failed (code): message`」。浏览器控制台也各记一行，所以「桌面上那句话不对」和「根本没通知」是两件可以分开查的事。
+宿主每次派发都会在响应里带上这次压缩的**明细**（`summary: { requested, ok, code, attempts, model, reasoningEffort, chars, truncated }`——`truncated: true` 就等于「这一条被切过」，所以没有多余的字段），并按 `notify` 一行日志记下结果：成功时是「`notification shown (N title / M body chars, summary from provider/model in K attempt(s)`」——末尾带 `, cut to fit` 就说明这一次是切过的；失败时是「`notification summary failed (code): message`」。浏览器控制台也各记一行，所以「桌面上那句话不对」和「根本没通知」是两件可以分开查的事。
 
 设置页「通知」页签有一个总开关、一个**摘要模型**（两边下拉 + 刷新目录，与「旁路提问」「标题」页签同形）、一个**摘要最多显示字符数**、本机实际的派发方式，以及一个**发送测试通知**按钮（测试正文故意长于默认上限，点一下就能看到 `...` 缩写的效果——这一颗按钮走的是**纯派发**路径，不调用模型，所以它证明的是「桌面能弹出来」，压缩效果要看真的一轮回答跑完之后的那条 toast 与日志）。
 
@@ -375,7 +375,7 @@ node scripts/bench.mjs --runs 3 --effort auto     # 对照：省掉字段要多�
 - **通知的摘要取自未文档化的 chat 快照形状**：插件按「最后一条 assistant 记录的 `blocks` 里，从后往前第一个 `text` 块（跳过 `kind:'reasoning'`）；若最后是提问工具调用则取问题与选项」结构化提取，取不到就如实报「没有可用的回答摘要」而不是编造。形状对不上时会提取为空——通知仍会发，正文回落成「本轮没有可用的回答摘要」这句话，而不是一条只有标题的通知。**这正是曾经的 bug**：旧实现把记录里**每一个** `text` 字段按文档顺序拼起来，而推理块排在正文块前面，于是通知里出现的是模型的思考而不是回答（Windows 通知历史里实测到过）。所以现在是按 `kind` 跳过，不按措辞猜。
 - **同一条回答不会反复通知**：会话「停止工作」不等于「说了新东西」，而一个会话可能在没有新消息的情况下多次 running → idle。座位把摘要连同它的**消息 seq** 一起记下，宿主侧发送前比对上次发过的 seq，相同就不发。修复前有一次会话在通知历史里留下 **15 条完全相同**的记录。读不到 seq 时不去猜、照常通知，宁可多发也不吞掉真正的完成。
 - **通知的正文由模型压缩，而不是缩写原文**：正文是「把本轮回答压成一句不超过上限的话」，调用**固定 `reasoningEffort: 'off'`**，属于「要点速览」，完整内容仍在会话里；想看得多一点就把上限调大（最多 600）。压不进上限时会用更紧的预算**再压一次**，两次都压不进去才按老规矩切一刀并以 `...` 结尾——这时响应与日志里会标 `truncated: true`，**切过是看得见的**。压缩模型可以单独指定（默认跟随会话模型），但它**不接入任何思考强度档位**：这个功能只有「不思考」一种模式。
-- **通知正文压缩在真实模型上的表现尚未在本机实测**：自检用脚本化的假适配器逐条量过契约（关闭思考、上限写进提示词、超长再压一次、失败不退回原文、无原文不调模型），但「某个真模型是否总能一次压到 120 字以内」取决于模型本身，本仓库无法替它保证。真实链路要看重装后跑一轮：日志里 `notification shown (… summary from provider/model in K attempt(s))` 的 `K` 就是实际调用次数，末尾带 `cut to fit` 说明这一次仍然切过；摘不出来时是 `notification summary failed (code): message`，桌面上看到的正文是「本轮已结束，摘要不可用」。
+- **通知正文压缩在真实模型上实测过一次，但不是保证**：2026-10-09 重装后对 `deepseek-account/deepseek-flash` 实测——240 字正文一次压成 35 字（`attempts:1`、`truncated:false`、`reasoningEffort:'off'`），桌面正文结尾没有 `...`。自检另外用脚本化的假适配器逐条量过契约（关闭思考、上限写进提示词、超长再压一次、失败不退回原文、无原文不调模型）；但「某个真模型是否总能一次压到 120 字以内」取决于模型本身，本仓库无法替它保证。日常核对看日志：`notification shown (… summary from provider/model in K attempt(s))` 的 `K` 是实际调用次数，末尾带 `cut to fit` 说明这一次仍然切过；摘不出来时是 `notification summary failed (code): message`，桌面上看到的正文是「本轮已结束，摘要不可用」。
 - **摘不出来时不退回原文**：模型调不动、路由里没有可用模型、或整个压缩超过 20 秒时，通知照发，正文写「本轮已结束，摘要不可用」。这是刻意的取舍——回落到原文会让每一次失败都看起来像成功。
 - **通知只在真正 running → idle 时发**：会话第一次报 idle 是初始态，不算完成。首次启动/重连期间错过的跳变不会补发。
 - **桌面通知依赖本机工具**：Linux 需要 `notify-send`（`libnotify`）且有 `DISPLAY`/`WAYLAND_DISPLAY`；Windows 依赖 `powershell.exe` 的 WinRT toast（**Windows PowerShell 5.1，Win10/Win11 自带**）**且该通知必须挂在一个注册过的 AppUserModelID 下**——插件自己往 `HKCU` 的两个键写（已注册的 id 原样不动），写不进去就按失败上报。**跨版本那一半是推断而非实测**：`Classes\AppUserModelId` 只在 Win11 26300 上量过，`PushNotifications\Backup` 是为更老的 Win10 备的保险，本机没有 Win10 可验证。工具缺失或没有桌面时不派发，并由设置页的测试按钮如实报出原因（不弹「静默成功」的假象）。
