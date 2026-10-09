@@ -130,9 +130,17 @@ thresholdRatio = 你要的 token 数 ÷ 该模型窗口大小
 | 平台 | 派发方式 |
 | --- | --- |
 | Linux | `notify-send`（freedesktop）；**没有 `DISPLAY` / `WAYLAND_DISPLAY` 就不派发**——无头环境里那条命令注定失败，跳过并如实回报，而不是刷一堆失败。 |
-| Windows | `powershell.exe` 走 WinRT toast。脚本用 `-EncodedCommand`（base64 UTF-16LE）传递，标题与正文**从不进入命令行**，里面的单引号按 PowerShell 规则翻倍转义。 |
+| Windows | `powershell.exe` 走 WinRT toast。**必须是 Windows PowerShell 5.1**（Win10/Win11 自带）——`pwsh` 7 移除了 WinRT 投影，同一脚本在 7.6.6 上直接报「找不到类型 `Windows.UI.Notifications.ToastNotificationManager`」，所以这里写死 `powershell.exe`、绝不退回 `PATH` 上的 `pwsh`。脚本用 `-EncodedCommand`（base64 UTF-16LE）传递，标题与正文**从不进入命令行**，里面的单引号按 PowerShell 规则翻倍转义；**同一次运行里先注册自己的 AppUserModelID、再投递**（见下方注）。 |
 | WSL | Linux 进程、Windows 桌面：`notify-send` 通常没有可用的 session bus，所以 WSL 路由到 Windows 通知。 |
 | 其它 | 不派发。 |
+
+> **Windows 上为什么必须自己注册 AppUserModelID**：`CreateToastNotifier().Show()` 对**未注册**的 AppUserModelID 照样正常返回、PowerShell 照样退出 0、Windows 甚至把这条 toast 记进通知历史——然后**什么都不显示**。所谓注册，指的是开始菜单快捷方式的 `System.AppUserModel.ID`，或者未打包应用的 `HKCU\Software\Classes\AppUserModelId\<id>` 键；**Win10 与 Win11 都认后者**，不需要快捷方式、也不需要安装器（Win11 26100 实测：只有注册表键就能渲染）。这件事曾经被留给安装器，于是插件写死的 `ai.deepseek.dsh.desktop` 在一台装 DSH NEXT 的机器上成了幽灵 id（那台机器注册的是 `ai.deepseek.dsh.desktop.next`），每条通知都被排队后丢弃，而设置页的测试按钮还报「已发送」。现在脚本用 `Test-Path` 判一次——**已注册的 id 原样不动**，安装器给的名字和图标不被覆盖——没注册就自己写，注册失败被 `try`/`catch` 兜住、不阻断投递。脚本最后用一行 `prompt-tuner:appId=created|present|blocked` 回报结果，而 `blocked` 意味着这条 toast 注定看不见，于是宿主**按失败上报**（`/notify` 返回 `ok:false` 并附原因），不再演第二次「静默成功」。
+
+> **跨 Win10 / Win11 的写法**：Windows 10 与 11 对「未打包应用怎么算注册好了」并不完全一致，而本机只有 Win11 26300 可以实测，所以脚本**两个键都写**（都只写自己那个子键、都只在缺失时写、都只在 `HKCU`，不需要管理员）：
+> - `HKCU\Software\Classes\AppUserModelId\<id>`——现代身份键（`DisplayName` / `IconUri` / `ShowInSettings`），Win11 26300 实测：只写它就足以渲染。
+> - `HKCU\Software\Microsoft\Windows\CurrentVersion\PushNotifications\Backup\<id>`——1709 之前桌面应用声明「我要横幅/Toast/声音」的 opt-in（`appType=app:desktop`、`Setting=s:banner,s:toast,s:audio,c:toast,c:ringing`、`wnsId=NonImmersivePackage`）。
+>
+> 它**不碰** `Notifications\Settings\<id>`——那个每应用开关归 Windows 和用户管，被静音的就该保持静音。脚本只用 5.1 从 Windows 8 起就有的 cmdlet 与 `HKCU:` provider（`Test-Path` / `New-Item` / `New-ItemProperty` / `Write-Output`），不用 `Add-Type`、不 `Import-Module`、不碰 `HKLM:`，所以在受约束语言模式（WDAC/AppLocker）下也只是注册失败、照常报 `blocked`，而不是把整条链路带崩。
 
 **完成判定**用的就是 shell 自己的会话状态通道：客户端订阅 `remote.$on('api-session/status', (sessionId, running) => …)`，只有在**真正发生 running → idle 跳变**时才发（会话第一次报 `false` 是初始态，不算完成；idle → idle 也不重复发）。因此**后台会话跑完一样会通知**——你通常正是在看别处的时候，之前启动的任务才跑完。摘要由会话座位从 chat 快照里**结构化**取出（最后一条带 assistant 标记的记录里的 `text` 字段，流式中的 `partial` 也算），取不到就如实说「没有可用的回答摘要」，不编造。
 
@@ -267,7 +275,7 @@ thresholdRatio = 你要的 token 数 ÷ 该模型窗口大小
 | `lib/routes.js` | 路由层：状态、设置、改写、旁路提问、压缩、通知（含 SSE、失败阶梯、历史） |
 | `lib/prompt.js` | 默认优化提示词、档位指令、模板、输出规范化、待确认提取、旁路系统提示词与多轮消息组装 |
 | `lib/compaction.js` | 固定 token 阈值 → `compaction-basic` 策略（换算、校验、合并、YAML 片段、`configEditor` 写入） |
-| `lib/notify.js` | 桌面通知：平台判定（含 WSL）、标题/正文折叠与 **`...` 缩写**、命令构造（argv / `-EncodedCommand`）、有界派发 |
+| `lib/notify.js` | 桌面通知：平台判定（含 WSL）、标题/正文折叠与 **`...` 缩写**、命令构造（argv / `-EncodedCommand`）、**Windows AppUserModelID 自举与回报**、有界派发 |
 | `lib/store.js` | 配置读写（原子写、容错读）+ 旁路历史存储（每会话分片、裁剪） |
 | `lib/http.js` | JSON 信封、有上限的 body 读取、回环信任围栏 |
 | `lib/client.js` | 浏览器半区：六个注册入口 + per-session 状态机 + 完成通知订阅 |
@@ -277,13 +285,13 @@ thresholdRatio = 你要的 token 数 ÷ 该模型窗口大小
 ## 自检与基准
 
 ```sh
-npm run check                 # 458 项，含宿主路由、压缩/通知模块与浏览器半区
+npm run check                 # 472 项，含宿主路由、压缩/通知模块与浏览器半区
 npm run check:shape           # 对**已安装**的 DSH 复核旁路提问的消息形状（需要本机有 DSH）
 node scripts/bench.mjs --runs 3 --effort off
 node scripts/bench.mjs --runs 3 --effort auto     # 对照：省掉字段要多花多少时间
 ```
 
-自检不用测试框架，四层：**静态契约**（注入器按字面读取的 `slots.register` 调用（现为六处）、`dsh.bundle`、主题 token-only CSS、中英词典键一致、同座位不得重复 `id`、旧项目名已无残留）、**宿主路由**（假 `ctx`/假 HTTP 驱动真实 handler：失败阶梯、强度协商、预算、SSE 帧序、信任围栏、旁路提问的拒绝分支与历史落盘/清空，以及「全部历史原样收下、超长上下文既不拒绝也不截断、每个增量一帧、不给模型工具、assistant 轮次带 `source`、多轮形状被拒时改用单轮重问」，以及旁路提问自己的模型与强度：`/state` 分别上报两半的路由、`btw*` 只影响旁路提问、清空后回落与改写一致）、**压缩与通知模块**（固定 token → 该模型占比的换算与边界：窗口约掉后仍是同一个绝对数、超过窗口/超出范围/窗口未知分别被拒、`retainRatio` 恒小于 `thresholdRatio`、接近窗口上限时 capped、合并策略只覆盖同 route 并保留手写行、`configEditor` 写入与 `unavailable`/`entry-missing`/reconcile 抛错三条失败路径；平台判定 Linux/Windows/WSL/无桌面、Linux 命令 argv 无 shell、Windows `-EncodedCommand` 解回真实脚本且单引号翻倍、超长与控制字符先折叠、**缩写后长度不超过上限且以 `...` 结尾**、上限可被调用方覆盖、手改坏的字符数被夹回范围；以及 `/state`、`/save`、`/compaction.windows`、`/compaction.apply`、`/notify`、`/notify.test` 六条路由的准入与拒绝）、**浏览器半区**（假 React + 假 fetch 执行真实组件：自动替换 vs 等待确认、会话隔离、撤销、芯片守卫、JSON 回退、i18n、旁路提问的原始记录携带与面板状态机，以及「进入会话就自动补齐历史、提问带的是补齐后的整段、工具调用及其结果原样在内、进行中的调用与流式文本也在内、分页不前进时如实报 partial、三种上下文标签各说各的真话、选『不带上下文』时不去拉历史」，以及设置页的页签分组：六组设置项**互不重叠、并集等于这 16 项**、两处模型/强度下拉的可选值逐个相同、写设置时只带 `btw*` 键、aria 连线与方向键走查、访问过的页签保持挂载，加上完成通知：摘要结构化提取、会话标题现读、`running → idle` 才发一次、初始 idle 与 idle → idle 都不发、无 `remote` 时静默降级，以及一条回归守卫——**服务只能经 `ctx.get` 拿到、裸读 `ctx.<name>` 会抛错**（cordis 对未 inject 的服务就是如此）时，订阅与写入仍必须成立；再加上摘要字符上限：越界不保存且就地说明范围、改它只发 `notifyMaxChars` 一个键、清空输入框不算改设置、宿主没上报契约时这一项不出现）。
+自检不用测试框架，四层：**静态契约**（注入器按字面读取的 `slots.register` 调用（现为六处）、`dsh.bundle`、主题 token-only CSS、中英词典键一致、同座位不得重复 `id`、旧项目名已无残留）、**宿主路由**（假 `ctx`/假 HTTP 驱动真实 handler：失败阶梯、强度协商、预算、SSE 帧序、信任围栏、旁路提问的拒绝分支与历史落盘/清空，以及「全部历史原样收下、超长上下文既不拒绝也不截断、每个增量一帧、不给模型工具、assistant 轮次带 `source`、多轮形状被拒时改用单轮重问」，以及旁路提问自己的模型与强度：`/state` 分别上报两半的路由、`btw*` 只影响旁路提问、清空后回落与改写一致）、**压缩与通知模块**（固定 token → 该模型占比的换算与边界：窗口约掉后仍是同一个绝对数、超过窗口/超出范围/窗口未知分别被拒、`retainRatio` 恒小于 `thresholdRatio`、接近窗口上限时 capped、合并策略只覆盖同 route 并保留手写行、`configEditor` 写入与 `unavailable`/`entry-missing`/reconcile 抛错三条失败路径；平台判定 Linux/Windows/WSL/无桌面、Linux 命令 argv 无 shell、Windows `-EncodedCommand` 解回真实脚本且单引号翻倍、**自举脚本先注册 AppUserModelID 再投递、且用 `Test-Path` 保证已注册的 id 不被覆盖**、`created/present/blocked` 三种回报都能读回、**注册不上时按失败上报而不是报一个没人看得见的成功**、**跨 Win10/Win11 两个注册键都写、只用 5.1 就有的 cmdlet（不 `Add-Type`、不 `Import-Module`、不碰 `HKLM:`）、不碰用户的 `Notifications\Settings`、Windows 一律走 `powershell.exe`**、超长与控制字符先折叠、**缩写后长度不超过上限且以 `...` 结尾**、上限可被调用方覆盖、手改坏的字符数被夹回范围；以及 `/state`、`/save`、`/compaction.windows`、`/compaction.apply`、`/notify`、`/notify.test` 六条路由的准入与拒绝）、**浏览器半区**（假 React + 假 fetch 执行真实组件：自动替换 vs 等待确认、会话隔离、撤销、芯片守卫、JSON 回退、i18n、旁路提问的原始记录携带与面板状态机，以及「进入会话就自动补齐历史、提问带的是补齐后的整段、工具调用及其结果原样在内、进行中的调用与流式文本也在内、分页不前进时如实报 partial、三种上下文标签各说各的真话、选『不带上下文』时不去拉历史」，以及设置页的页签分组：六组设置项**互不重叠、并集等于这 16 项**、两处模型/强度下拉的可选值逐个相同、写设置时只带 `btw*` 键、aria 连线与方向键走查、访问过的页签保持挂载，加上完成通知：摘要结构化提取、会话标题现读、`running → idle` 才发一次、初始 idle 与 idle → idle 都不发、无 `remote` 时静默降级，以及一条回归守卫——**服务只能经 `ctx.get` 拿到、裸读 `ctx.<name>` 会抛错**（cordis 对未 inject 的服务就是如此）时，订阅与写入仍必须成立；再加上摘要字符上限：越界不保存且就地说明范围、改它只发 `notifyMaxChars` 一个键、清空输入框不算改设置、宿主没上报契约时这一项不出现）。
 
 **历史窗口**（浏览器半区里的独立一组）：用一个假会话面（`loadOlder()` 把 fixture 页前插进面板读的那个数组，`getSnapshot()` 像真实现一样缓存引用）驱动真实的 `ensureFullHistory`：一路拉回最早一页 → `complete`；页请求不前进 → 一次就停并报 `partial`；没有 `sessions` 服务 → `unavailable`；座位挂载即触发；提问时读的是补齐后的窗口。
 
@@ -301,7 +309,7 @@ node scripts/bench.mjs --runs 3 --effort auto     # 对照：省掉字段要多�
 - **通知的摘要取自未文档化的 chat 快照形状**：插件按「最后一条带 `assistant` 标记的记录里的 `text` 字段」结构化提取，取不到就如实报「没有可用的回答摘要」而不是编造。因此极少数自定义渲染的消息可能提取为空——通知仍会发，正文回落成「本轮没有可用的回答摘要」这句话，而不是一条只有标题的通知。
 - **通知的正文是缩写，不是原文**：回答先折叠成一行，再按设置的长度（默认 120 字符）切一刀并以 `...` 结尾。摘要是「要点速览」，完整内容仍在会话里；想看得多一点就把上限调大（最多 600）。
 - **通知只在真正 running → idle 时发**：会话第一次报 idle 是初始态，不算完成。首次启动/重连期间错过的跳变不会补发。
-- **桌面通知依赖本机工具**：Linux 需要 `notify-send`（`libnotify`）且有 `DISPLAY`/`WAYLAND_DISPLAY`；Windows 依赖 `powershell.exe` 的 WinRT toast（系统自带）。工具缺失或没有桌面时不派发，并由设置页的测试按钮如实报出原因（不弹「静默成功」的假象）。
+- **桌面通知依赖本机工具**：Linux 需要 `notify-send`（`libnotify`）且有 `DISPLAY`/`WAYLAND_DISPLAY`；Windows 依赖 `powershell.exe` 的 WinRT toast（**Windows PowerShell 5.1，Win10/Win11 自带**）**且该通知必须挂在一个注册过的 AppUserModelID 下**——插件自己往 `HKCU` 的两个键写（已注册的 id 原样不动），写不进去就按失败上报。**跨版本那一半是推断而非实测**：`Classes\AppUserModelId` 只在 Win11 26300 上量过，`PushNotifications\Backup` 是为更老的 Win10 备的保险，本机没有 Win10 可验证。工具缺失或没有桌面时不派发，并由设置页的测试按钮如实报出原因（不弹「静默成功」的假象）。
 - 收录进 awesome 列表**不等于**安全审查。
 
 ## 安装

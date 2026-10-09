@@ -990,6 +990,57 @@ function cordisLikeContext(services) {
     notify.windowsToastScript("a'b", "c'd").includes("'a''b'")
       && notify.windowsToastScript("a'b", "c'd").includes("'c''d'"))
 
+  // Windows accepts a toast under an AppUserModelID that is not registered,
+  // files it in the notification history, and renders nothing — while
+  // `CreateToastNotifier` returns normally and PowerShell exits 0. So the
+  // script has to register the id itself, and say whether that worked.
+  const bootstrap = notify.windowsToastScript('T', 'B', { appId: 'com.example.app', displayName: 'Example', iconUri: 'C:\\Example.exe' })
+  check('Windows 脚本自带 AUMID 自举：注册与投递在同一次运行里',
+    bootstrap.includes("'HKCU:\\Software\\Classes\\AppUserModelId\\'")
+      && bootstrap.includes('New-ItemProperty')
+      && bootstrap.includes('CreateToastNotifier($appId)'),
+    bootstrap.slice(0, 100))
+  check('兼容 Win10 与 Win11：两个注册键都写（现代身份键 + pre-1709 opt-in）',
+    bootstrap.includes("'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\PushNotifications\\Backup\\'")
+      && bootstrap.includes("-Name appType -Value 'app:desktop'")
+      && bootstrap.includes("-Name wnsId -Value 'NonImmersivePackage'")
+      && bootstrap.includes('s:banner,s:toast,s:audio'))
+  check('自举只在 id 未注册时写（Test-Path 守卫），且失败不阻断投递（try/catch）',
+    bootstrap.includes('if (Test-Path $appIdKey) { $appIdState = "present" }')
+      && bootstrap.includes('if (-not (Test-Path $optInKey))')
+      && bootstrap.includes('} catch { }')
+      && bootstrap.indexOf('} catch { }') < bootstrap.indexOf('CreateToastNotifier'))
+  check('不碰用户自己的每应用通知开关（Notifications\\Settings 归 Windows 与用户管）',
+    !bootstrap.includes('Notifications\\Settings'))
+  check('自举只用 5.1 就有的 cmdlet 与 HKCU: provider（不依赖模块、不 elevates）',
+    ['Test-Path', 'New-Item ', 'New-ItemProperty', 'Write-Output'].every((cmdlet) => bootstrap.includes(cmdlet))
+      && !bootstrap.includes('Add-Type')
+      && !bootstrap.includes('Import-Module')
+      && !bootstrap.includes('HKLM:'))
+  check('Windows 一律走 powershell.exe（5.1 有 WinRT 投影，pwsh 7 没有）',
+    notify.WINDOWS_SHELL === 'powershell.exe'
+      && notify.buildNotifyCommand('windows', { title: 'T', body: 'B' }).command === 'powershell.exe')
+  check('自举结果以标记行回报，供调用方读取',
+    bootstrap.includes("Write-Output ('prompt-tuner:appId=' + $appIdState)"))
+  check('appId / displayName / iconUri 可覆盖，且按 PowerShell 规则转义',
+    bootstrap.includes("$appId = 'com.example.app'")
+      && bootstrap.includes("-Value 'Example'")
+      && bootstrap.includes("-Value 'C:\\Example.exe'")
+      && notify.windowsToastScript('T', 'B', { appId: "a'b" }).includes("$appId = 'a''b'"))
+  check('windowsAppIdRegistryPath 指向 HKCU 的 AppUserModelId 键',
+    notify.windowsAppIdRegistryPath('com.example.app') === 'HKCU:\\Software\\Classes\\AppUserModelId\\com.example.app'
+      && notify.windowsAppIdRegistryPath() === 'HKCU:\\Software\\Classes\\AppUserModelId\\' + notify.WINDOWS_APP_ID)
+  check('windowsAppIdOptInPath 指向 HKCU 的 PushNotifications\\Backup 键',
+    notify.windowsAppIdOptInPath('com.example.app') === 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\PushNotifications\\Backup\\com.example.app'
+      && notify.windowsAppIdOptInPath() === 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\PushNotifications\\Backup\\' + notify.WINDOWS_APP_ID)
+  check('parseAppIdState 认三种结果，读不出来不猜',
+    notify.parseAppIdState('prompt-tuner:appId=created\n') === 'created'
+      && notify.parseAppIdState('prompt-tuner:appId=present') === 'present'
+      && notify.parseAppIdState('prompt-tuner:appId=blocked') === 'blocked'
+      && notify.parseAppIdState('') === undefined
+      && notify.parseAppIdState(undefined) === undefined
+      && notify.parseAppIdState('noise') === undefined)
+
   const okRun = async () => ({ error: null })
   const failRun = async () => ({ error: new Error('notify-send not found') })
   check('sendNotification 成功时 ok=true 并回报平台与命令',
@@ -998,6 +1049,29 @@ function cordisLikeContext(services) {
     (await notify.sendNotification({ title: 'T', body: 'B' }, { platform: 'linux', env: { DISPLAY: ':0' }, run: failRun })).error === 'notify-send not found')
   check('无桌面时跳过并说明 skipped，不调用任何命令',
     (await notify.sendNotification({ title: 'T', body: 'B' }, { platform: 'linux', env: {} })).skipped === 'no-display')
+
+  // The Windows half of the same contract: the toast run also reports whether
+  // its AppUserModelID ended up registered, because that — not the WinRT call's
+  // return value — is what decides whether anything reaches the screen.
+  const windowsRun = (stdout) => async () => ({ error: null, stdout })
+  const createdNote = await notify.sendNotification({ title: 'T', body: 'B' }, { platform: 'win32', run: windowsRun('prompt-tuner:appId=created') })
+  const presentNote = await notify.sendNotification({ title: 'T', body: 'B' }, { platform: 'win32', run: windowsRun('prompt-tuner:appId=present') })
+  check('Windows 投递成功时回报自举结果（created / present 都算注册好了）',
+    createdNote.ok === true && createdNote.registration === 'created'
+      && presentNote.ok === true && presentNote.registration === 'present',
+    `${createdNote.registration} / ${presentNote.registration}`)
+  const blockedNote = await notify.sendNotification(
+    { title: 'T', body: 'B' },
+    { platform: 'win32', appId: 'com.example.ghost', run: windowsRun('prompt-tuner:appId=blocked') },
+  )
+  check('AUMID 注册不上时如实报失败，而不是报一个没人看得见的成功',
+    blockedNote.ok === false && blockedNote.registration === 'blocked'
+      && String(blockedNote.error).includes('com.example.ghost'),
+    JSON.stringify(blockedNote))
+  const unattested = await notify.sendNotification({ title: 'T', body: 'B' }, { platform: 'win32', run: async () => ({ error: null }) })
+  check('没回报自举结果的 runner（测试替身）不编造 registration',
+    unattested.ok === true && !('registration' in unattested))
+
   let capturedArgs = null
   const captureRun = async (_command, args) => {
     capturedArgs = args
