@@ -1,0 +1,1 @@
+Output language (this line overrides anything above that conflicts): write the rewritten prompt itself in English. Keep proper nouns, file paths, commands, interface names, variable names, code and any quoted source text verbatim — never translate them. For a term with no established English equivalent, keep the original and gloss it once at first use.

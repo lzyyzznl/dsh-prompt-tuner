@@ -1,0 +1,113 @@
+{
+  "note": "fixed evaluation set; real entries are sanitized user drafts from this workspace's session logs",
+  "drafts": [
+    {
+      "id": "real-01",
+      "source": "real",
+      "shape": "bug report",
+      "text": "为什么一个对话结束会发送2遍通知而且内容都说没有摘要需要通知呢"
+    },
+    {
+      "id": "real-02",
+      "source": "real",
+      "shape": "paste-heavy bug report",
+      "text": "为什么我无法删除ccx这个模型？ 删除 ccx？\r\n\r\n删除 ccx 会移除其配置；其使用的凭证（如有）由其他位置管理，将会保留。\r\n\r\nConfiguration for \"llm-pi-ai\" is overridden by a home patch or command-line overlay"
+    },
+    {
+      "id": "real-03",
+      "source": "real",
+      "shape": "question",
+      "text": "当前dsh插件的这个改写功能是干嘛的？ 简单说说"
+    },
+    {
+      "id": "real-04",
+      "source": "real",
+      "shape": "question (multi-line, pasted option list)",
+      "text": "标准\r\n精简\r\n结构化\r\n扩写 这4个有啥区别？"
+    },
+    {
+      "id": "real-05",
+      "source": "real",
+      "shape": "config change request (detailed spec)",
+      "text": "为\"旁路提问\"功能加上与\"优化提示词\"相同的模型选择与思考等级设置。\r\n\r\n约束：\r\n- 实现方式、入口位置、交互形态完全参照现有\"优化提示词\"的做法，保持一致；不新增其他设置项。\r\n- 只做这一处改动，不重构其他模块。\r\n\r\n验收标准：\r\n- \"旁路提问\"界面存在模型选择项，可选值与\"优化提示词\"一致。\r\n- \"旁路提问\"界面存在思考等级设置项，可选值与\"优化提示词\"一致。\r\n- 两项设置只作用于旁路提问，不影响\"优化提示词\"及其他功能的现有设置。\r\n- 不设置时，回落行为与\"优化提示词\"不设置时的行为一致。\r\n\r\n## 待确认\r\n- 未说明技术栈与代码位置，按\"在现有旁路提问实现处直接改\"处理。\r\n- 未说明是否需要持久化保存设置，按与\"优化提示词\"现有保存方式一致处理。\r\n- 未说明\"旁路提问\"是否已有对应 UI 组件，按复用\"优化提示词\"的组件处理。"
+    },
+    {
+      "id": "real-06",
+      "source": "real",
+      "shape": "docs / repo-structure request",
+      "text": "将 README 改为简洁的功能介绍，把完整的历史改进过程与内容移出 README，另建单独的历史变更文档或文件夹承载，README 中通过引用指向该文档。\n\n非目标：不改动历史改进内容本身，只做位置与结构的调整。\n\n## 待确认\n- 未提供现有 README 路径与历史内容所在文件，默认处理对象为仓库根目录的 README 及其中已写入的历史内容。\n- 历史变更文档的名称、格式与存放路径未指定，默认沿用仓库现有约定。\n- 默认不删除任何历史信息，仅迁移。"
+    },
+    {
+      "id": "real-07",
+      "source": "real",
+      "shape": "research / design request",
+      "text": "最好的通用一些不用写死领域 主要是核心逻辑要清晰"
+    },
+    {
+      "id": "real-08",
+      "source": "real",
+      "shape": "config change request (short)",
+      "text": "我希望可以在设置里面切换中英文 要么中文要么英文"
+    },
+    {
+      "id": "real-09",
+      "source": "real",
+      "shape": "one-line vague request",
+      "text": "提交然后更新当前dsh的最新版本"
+    },
+    {
+      "id": "real-10",
+      "source": "real",
+      "shape": "one-line vague request (question form)",
+      "text": "代码push了吗"
+    },
+    {
+      "id": "syn-01",
+      "source": "synthetic",
+      "shape": "one-sentence vague request",
+      "text": "帮我弄一下那个东西，随便看看怎么改比较好"
+    },
+    {
+      "id": "syn-02",
+      "source": "synthetic",
+      "shape": "Chinese question (为什么…)",
+      "text": "为什么我用同样的提示词，跑两次得到的结果差这么多？"
+    },
+    {
+      "id": "syn-03",
+      "source": "synthetic",
+      "shape": "English question",
+      "text": "Why does the plugin reload the whole panel every time I change one setting?"
+    },
+    {
+      "id": "syn-04",
+      "source": "synthetic",
+      "shape": "long detailed spec (>800 chars)",
+      "text": "我想要给这个插件加一个新的「快速提问」面板，需求大概是这样：\n\n背景：现在每次想问一个小问题，都要先切到旁路提问，再手动选模型、选思考等级，步骤太多了，日常用起来很烦。而且旁路提问的记录和主对话混在一起，想回头找一个具体问过什么特别难找。\n\n目标：在不改动现有旁路提问逻辑的前提下，新增一个「快速提问」入口，把最常用的那套参数固定下来，一键就能问。\n\n具体要做的事：\n1. 在会话输入框旁边加一个按钮，点了直接弹出一个单行输入框，不需要切页面，弹框位置贴着按钮，不要做成居中大弹窗。\n2. 弹框里只需要一个输入框 + 一个发送按钮，回车即发送，Shift+回车换行，Esc 关闭并保留已输入的内容。\n3. 这套快速提问使用的模型、思考等级、携带上下文条数，全部在设置面板里单独放一个 tab 配置，不要和旁路提问的设置混在一起。未配置时回落到当前默认值。\n4. 快速提问的会话记录不要出现在主对话流里，单独存在一份列表，可以点开查看，也可以一键清空，清空要二次确认。\n5. 如果正在等待上一条快速提问的回复，发送按钮要置灰，避免并发请求；超时 60 秒要自动放开发送按钮并提示失败。\n6. 快速提问的回答支持一键「插入到主对话」，插入后作为一条普通用户消息提交给 agent；如果已经有正在跑的回合，要先提示会排队。\n7. 列表里的每条记录要显示提问时间、耗时、使用的模型名，长内容折叠到三行，点开看全文。\n\n约束：\n- 不复用旁路提问的存储结构，新建一套 key，避免互相污染。\n- 不新增任何第三方依赖，继续用现有的 ESM 写法，不加构建步骤。\n- 现有的旁路提问、提示词优化这两个功能的行为一个都不能变，改完要能跑通现有的 check 脚本。\n- UI 风格跟随现有设置面板，不引入新的组件库，深色模式下也要能看。\n\n验收标准：\n- 点击按钮能弹出输入框，回车能发出请求并拿到回复。\n- 设置面板里能找到「快速提问」独立 tab，改动后立即生效，重启后仍然保留。\n- 快速提问的记录不进入主对话流，列表能正确显示时间和内容，清空功能可用。\n- 并发保护生效：上一条没回来时发送按钮不可点，超时后能恢复。\n- 「插入到主对话」之后，主对话里能看到这条消息，并且 agent 正常响应。\n- 现有 check 脚本全部通过，旁路提问与提示词优化的手动验证结果与改动前一致。\n\n如果哪里没说清楚，先按你判断的最合理方式实现，做完把改动点和假设列出来给我看。"
+    },
+    {
+      "id": "syn-05",
+      "source": "synthetic",
+      "shape": "pasted error / stack trace with no request verb",
+      "text": "TypeError: Cannot read properties of undefined (reading 'length')\n    at renderPanel (<路径>:412:31)\n    at updateSettings (<路径>:388:5)\n    at HTMLInputElement.<anonymous> (<路径>:501:9)\n\nat 打开设置面板 -> 改「携带最近 n 条」-> 清空输入框 -> 报错\n控制台只有这一条，面板直接白掉了"
+    },
+    {
+      "id": "syn-06",
+      "source": "synthetic",
+      "shape": "pure small talk, no task",
+      "text": "早"
+    },
+    {
+      "id": "syn-07",
+      "source": "synthetic",
+      "shape": "bare code snippet with no request verb",
+      "text": "const turns = store.get('btwContextTurns');\nconst list = turns === 'all' ? all : all.slice(-turns);\nreturn list.map(serialize).join('\\n');"
+    },
+    {
+      "id": "syn-08",
+      "source": "synthetic",
+      "shape": "very long draft (>3000 chars, messy pasted log/requirements dump)",
+      "text": "梳理一下这次要改的东西，我先把乱七八糟的都贴在这里，你看着办。\n\n=== 最近几天攒的反馈 ===\n1. 通知老是发两遍，而且两遍的内容都是「没有摘要需要通知」，不知道从哪冒出来的。\n2. 有时候通知发出来了，点进去看不到对应的会话，标题也不对。\n3. windows 上压根收不到通知，mac 上正常。win10 和 win11 都要测，powershell 版本也不一样，5.1 和 7 都跑过。\n4. 旁路提问的上下文好像少了工具调用的结果，只带了最终的 assistant 文本。\n5. 携带最近 n 条，n 想手动输入，不要给我固定的 0/4/8/16。\n6. 设置的 tab 太多了，提示词优化占了一整块，想只留一个。\n7. 想能切换输出语言，中文或者英文，做个开关就行。\n8. 会话标题每 100 轮重新总结一次，长度上限也想能配。\n9. 标题生成用的模型最好也能单独选。\n10. 快速提问希望能一键插入主对话。\n\n=== 我自己的碎碎念 ===\n其实上面这些有一半是我在用的过程中顺手记的，可能不准确。你先别急着全做，先把能确认的确认一下，不确定的列出来问我。\n另外这个项目是我自己维护的一个 dsh 的小插件，纯 ESM，没有构建步骤，别给我引入 webpack/vite 那一套。测试就一个 scripts/check.mjs，改完必须过。\n\n=== 一次崩溃现场 ===\nTypeError: Cannot read properties of undefined (reading 'text')\n    at normalize (<路径>:77:18)\n    at buildPrompt (<路径>:52:3)\n    at <路径>:141:20\n当时是在设置里把自定义提示词清空，然后立刻点保存。\n\n=== 上次改完留下的 todo（我抄过来的，可能已经过时） ===\n- [x] 把多模式改成单模式\n- [x] 自义提示词覆盖默认\n- [ ] n 条消息拼进提示词（顺序要时间正序）\n- [ ] 不足 n 条不要报错\n- [ ] 通知先总结再推送\n- [ ] 总结时关闭 thinking\n- [ ] 模型可配置，放「消息通知设置」里\n\n=== 环境 ===\nnode v26，dsh 最新版，win11 + powershell 7，偶尔在 wsl 里跑。\n\n=== 又翻出几条更早的聊天记录（原样贴，没整理） ===\n「通知那个还是不行，我重启了 dsh 也没用」\n「标题能不能别每次都变，看着眼花」\n「设置里的开关点了没反应，刷新一下才生效」\n「这个 n 条到底算不算工具结果？我数了数好像不对」\n「能不能加个导出，我要把设置备份一下」\n「中文英文那个开关，是只影响输出还是连界面一起变？」\n\n=== 我瞎猜的优先级 ===\nP0：通知、崩溃、n 条上下文\nP1：快速提问、设置 tab 合并、语言开关\nP2：标题重总结、导出、耗时显示\n但我不确定 P0 里哪个最急，你按依赖关系排一下，别按我这个拍脑袋的来。\n\n=== 一些没想清楚的点 ===\n- 「携带最近 n 条」到底是按消息条数算，还是按消息+工具调用+结果算？两种算法的结果差挺多的。\n- 通知总结用的模型，如果没配，是回落到默认模型还是干脆不总结直接发原文？\n- 语言开关要不要影响内置提示词？我感觉要，但不确定会不会把已有用户的自定义提示词搞坏。\n- 快速提问的记录要不要跟着会话走？换会话还能不能看到？\n\n大概就这些，你先读一遍，然后告诉我你打算怎么拆分、先做哪几个，别一上来就动手。\n\n=== 下面是我从终端里直接复制出来的，格式全乱了，凑合看 ===\nPS <路径>> node scripts/check.mjs\n[check] notify: last-message summary ................ ok\n[check] notify: thinking disabled .................. ok\n[check] notify: model configurable ................. FAIL\n  expected config key \"notifyModel\" to be read before fallback\n  got: undefined\n[check] panel: single tab ......................... ok\n[check] prompt: custom overrides default ........... ok\n[check] prompt: recent n messages in order ........ ok\n[check] prompt: n exceeds history ................. ok\n[check] btw: context includes tool results ........ FAIL\n  expected: message + tool-call + tool-result (whole records)\n  got:      message only\npassed 7, failed 2, total 9\nPS <路径>> git status --short\n M lib/prompt.js\n M lib/routes.js\n M lib/store.js\n?? scripts/eval/\nPS <路径>> git log --oneline -8\nf3a91c2 通知：改成本地拼接，先不调模型\nb7e02d4 标题：初始取第一句话\n9c4d18a 设置：拆分 tab\n1a0ff34 旁路提问：补上模型选择\n55b8e10 提示词优化：改成单模式\nPS <路径>>\n\n=== 一份我很早写的、可能已经完全过时的需求草稿 ===\n「做一个 dsh 插件，功能是：把用户输入的话先过一遍模型，改写得更清楚再发给 agent。要支持几个预设风格，比如标准、精简、结构化、扩写。界面上要能让用户选风格，还要能填自定义提示词。另外再做一个旁路提问，就是主对话之外还能单独问一个问题，不干扰主流程。旁路提问要能带上下文，带多少条要能选，给几个固定档位就好，全部、0、4、8、16。通知也要做，会话结束的时候发个系统通知。通知内容就取最后一条消息。」\n—— 现在看这份草稿基本都被推翻了：风格只留一个模式、档位要改成手填、通知要先总结再发。但我还是贴上来，因为里面「不干扰主流程」这个点我觉得现在依然成立，快速提问也应该按这个原则来。\n\n=== 另外还有几个我一直没想明白、想让你给个判断的 ===\n1. 现在这几个功能（提示词优化、旁路提问、通知增强、标题总结、快速提问）要不要抽一个公共的「模型调用 + 参数回落」层出来？现在每个地方各写一份，参数默认值散在四五个文件里，我改一个忘一个。但抽出来又是一次不小的重构，怕把已经测好的东西搞坏，你怎么权衡？\n2. 设置面板现在 tab 越来越多，是继续加 tab，还是改成左边一个列表右边内容的分栏？我倾向分栏，但这算 UI 重构，超出这次范围了，想听你的意见。\n3. 测试只有 scripts/check.mjs 一个手写的脚本，没有真正的单测框架。要不要顺手引入一个？我担心又要加依赖，和我一直坚持的「零依赖、无构建」冲突。\n4. 我有时候会在 wsl 里跑这套东西，路径和 powershell 通知那部分会不一样，这块要不要专门处理？还是干脆声明不支持 wsl？\n\n=== 最后再贴一段我自己写的、很啰嗦的验收想法，你帮我压一压 ===\n我希望改完之后，第一，通知不要再发两遍，也不要再出现「没有摘要需要通知」这种看不懂的话；第二，通知点进去要能看到对应会话，标题得对得上；第三，windows 上必须能收到通知，win10、win11、powershell 5.1 和 7 都要能跑；第四，旁路提问带的上下文必须包含工具调用的结果，不能只剩最后的回答；第五，携带最近 n 条要能手填，填多少就是多少，不足不报错；第六，设置面板里提示词优化只留一个 tab，不要多模式；第七，输出语言中英文可切换；第八，标题每 100 轮重新总结，长度上限可配，用的模型也能单独选；第九，快速提问能一键插入主对话；第十，现有 check 脚本必须全过，其他功能行为一律不变。\n\n好了我真的写完了，你看完先别改代码，给我一个拆分方案和顺序，有疑问的地方直接列出来问我。"
+    }
+  ]
+}
