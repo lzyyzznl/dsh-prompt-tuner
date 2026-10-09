@@ -6,9 +6,13 @@
  * fixed draft set, three arms, and a judge that never learns which arm produced
  * which rewrite.
  *
- *   baseline   scripts/eval/prompt-baseline.txt    the prompt as it shipped before a change
- *   candidate  scripts/eval/prompt-candidate.txt   the prompt under test
- *   minimal    scripts/eval/prompt-minimal.txt     a deliberately compressed variant
+ *   baseline   scripts/eval/prompt-baseline.txt   the 22-rule prompt the six-step rewrite replaced
+ *   previous   scripts/eval/prompt-previous.txt   the prompt that shipped before this iteration
+ *   candidate  scripts/eval/prompt-candidate.txt  the prompt under test
+ *   minimal    scripts/eval/prompt-minimal.txt    a deliberately compressed variant
+ *
+ * Every arm runs 18 drafts, so three arms is the default shape (54 calls); a
+ * fourth is accepted and judged too. The arm set is chosen with `--arms`.
  *
  * The arms run through the running host, not a private HTTP client: a rewrite is
  * `POST <url>/dsh-prompt-optimizer/optimize`, and an arm is selected by writing
@@ -65,9 +69,10 @@ const outDir = String(flag('out', RUNS_DIR))
 const concurrency = num('concurrency', 3)
 const limit = num('limit', 0)
 
-/** The three arms, in report order. `lang` appends the runtime language line. */
+/** The arms, in report order. `lang` appends the runtime language line. */
 const ARM_DEFS = [
-  { name: 'baseline', file: 'prompt-baseline.txt', lang: null, note: 'the shipped prompt before the change' },
+  { name: 'baseline', file: 'prompt-baseline.txt', lang: null, note: 'the 22-rule prompt the six-step rewrite replaced' },
+  { name: 'previous', file: 'prompt-previous.txt', lang: String(flag('lang', 'zh')), note: 'the prompt that shipped before this iteration' },
   { name: 'candidate', file: 'prompt-candidate.txt', lang: String(flag('lang', 'zh')), note: 'the prompt under test' },
   { name: 'minimal', file: 'prompt-minimal.txt', lang: String(flag('lang', 'zh')), note: 'deliberately compressed' },
 ]
@@ -279,7 +284,7 @@ function parseJudgement(text) {
       continue
     }
     const candidate = String(parsed.candidate ?? '').toUpperCase()
-    if (!'ABC'.includes(candidate) || candidate.length !== 1) continue
+    if (!'ABCD'.includes(candidate) || candidate.length !== 1) continue
     scores.push({
       candidate,
       fidelity: Number(parsed.fidelity),
@@ -320,7 +325,7 @@ async function runJudge(set) {
       // The mapping is fixed per draft (and reproducible from the run stamp), so
       // the same draft can be re-judged and compared.
       const order = seededShuffle([...rows.keys()], `${run.stamp ?? ''}:${draft.id}`)
-      const labels = ['A', 'B', 'C'].slice(0, order.length)
+      const labels = ['A', 'B', 'C', 'D'].slice(0, order.length)
       const mapping = Object.fromEntries(labels.map((label, index) => [label, order[index]]))
       const labelled = labels.map((label) => ({ label, text: rows.get(mapping[label]).text }))
       const { ms, envelope, transport } = await call('/optimize', { text: judgePayload(draft, labelled), records: [] })
