@@ -1,7 +1,7 @@
 {
   "name": "dsh-prompt-tuner",
   "version": "0.1.0",
-  "description": "A personal DSH Web plugin suite for the composer: single-mode prompt rewriting (a built-in default prompt, or your own, plus the newest n session messages, riding the session's own model) with one settings tab, plus read-only side questions, desktop notifications and session titles",
+  "description": "A personal DSH Web plugin suite for the composer: single-mode prompt rewriting (a built-in default prompt, or your own, plus a Chinese/English switch for the rewrite's own output language and the newest n session messages, riding the session's own model) with one settings tab, plus read-only side questions, desktop notifications and session titles",
   "type": "module",
   "main": "./lib/index.js",
   "files": [
@@ -33,7 +33,8 @@
     "check": "node scripts/check.mjs",
     "check:shape": "node scripts/check-thread-shape.mjs",
     "check:title": "node scripts/check-title-shape.mjs",
-    "bench": "node scripts/bench.mjs"
+    "bench": "node scripts/bench.mjs",
+    "eval:prompt": "node scripts/eval-prompt.mjs"
   },
   "exports": {
     ".": {

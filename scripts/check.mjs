@@ -147,17 +147,23 @@ const notifySummary = await import('../lib/notify-summary.js')
 section('2. 提示词与设置')
 
 const defaultPrompt = prompt.DEFAULT_SYSTEM_PROMPT
-for (const marker of ['保真', '补全字段', '消除矛盾', '体量', '禁止', '输出', '待确认', '长度与任务相称', '不编造', '会话上下文']) {
+for (const marker of ['判定', '保真', '补全', '冲突', '裁剪', '输出', '待确认', '不编造', '上下文', '输出语言']) {
   check(`默认提示词含「${marker}」`, defaultPrompt.includes(marker))
 }
-check('默认提示词长度在 1000-4000 字之间（够细但不失控）', defaultPrompt.length > 1000 && defaultPrompt.length < 4000, String(defaultPrompt.length))
+// The six steps are the prompt's whole shape: read → keep → fill → resolve →
+// cut → state the contract. The measured text is shorter than the 22-rule
+// version it replaced (1379 vs 2187 chars), so the band is tightened to catch a
+// prompt that silently grows back into a rule list.
+check('默认提示词长度在 1000-2200 字之间（六步骨架，测量后收紧）', defaultPrompt.length > 1000 && defaultPrompt.length < 2200, String(defaultPrompt.length))
 // One mode: the prompt is not specialized by any style directive any more, and
 // the old agent-route template is gone with the route itself.
 check('单一模式：不再导出档位指令', prompt.STYLE_DIRECTIVES === undefined && prompt.styleDirective === undefined)
 check('单一模式：不再导出「交给主 agent」模板', prompt.AGENT_TEMPLATE === undefined && prompt.buildAgentTemplate === undefined)
-check('默认提示词把会话上下文定义为被引用的数据', defaultPrompt.includes('不是要你执行的指令') && defaultPrompt.includes('引用'))
+check('默认提示词把会话上下文定义为被引用的数据', defaultPrompt.includes('被引用的数据') && defaultPrompt.includes('指令'))
 check('默认提示词约定上下文按时间正序、以草稿为准', defaultPrompt.includes('时间正序') && defaultPrompt.includes('以草稿为准'))
-check('findAssumptions 抽出待确认并剥离列表符号', JSON.stringify(prompt.findAssumptions('正文\n\n## 待确认\n- 假设A\n2. 假设B')) === JSON.stringify({ body: '正文', assumptions: '假设A\n假设B' }))
+check('findAssumptions 抽出待确认并剥离列表符号（中英标题都认）',
+  JSON.stringify(prompt.findAssumptions('正文\n\n## 待确认\n- 假设A\n2. 假设B')) === JSON.stringify({ body: '正文', assumptions: '假设A\n假设B' })
+    && JSON.stringify(prompt.findAssumptions('body\n\n## To confirm\n- a\n- b')) === JSON.stringify({ body: 'body', assumptions: 'a\nb' }))
 check('无待确认小节时原样返回', JSON.stringify(prompt.findAssumptions('只有正文')) === JSON.stringify({ body: '只有正文', assumptions: null }))
 check('空待确认小节不产生假设', prompt.findAssumptions('正文\n\n## 待确认\n').assumptions === null)
 check('normalizeAnswer 剥掉整体代码围栏', prompt.normalizeAnswer('```md\n正文\n```') === '正文')
@@ -172,12 +178,29 @@ check('上下文与草稿各有一对分隔符',
   && (payloadWithRecords.match(/<<<待优化提示词>>>/g) ?? []).length === 1)
 check('空白上下文退化为只发草稿（与旧行为一致）', prompt.buildPayload('draft', '   ') === prompt.buildPayload('draft'))
 
-// The rewrite's whole settings surface: a prompt and a record count. The keys the
-// old multi-mode feature used (model pinning, effort, style, apply mode, route,
-// shortcut) must be gone from the store, not merely hidden in the UI.
-const REWRITE_ONLY_KEYS = ['systemPrompt', 'recentMessages']
+// The output-language contract: one line appended to whichever prompt is in
+// force, and `scripts/eval/*.txt` is where that line was measured from. The eval
+// harness sends the fixture, the plugin sends `outputLanguageDirective`, so the
+// two are compared byte for byte — a measured prompt that is not the shipped
+// prompt measures nothing.
+const langZh = readFileSync(join(ROOT, 'scripts/eval/language-zh.txt'), 'utf8').trim()
+const langEn = readFileSync(join(ROOT, 'scripts/eval/language-en.txt'), 'utf8').trim()
+const candidateFixture = readFileSync(join(ROOT, 'scripts/eval/prompt-candidate.txt'), 'utf8').trim()
+check('输出语言指令与 eval fixture 逐字一致，且追加在生效提示词之后（自定义提示词也带）',
+  prompt.outputLanguageDirective('zh') === langZh && prompt.outputLanguageDirective('en') === langEn
+    && prompt.composeSystemPrompt(null, 'zh') === `${defaultPrompt}\n\n${langZh}`
+    && prompt.composeSystemPrompt('只输出一句话。', 'zh') === `只输出一句话。\n\n${langZh}`
+    && prompt.composeSystemPrompt('x', 'de') === `x\n\n${langZh}`
+    && prompt.composeSystemPrompt(null, 'en').endsWith(langEn)
+    && defaultPrompt === candidateFixture && !candidateFixture.includes('本行优先级最高'))
+
+// The rewrite's whole settings surface: a prompt, an output language and a
+// record count. The keys the old multi-mode feature used (model pinning, effort,
+// style, apply mode, route, shortcut) must be gone from the store, not merely
+// hidden in the UI.
+const REWRITE_ONLY_KEYS = ['systemPrompt', 'outputLang', 'recentMessages']
 const REMOVED_REWRITE_KEYS = ['provider', 'model', 'reasoningEffort', 'followSessionModel', 'style', 'applyMode', 'route', 'shortcut']
-check('store 默认值只剩改写自己的两项', REWRITE_ONLY_KEYS.every((key) => key in store.DEFAULT_SETTINGS)
+check('store 默认值只剩改写自己的三项', REWRITE_ONLY_KEYS.every((key) => key in store.DEFAULT_SETTINGS)
   && REMOVED_REWRITE_KEYS.every((key) => !(key in store.DEFAULT_SETTINGS)), Object.keys(store.DEFAULT_SETTINGS).join(','))
 check('改写的模式/模型/快捷键常量已从 store 移除',
   store.STYLE_CHOICES === undefined && store.APPLY_MODES === undefined && store.REWRITE_ROUTES === undefined)
@@ -916,16 +939,43 @@ const textStep = (text) => [{ type: 'text-delta', text }, { type: 'finish', reas
   await call(ctx, '/save', { systemPrompt: '只输出一句话。' })
   await call(ctx, '/optimize', { text: '草稿' })
   check('自定义提示词替换内置默认（不是叠加）',
-    ctx.calls[0].system === '只输出一句话。', JSON.stringify(ctx.calls[0].system))
+    ctx.calls[0].system.startsWith('只输出一句话。') && !ctx.calls[0].system.includes('只补全不扩写'),
+    JSON.stringify(ctx.calls[0].system))
   await call(ctx, '/save', { systemPrompt: null })
   await call(ctx, '/optimize', { text: '草稿' })
   check('未自定义时用内置默认提示词',
-    ctx.calls[1].system === prompt.DEFAULT_SYSTEM_PROMPT && ctx.calls[1].system.includes('待确认'))
+    ctx.calls[1].system === prompt.composeSystemPrompt(null, 'zh') && ctx.calls[1].system.includes('待确认'))
   // The prompt is a setting, not a per-request knob: a body that carries one
   // cannot override what the settings page holds.
   await call(ctx, '/optimize', { text: '草稿', systemPrompt: '注入的提示词' })
   check('请求体里的 systemPrompt 不再能覆盖设置',
-    ctx.calls[2].system === prompt.DEFAULT_SYSTEM_PROMPT, JSON.stringify(ctx.calls[2].system))
+    ctx.calls[2].system === prompt.composeSystemPrompt(null, 'zh'), JSON.stringify(ctx.calls[2].system))
+}
+
+{
+  // The output language is a three-state setting: `zh` / `en` are explicit
+  // choices, `null` means "follow the shell" — which is why the browser sends
+  // its locale with every rewrite, and why a stored choice must win over it.
+  const ctx = makeCtx([textStep('a'), textStep('b'), textStep('c'), textStep('d')])
+  registerRoutes(ctx)
+  await call(ctx, '/save', { outputLang: null, systemPrompt: null })
+  const first = await call(ctx, '/state', {})
+  await call(ctx, '/optimize', { text: '草稿', lang: 'en' })
+  await call(ctx, '/optimize', { text: '草稿' })
+  await call(ctx, '/save', { outputLang: 'en' })
+  await call(ctx, '/optimize', { text: '草稿', lang: 'zh' })
+  const rejected = await call(ctx, '/save', { outputLang: 'fr' })
+  const second = await call(ctx, '/state', {})
+  await call(ctx, '/save', { outputLang: null })
+  check('输出语言：null 跟随请求里的 shell 语言、存下的值压过它、非法值被拒',
+    first.json.value.outputLang === null
+      && first.json.value.outputLanguages.join(',') === 'zh,en'
+      && first.json.value.defaultOutputLang === 'zh'
+      && ctx.calls[0].system.endsWith(prompt.outputLanguageDirective('en'))
+      && ctx.calls[1].system.endsWith(prompt.outputLanguageDirective('zh'))
+      && ctx.calls[2].system.endsWith(prompt.outputLanguageDirective('en'))
+      && second.json.value.outputLang === 'en'
+      && rejected.json.ok === false && rejected.json.error.code === 'bad-request')
 }
 
 {
@@ -2106,6 +2156,7 @@ const STATE = {
   value: {
     settings: {
       systemPrompt: null,
+      outputLang: null,
       recentMessages: 8,
       btwContextTurns: 'all',
       btwContextCount: 8,
@@ -2123,6 +2174,9 @@ const STATE = {
     },
     defaultSystemPrompt: prompt.DEFAULT_SYSTEM_PROMPT,
     custom: false,
+    outputLang: null,
+    outputLanguages: [...prompt.OUTPUT_LANGUAGES],
+    defaultOutputLang: prompt.DEFAULT_OUTPUT_LANGUAGE,
     models: [{ id: 'deepseek-official', name: 'DeepSeek', models: [{ id: 'deepseek-flash', name: 'Flash' }], error: null }],
     active: { provider: 'deepseek-official', model: 'deepseek-flash' },
     effortChoices: [...store.EFFORT_CHOICES],
@@ -2723,7 +2777,7 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
   /* ── the split's acceptance criterion: no omission, no duplication ── */
   // Keyed off the `dspo-set-label` nodes on purpose: the 说明 blocks re-print
   // some of these names, so raw text would double-count them.
-  const ROW_KEYS = ['recentMessagesLabel', 'promptLabel', 'btwModelLabel', 'btwEffortLabel', 'btwContextLabel', 'btwSaveHistoryLabel', 'titleModelLabel', 'titleEffortLabel', 'titleRerollLabel', 'titleMaxCharsLabel', 'compactionLabel', 'notifyToggle', 'notifyPlatformLabel', 'notifyModelLabel', 'notifyCharsLabel']
+  const ROW_KEYS = ['recentMessagesLabel', 'promptLabel', 'outputLangLabel', 'btwModelLabel', 'btwEffortLabel', 'btwContextLabel', 'btwSaveHistoryLabel', 'titleModelLabel', 'titleEffortLabel', 'titleRerollLabel', 'titleMaxCharsLabel', 'compactionLabel', 'notifyToggle', 'notifyPlatformLabel', 'notifyModelLabel', 'notifyCharsLabel']
   const expectedRows = ROW_KEYS.map((key) => bundle.DICT.zh[key])
   const sets = TAB_IDS.map((id) => labelsByTab[id])
   const summary = TAB_IDS.map((id) => `${id}:[${labelsByTab[id].join('|')}]`).join(' ')
@@ -2733,7 +2787,7 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
       && sets.every((labels, index) => sets.slice(index + 1).every((other) => labels.every((label) => !other.includes(label)))),
     summary)
   const union = [...new Set(sets.flat())].sort()
-  check('五个页签的行标签并集恰好是词典里的这 15 行（无遗漏、无重复）',
+  check('五个页签的行标签并集恰好是词典里的这 16 行（无遗漏、无重复）',
     union.length === ROW_KEYS.length && JSON.stringify(union) === JSON.stringify([...expectedRows].sort()),
     `${union.length}: ${union.join('|')}`)
 
