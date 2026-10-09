@@ -1003,15 +1003,46 @@ function cordisLikeContext(services) {
     capturedArgs = args
     return { error: null }
   }
-  await notify.sendNotification(
+  const longNote = await notify.sendNotification(
     { title: 'x'.repeat(500), body: 'y'.repeat(2000) },
     { platform: 'linux', env: { DISPLAY: ':0' }, run: captureRun },
   )
-  check('超长标题正文被折叠截断后才进命令（120 / 600 字符上限）',
+  const cutTitle = 'x'.repeat(notify.NOTIFY_TITLE_CHARS - notify.ELLIPSIS.length) + notify.ELLIPSIS
+  const cutBody = 'y'.repeat(notify.NOTIFY_BODY_CHARS - notify.ELLIPSIS.length) + notify.ELLIPSIS
+  check('超长标题正文被缩写，超出部分以 ... 结尾（48 / 120 字符上限）',
     capturedArgs !== null
-      && capturedArgs.includes('x'.repeat(notify.NOTIFY_TITLE_CHARS))
-      && capturedArgs.includes('y'.repeat(notify.NOTIFY_BODY_CHARS)),
+      && capturedArgs.includes(cutTitle)
+      && capturedArgs.includes(cutBody),
     capturedArgs === null ? 'no command' : `${capturedArgs[capturedArgs.length - 2].length}/${capturedArgs[capturedArgs.length - 1].length}`)
+  // The cap counts the ellipsis, so the promised number really is the longest
+  // string that can reach the desktop — not "the limit plus three dots".
+  check('缩写后的长度不超过设定上限，且结尾是 ...',
+    longNote.shown.title === cutTitle
+      && longNote.shown.body === cutBody
+      && longNote.shown.body.length === notify.NOTIFY_BODY_CHARS
+      && longNote.shown.body.endsWith(notify.ELLIPSIS),
+    `${longNote.shown.title.length} / ${longNote.shown.body.length}`)
+  check('没超上限的正文原样保留（不多加省略号）',
+    notify.abbreviate('短正文', notify.NOTIFY_BODY_CHARS) === '短正文'
+      && notify.abbreviate('a'.repeat(50), 50) === 'a'.repeat(50)
+      && notify.abbreviate('a'.repeat(51), 50) === 'a'.repeat(47) + notify.ELLIPSIS
+      && notify.abbreviate('', notify.NOTIFY_BODY_CHARS) === '')
+  await notify.sendNotification(
+    { title: 'T', body: 'z'.repeat(1000) },
+    { platform: 'linux', env: { DISPLAY: ':0' }, run: captureRun, bodyChars: 200 },
+  )
+  check('正文上限可被调用方覆盖（走的是设置里的 notifyMaxChars）',
+    capturedArgs.includes('z'.repeat(197) + notify.ELLIPSIS)
+      && capturedArgs.at(-1).length === 200
+      && !capturedArgs.some((arg) => typeof arg === 'string' && arg.includes('z'.repeat(1000))),
+    `${capturedArgs.at(-1).length} chars`)
+  check('手改坏的字符数被夹进可写范围（坏值回落默认）',
+    notify.normalizeNotifyChars(300) === 300
+      && notify.normalizeNotifyChars(5) === notify.NOTIFY_MIN_BODY_CHARS
+      && notify.normalizeNotifyChars(99_999) === notify.NOTIFY_MAX_BODY_CHARS
+      && notify.normalizeNotifyChars('abc') === notify.NOTIFY_BODY_CHARS
+      && notify.normalizeNotifyChars(null) === notify.NOTIFY_BODY_CHARS
+      && notify.normalizeNotifyChars(undefined) === notify.NOTIFY_BODY_CHARS)
   await notify.sendNotification(
     { title: 'a\nb', body: 'c\td' },
     { platform: 'linux', env: { DISPLAY: ':0' }, run: captureRun },
@@ -1032,11 +1063,16 @@ function cordisLikeContext(services) {
       && state.json.value.compaction.limits.minTokens === compaction.MIN_COMPACTION_TOKENS
       && Array.isArray(state.json.value.compaction.plan.policies),
     JSON.stringify(state.json?.value?.compaction ?? null))
-  check('/state 上报通知契约（开关、平台、标题正文上限）',
+  check('/state 上报通知契约（开关、平台、标题与正文上限及其可填范围）',
     state.json?.value?.notify?.onComplete === true
       && 'platform' in state.json.value.notify
       && state.json.value.notify.limits.titleChars === notify.NOTIFY_TITLE_CHARS
-      && state.json.value.notify.limits.bodyChars === notify.NOTIFY_BODY_CHARS)
+      && state.json.value.notify.limits.bodyChars === store.DEFAULT_SETTINGS.notifyMaxChars
+      && state.json.value.notify.limits.bodyChars === notify.NOTIFY_BODY_CHARS
+      && state.json.value.notify.limits.minBodyChars === notify.NOTIFY_MIN_BODY_CHARS
+      && state.json.value.notify.limits.maxBodyChars === notify.NOTIFY_MAX_BODY_CHARS
+      && state.json.value.notify.limits.ellipsis === notify.ELLIPSIS,
+    JSON.stringify(state.json?.value?.notify ?? null))
 
   const saved = await call(ctx, '/save', { compactionTokens: { 'deepseek-official/deepseek-flash': 250_000 } })
   check('/save 收下合法的 per-model 阈值并回读',
@@ -1053,6 +1089,17 @@ function cordisLikeContext(services) {
     (await call(ctx, '/save', { notifyOnComplete: 'yes' })).json?.ok === false)
   check('/save 存下通知开关并回读',
     (await call(ctx, '/save', { notifyOnComplete: false })).json?.value?.settings?.notifyOnComplete === false)
+  check('/save 拒绝非整数或超出范围的字符上限',
+    (await call(ctx, '/save', { notifyMaxChars: '120' })).json?.ok === false
+      && (await call(ctx, '/save', { notifyMaxChars: 12 })).json?.ok === false
+      && (await call(ctx, '/save', { notifyMaxChars: 9_999 })).json?.ok === false
+      && (await call(ctx, '/save', { notifyMaxChars: 120.5 })).json?.ok === false)
+  const savedChars = await call(ctx, '/save', { notifyMaxChars: 200 })
+  check('/save 存下字符上限，/state 的正文上限随之改变（通知发出去的就是这个数）',
+    savedChars.json?.value?.settings?.notifyMaxChars === 200
+      && savedChars.json?.value?.notify?.limits?.bodyChars === 200
+      && savedChars.json?.value?.notify?.limits?.titleChars === notify.NOTIFY_TITLE_CHARS,
+    JSON.stringify(savedChars.json?.value?.settings?.notifyMaxChars ?? null))
 
   const windowsView = await call(ctx, '/compaction.windows', {})
   check('/compaction.windows 列出目录里的每个模型与其宿主解析出的窗口',
@@ -1332,6 +1379,7 @@ const STATE = {
       btwSaveHistory: true,
       compactionTokens: { 'deepseek-official/deepseek-flash': 250_000 },
       notifyOnComplete: true,
+      notifyMaxChars: 200,
     },
     defaultSystemPrompt: prompt.DEFAULT_SYSTEM_PROMPT,
     custom: false,
@@ -1365,7 +1413,14 @@ const STATE = {
       onComplete: true,
       platform: 'linux',
       appName: 'DSH',
-      limits: { titleChars: 120, bodyChars: 600 },
+      limits: {
+        titleChars: 48,
+        bodyChars: 200,
+        minBodyChars: 40,
+        maxBodyChars: 600,
+        defaultBodyChars: 120,
+        ellipsis: '...',
+      },
     },
   },
 }
@@ -1837,7 +1892,7 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
   // some of these names, so raw text would double-count them. The shortcut row
   // renders `shortcutToggle` ("启用 Alt+O 触发优化"); `shortcutLabel` ("快捷键")
   // is in the dictionary but is not a row name, so it is not in this list.
-  const ROW_KEYS = ['followSession', 'modelLabel', 'effortLabel', 'styleLabelSetting', 'applyModeLabel', 'routeLabel', 'shortcutToggle', 'promptLabel', 'btwModelLabel', 'btwEffortLabel', 'btwContextLabel', 'btwSaveHistoryLabel', 'compactionLabel', 'notifyToggle', 'notifyPlatformLabel']
+  const ROW_KEYS = ['followSession', 'modelLabel', 'effortLabel', 'styleLabelSetting', 'applyModeLabel', 'routeLabel', 'shortcutToggle', 'promptLabel', 'btwModelLabel', 'btwEffortLabel', 'btwContextLabel', 'btwSaveHistoryLabel', 'compactionLabel', 'notifyToggle', 'notifyPlatformLabel', 'notifyCharsLabel']
   const expectedRows = ROW_KEYS.map((key) => bundle.DICT.zh[key])
   const sets = TAB_IDS.map((id) => labelsByTab[id])
   const summary = TAB_IDS.map((id) => `${id}:[${labelsByTab[id].join('|')}]`).join(' ')
@@ -1847,7 +1902,7 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
       && sets.every((labels, index) => sets.slice(index + 1).every((other) => labels.every((label) => !other.includes(label)))),
     summary)
   const union = [...new Set(sets.flat())].sort()
-  check('六个页签的行标签并集恰好是词典里的这 15 行（无遗漏、无重复）',
+  check('六个页签的行标签并集恰好是词典里的这 16 行（无遗漏、无重复）',
     union.length === ROW_KEYS.length && JSON.stringify(union) === JSON.stringify([...expectedRows].sort()),
     `${union.length}: ${union.join('|')}`)
 
@@ -2568,7 +2623,8 @@ section('4b. 压缩与通知的浏览器半区')
   const wired = loadClientBundle(async (url, init) => {
     const action = String(url).slice(String(url).lastIndexOf('/') + 1)
     fetchCalls.push({ action, body: JSON.parse(init.body) })
-    return new Response(JSON.stringify(action === 'state' ? STATE : { ok: true, value: { sent: true } }), { status: 200 })
+    const envelope = action === 'state' ? STATE : action === 'save' ? { ok: true, value: STATE.value } : { ok: true, value: { sent: true } }
+    return new Response(JSON.stringify(envelope), { status: 200 })
   })
   await wired.settingsStore.load(true)
   const handlers = []
@@ -2687,6 +2743,43 @@ section('4b. 压缩与通知的浏览器半区')
     notifyToggle !== undefined && notifyToggle.props.type === 'checkbox' && notifyToggle.props.checked === true)
   check('通知页签显示本机派发方式与测试按钮',
     buttonsOf(notifyPanel).some((button) => labelOf(button).includes('发送测试通知')))
+
+  /* ── 摘要缩写：通知多长由设置页定，越界不保存 ── */
+  const notifyPanelOf = (tree) => findAll(tree, (node) => node.props?.id === 'dspo-panel-notify')[0]
+  const charsOf = (tree) => findAll(notifyPanelOf(tree), (node) => node.props?.id === 'dspo-notify-chars')[0]
+  // `wired` is the bundle loaded last, so it owns `globalThis.fetch`: the
+  // settings page's writes land in its sink, not in the other one's.
+  const saves = () => fetchCalls.filter((entry) => entry.action === 'save')
+  const chars = charsOf(page)
+  const limits = STATE.value.notify.limits
+  check('通知页签有「摘要最多显示字符数」输入，初值是已存的值、可填范围来自宿主',
+    chars?.type === 'input' && chars.props.type === 'number'
+      && chars.props.value === String(limits.bodyChars)
+      && chars.props.min === limits.minBodyChars
+      && chars.props.max === limits.maxBodyChars,
+    JSON.stringify(chars?.props ?? null))
+  const draw = () => renderPage({ close() {} })
+  chars.props.onChange({ target: { value: '9999' } })
+  charsOf(draw()).props.onBlur()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  const rejectedChars = draw()
+  check('超出范围的字符数不保存，就地说明可填范围',
+    saves().length === 0
+      && textOf(notifyPanelOf(rejectedChars)).includes(String(limits.minBodyChars))
+      && textOf(notifyPanelOf(rejectedChars)).includes(String(limits.maxBodyChars)),
+    saves().map((entry) => JSON.stringify(entry.body)).join('|'))
+  charsOf(rejectedChars).props.onChange({ target: { value: '260' } })
+  charsOf(draw()).props.onBlur()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  check('改摘要字符数只发 notifyMaxChars 一个键',
+    JSON.stringify(saves().at(-1)?.body) === JSON.stringify({ notifyMaxChars: 260 }),
+    JSON.stringify(saves().map((entry) => entry.body)))
+  charsOf(draw()).props.onChange({ target: { value: '   ' } })
+  charsOf(draw()).props.onBlur()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  check('清空输入框不算改设置（不改、不报错）',
+    saves().length === 1 && charsOf(draw()).props.value === String(limits.bodyChars))
   bundle.__restore()
 }
 
