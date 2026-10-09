@@ -147,40 +147,58 @@ const notifySummary = await import('../lib/notify-summary.js')
 section('2. 提示词与设置')
 
 const defaultPrompt = prompt.DEFAULT_SYSTEM_PROMPT
-for (const marker of ['保真', '补全字段', '消除矛盾', '体量', '禁止', '输出', '待确认', '长度与任务相称', '不编造']) {
+for (const marker of ['保真', '补全字段', '消除矛盾', '体量', '禁止', '输出', '待确认', '长度与任务相称', '不编造', '会话上下文']) {
   check(`默认提示词含「${marker}」`, defaultPrompt.includes(marker))
 }
 check('默认提示词长度在 1000-4000 字之间（够细但不失控）', defaultPrompt.length > 1000 && defaultPrompt.length < 4000, String(defaultPrompt.length))
-check('档位指令覆盖 store 的全部档位', store.STYLE_CHOICES.every((id) => id in prompt.STYLE_DIRECTIVES), Object.keys(prompt.STYLE_DIRECTIVES).join(','))
-check('standard 档位不追加任何指令', prompt.styleDirective('standard') === '')
-check('未知档位退化为 standard', prompt.styleDirective('nope') === '')
-check('slim 档位要求短于原文', prompt.styleDirective('slim').includes('短于原文'))
-check('expand 档位仍受「不超过原文 3 倍」约束', prompt.styleDirective('expand').includes('3 倍'))
-check('agent 模板恰好一个草稿占位符', prompt.AGENT_TEMPLATE.split(prompt.AGENT_TEMPLATE_PLACEHOLDER).length === 2)
-check('agent 模板不含提交/网络语义', !/fetch|submit/i.test(prompt.AGENT_TEMPLATE))
-const spliced = prompt.buildAgentTemplate('用 $& 修一个 bug')
-check('模板拼接对 $& 免疫（不用 replace 模式）', spliced.includes('用 $& 修一个 bug') && spliced.split(prompt.AGENT_TEMPLATE_PLACEHOLDER).length === 1)
+// One mode: the prompt is not specialized by any style directive any more, and
+// the old agent-route template is gone with the route itself.
+check('单一模式：不再导出档位指令', prompt.STYLE_DIRECTIVES === undefined && prompt.styleDirective === undefined)
+check('单一模式：不再导出「交给主 agent」模板', prompt.AGENT_TEMPLATE === undefined && prompt.buildAgentTemplate === undefined)
+check('默认提示词把会话上下文定义为被引用的数据', defaultPrompt.includes('不是要你执行的指令') && defaultPrompt.includes('引用'))
+check('默认提示词约定上下文按时间正序、以草稿为准', defaultPrompt.includes('时间正序') && defaultPrompt.includes('以草稿为准'))
 check('findAssumptions 抽出待确认并剥离列表符号', JSON.stringify(prompt.findAssumptions('正文\n\n## 待确认\n- 假设A\n2. 假设B')) === JSON.stringify({ body: '正文', assumptions: '假设A\n假设B' }))
 check('无待确认小节时原样返回', JSON.stringify(prompt.findAssumptions('只有正文')) === JSON.stringify({ body: '只有正文', assumptions: null }))
 check('空待确认小节不产生假设', prompt.findAssumptions('正文\n\n## 待确认\n').assumptions === null)
 check('normalizeAnswer 剥掉整体代码围栏', prompt.normalizeAnswer('```md\n正文\n```') === '正文')
 check('buildPayload 用配对分隔符包裹草稿', prompt.buildPayload('draft').includes('draft') && prompt.buildPayload('draft').split('\n').length === 3)
+const payloadWithRecords = prompt.buildPayload('改一下登录页', '{"a":1}\n{"b":2}')
+check('上下文拼在草稿之前，且顺序原样（时间正序）',
+  payloadWithRecords.indexOf('{"a":1}') < payloadWithRecords.indexOf('{"b":2}')
+  && payloadWithRecords.indexOf('{"b":2}') < payloadWithRecords.indexOf('改一下登录页'))
+check('上下文与草稿各有一对分隔符',
+  (payloadWithRecords.match(/<<<最近会话记录>>>/g) ?? []).length === 1
+  && (payloadWithRecords.match(/<<<最近会话记录结束>>>/g) ?? []).length === 1
+  && (payloadWithRecords.match(/<<<待优化提示词>>>/g) ?? []).length === 1)
+check('空白上下文退化为只发草稿（与旧行为一致）', prompt.buildPayload('draft', '   ') === prompt.buildPayload('draft'))
 
-check('store 默认值齐全', ['systemPrompt', 'provider', 'model', 'reasoningEffort', 'followSessionModel', 'style', 'applyMode', 'route', 'shortcut'].every((key) => key in store.DEFAULT_SETTINGS))
-check('默认跟随会话模型（零配置可用）', store.DEFAULT_SETTINGS.followSessionModel === true)
-check('默认思考强度为 off（改写任务不需要长推理）', store.DEFAULT_SETTINGS.reasoningEffort === 'off')
-check('默认直接替换（一键路径不变）', store.DEFAULT_SETTINGS.applyMode === 'auto')
-check('默认档位 standard / 路由 plugin', store.DEFAULT_SETTINGS.style === 'standard' && store.DEFAULT_SETTINGS.route === 'plugin')
+// The rewrite's whole settings surface: a prompt and a record count. The keys the
+// old multi-mode feature used (model pinning, effort, style, apply mode, route,
+// shortcut) must be gone from the store, not merely hidden in the UI.
+const REWRITE_ONLY_KEYS = ['systemPrompt', 'recentMessages']
+const REMOVED_REWRITE_KEYS = ['provider', 'model', 'reasoningEffort', 'followSessionModel', 'style', 'applyMode', 'route', 'shortcut']
+check('store 默认值只剩改写自己的两项', REWRITE_ONLY_KEYS.every((key) => key in store.DEFAULT_SETTINGS)
+  && REMOVED_REWRITE_KEYS.every((key) => !(key in store.DEFAULT_SETTINGS)), Object.keys(store.DEFAULT_SETTINGS).join(','))
+check('改写的模式/模型/快捷键常量已从 store 移除',
+  store.STYLE_CHOICES === undefined && store.APPLY_MODES === undefined && store.REWRITE_ROUTES === undefined)
+check('默认携带最近 8 条会话消息', store.DEFAULT_SETTINGS.recentMessages === store.DEFAULT_RECENT_MESSAGES && store.DEFAULT_RECENT_MESSAGES === 8)
+check('条数可设范围 0–50（0 = 不带）', store.MIN_RECENT_MESSAGES === 0 && store.MAX_RECENT_MESSAGES === 50)
+check('条数越界/非法回退默认',
+  store.normalizeRecentMessages(-1) === 8 && store.normalizeRecentMessages(51) === 8
+  && store.normalizeRecentMessages('3') === 8 && store.normalizeRecentMessages(3.5) === 8
+  && store.normalizeRecentMessages(0) === 0 && store.normalizeRecentMessages(undefined, 4) === 4)
 check('readSettings 对缺失文件给默认值', JSON.stringify(store.readSettings()) === JSON.stringify({ ...store.DEFAULT_SETTINGS }))
-writeFileSync(store.CONFIG_FILE, JSON.stringify({ reasoningEffort: 'ultra', style: 'nope', applyMode: 'x', route: 'y', shortcut: 'yes', followSessionModel: 1 }))
+writeFileSync(store.CONFIG_FILE, JSON.stringify({ recentMessages: 99, systemPrompt: 42 }))
 const tolerant = store.readSettings()
-check('readSettings 对非法枚举值回退默认', tolerant.reasoningEffort === 'off' && tolerant.style === 'standard' && tolerant.applyMode === 'auto' && tolerant.route === 'plugin')
-check('readSettings 对非布尔回退默认', tolerant.shortcut === true && tolerant.followSessionModel === true)
-store.writeSettings({ style: 'slim', shortcut: false, followSessionModel: false, systemPrompt: '自定义' })
+check('readSettings 对越界条数与非字符串提示词回退默认', tolerant.recentMessages === 8 && tolerant.systemPrompt === null)
+store.writeSettings({ recentMessages: 3, systemPrompt: '自定义' })
 const written = store.readSettings()
-check('writeSettings 落盘并读回', written.style === 'slim' && written.shortcut === false && written.followSessionModel === false && written.systemPrompt === '自定义')
-store.writeSettings({ systemPrompt: '', provider: null, model: null, reasoningEffort: 'off', followSessionModel: true, style: 'standard', applyMode: 'auto', route: 'plugin', shortcut: true })
+check('writeSettings 落盘并读回', written.recentMessages === 3 && written.systemPrompt === '自定义')
+store.writeSettings({ recentMessages: 0, systemPrompt: '自定义' })
+check('0 是一个可保存的值（不是「回退默认」）', store.readSettings().recentMessages === 0)
+store.writeSettings({ systemPrompt: '' })
 check('空提示词等价于「回到内置默认」', store.readSettings().systemPrompt === null)
+store.writeSettings({ systemPrompt: null, recentMessages: store.DEFAULT_RECENT_MESSAGES })
 
 /* ── 旁路提问（/btw）：提示词、消息拼装、历史文件 ── */
 
@@ -678,21 +696,50 @@ async function call(ctx, action, body, options) {
 
   const state = (await call(ctx, '/state', {})).json
   check('/state 有 settings/active/models/limits', state?.value?.settings !== undefined && 'active' in state.value && Array.isArray(state.value.models))
-  check('/state 带内置默认提示词与档位清单', typeof state.value.defaultSystemPrompt === 'string' && state.value.styleChoices.length === 4)
-  check('/state 带 agent 模板（含占位符）', typeof state.value.agentTemplate?.text === 'string' && typeof state.value.agentTemplate.placeholder === 'string')
-  check('/state 带三种应用模式与两种路由', state.value.applyModes.length === 2 && state.value.routes.length === 2)
-  check('/state 报告路由支持的思考强度', Array.isArray(state.value.reasoning?.efforts) && state.value.reasoning.defaultEffort === 'high')
-  check('/state 默认跟随会话模型', state.value.settings.followSessionModel === true)
-  check('/state 的 active 取会话模型', state.value.active?.model === 'deepseek-flash', JSON.stringify(state.value.active))
+  check('/state 带内置默认提示词', typeof state.value.defaultSystemPrompt === 'string' && state.value.defaultSystemPrompt.includes('## 待确认'))
+  // One mode: the message catalog, the style list, the apply modes, the routes
+  // and the agent template are all gone from the state view.
+  check('/state 不再广播档位 / 应用方式 / 改写路线 / agent 模板',
+    state.value.styleChoices === undefined && state.value.applyModes === undefined
+    && state.value.routes === undefined && state.value.agentTemplate === undefined)
+  check('/state 广播携带条数的边界与默认值',
+    state.value.limits.minRecentMessages === store.MIN_RECENT_MESSAGES
+    && state.value.limits.maxRecentMessages === store.MAX_RECENT_MESSAGES
+    && state.value.limits.defaultRecentMessages === store.DEFAULT_RECENT_MESSAGES,
+    JSON.stringify(state.value.limits))
+  // Only the halves that own an effort setting report one: the rewrite's effort
+  // is fixed `off` and the notification's never thinks, so a reasoning view for
+  // either would be spent on a control that does not exist. The session model
+  // used to travel along for the same nobody.
+  check('/state 只上报仍有强度开关那几半的思考强度（改写 / 通知不带，会话模型也不广播）',
+    state.value.reasoning === undefined && state.value.sessionModel === undefined
+    && state.value.notify?.reasoning === undefined
+    && Array.isArray(state.value.btw?.reasoning?.efforts)
+    && Array.isArray(state.value.title?.reasoning?.efforts))
+  check('/state 的 active 固定取会话模型，没有可覆盖它的设置',
+    state.value.active?.model === 'deepseek-flash' && state.value.settings.provider === undefined,
+    JSON.stringify(state.value.active))
+  check('/state 不再广播改写的模型与强度设置',
+    state.value.settings.reasoningEffort === undefined && state.value.settings.model === undefined
+    && state.value.settings.followSessionModel === undefined,
+    JSON.stringify(Object.keys(state.value.settings)))
 
-  const saved = (await call(ctx, '/save', { style: 'structured', applyMode: 'review', route: 'agent', shortcut: false })).json
-  check('/save 接受合法枚举', saved.value.settings.style === 'structured' && saved.value.settings.applyMode === 'review' && saved.value.settings.route === 'agent' && saved.value.settings.shortcut === false)
-  check('/save 拒绝非法档位', (await call(ctx, '/save', { style: 'nope' })).json?.error?.code === 'bad-request')
-  check('/save 拒绝非布尔 shortcut', (await call(ctx, '/save', { shortcut: 'yes' })).json?.error?.code === 'bad-request')
-  const picked = (await call(ctx, '/save', { provider: 'ccx', model: 'ccx-1' })).json
-  check('手选模型自动关闭「跟随会话」', picked.value.settings.followSessionModel === false && picked.value.active?.model === 'ccx-1')
-  const cleared = (await call(ctx, '/save', { provider: null, model: null })).json
-  check('清空选择自动恢复「跟随会话」', cleared.value.settings.followSessionModel === true && cleared.value.active?.model === 'deepseek-flash')
+  const saved = (await call(ctx, '/save', { recentMessages: 3, systemPrompt: '自定义' })).json
+  check('/save 接受该功能仅有的两项设置',
+    saved.value.settings.recentMessages === 3 && saved.value.settings.systemPrompt === '自定义',
+    JSON.stringify(saved.value.settings))
+  check('/save 拒绝越界条数', (await call(ctx, '/save', { recentMessages: 51 })).json?.error?.code === 'bad-request')
+  check('/save 拒绝非整数条数', (await call(ctx, '/save', { recentMessages: '5' })).json?.error?.code === 'bad-request')
+  check('/save 接受 0（不带上下文）', (await call(ctx, '/save', { recentMessages: 0 })).json?.value?.settings?.recentMessages === 0)
+  // A body that still carries the removed keys must not resurrect them: they are
+  // ignored, and the settings document never grows them back.
+  const legacy = (await call(ctx, '/save', { style: 'slim', applyMode: 'review', route: 'agent', shortcut: false, provider: 'ccx', model: 'ccx-1' })).json
+  check('/save 忽略已移除的旧设置键（不写回、不报错）',
+    legacy.error === undefined
+    && legacy.value.settings.style === undefined && legacy.value.settings.route === undefined
+    && legacy.value.settings.provider === undefined && legacy.value.settings.shortcut === undefined
+    && legacy.value.active?.model === 'deepseek-flash',
+    JSON.stringify({ error: legacy.error, active: legacy.value?.active }))
 
   // The session-title half: its own model pair and effort, plus the two numbers
   // that define the feature. Every one of them round-trips through /save, and
@@ -719,7 +766,7 @@ async function call(ctx, action, body, options) {
   check('/save 拒绝未知标题思考强度', (await call(ctx, '/save', { titleReasoningEffort: 'ultra' })).json?.error?.code === 'bad-request')
   check('/save 拒绝非字符串标题 provider', (await call(ctx, '/save', { titleProvider: 7 })).json?.error?.code === 'bad-request')
 
-  await call(ctx, '/save', { reasoningEffort: 'off', style: 'standard', applyMode: 'auto', route: 'plugin', shortcut: true })
+  await call(ctx, '/save', { recentMessages: store.DEFAULT_RECENT_MESSAGES, systemPrompt: null })
   await call(ctx, '/save', { titleProvider: null, titleModel: null, titleReasoningEffort: 'off', titleRerollTurns: 100, titleMaxChars: 24 })
 }
 
@@ -768,39 +815,95 @@ const textStep = (text) => [{ type: 'text-delta', text }, { type: 'finish', reas
   check('/optimize 默认发 off 思考强度', ctx.calls[0].reasoningEffort === 'off')
   check('/optimize 发送输出预算 maxTokens', typeof ctx.calls[0].maxTokens === 'number' && ctx.calls[0].maxTokens >= 768)
   check('/optimize 用配对分隔符包裹草稿', ctx.calls[0].messages[0].content[0].text.includes('原始草稿'))
-  check('/optimize 默认档位不追加指令', !ctx.calls[0].system.includes('本次档位'))
+  check('/optimize 不再追加任何档位指令（单一模式）', !ctx.calls[0].system.includes('本次档位'))
   check('/optimize 结果含 provider/model', typeof value?.provider === 'string' && typeof value?.model === 'string')
 }
 
 {
+  // The conversation excerpt, host side: the newest N records of what arrived,
+  // in the order they arrived, placed before the draft.
   const ctx = makeCtx([textStep('x')])
   registerRoutes(ctx)
-  await call(ctx, '/optimize', { text: '草稿', style: 'slim' })
-  check('档位把风格指令追加进系统提示', ctx.calls[0].system.includes('本次档位：精简'))
+  const records = ['{"i":1}', '{"i":2}', '{"i":3}', '{"i":4}']
+  await call(ctx, '/save', { recentMessages: 2 })
+  const res = await call(ctx, '/optimize', { text: '接着上面那个改', records })
+  const payload = ctx.calls[0].messages[0].content[0].text
+  check('只把最近 n 条会话记录拼进提示词', payload.includes('{"i":3}') && payload.includes('{"i":4}') && !payload.includes('{"i":1}'))
+  check('记录按时间正序拼入（最旧的在前）', payload.indexOf('{"i":3}') < payload.indexOf('{"i":4}'))
+  check('记录排在草稿之前', payload.indexOf('{"i":4}') < payload.indexOf('接着上面那个改'))
+  check('响应回报实际携带的记录条数', res.json.value.contextMessages === 2, JSON.stringify(res.json.value.contextMessages))
 }
 
 {
+  // Fewer records than n: carry what the session has, never fail the rewrite.
+  const ctx = makeCtx([textStep('x')])
+  registerRoutes(ctx)
+  await call(ctx, '/save', { recentMessages: 8 })
+  const res = await call(ctx, '/optimize', { text: '草稿', records: ['{"i":1}'] })
+  const payload = ctx.calls[0].messages[0].content[0].text
+  check('会话消息不足 n 条时按实际条数拼接',
+    res.json?.ok === true && payload.includes('{"i":1}') && res.json.value.contextMessages === 1,
+    JSON.stringify(res.json?.value?.contextMessages))
+}
+
+{
+  const ctx = makeCtx([textStep('x')])
+  registerRoutes(ctx)
+  await call(ctx, '/save', { recentMessages: 0 })
+  const res = await call(ctx, '/optimize', { text: '草稿', records: ['{"i":1}'] })
+  const payload = ctx.calls[0].messages[0].content[0].text
+  check('n=0 时提示词里没有会话记录段', !payload.includes('{"i":1}') && !payload.includes('最近会话记录'))
+  check('n=0 时回报 0 条', res.json.value.contextMessages === 0)
+}
+
+{
+  // A record the host cannot read costs its own line, never the rewrite.
+  const ctx = makeCtx([textStep('x')])
+  registerRoutes(ctx)
+  await call(ctx, '/save', { recentMessages: 5 })
+  const res = await call(ctx, '/optimize', { text: '草稿', records: ['{"ok":1}', '', 42, null] })
+  const payload = ctx.calls[0].messages[0].content[0].text
+  check('非字符串 / 空白记录被忽略而不是报错',
+    res.json?.ok === true && payload.includes('{"ok":1}') && res.json.value.contextMessages === 1)
+}
+
+{
+  // Thinking is fixed off now: an old `reasoningEffort` in the settings file no
+  // longer reaches the call.
   const ctx = makeCtx([textStep('x')])
   registerRoutes(ctx)
   await call(ctx, '/save', { reasoningEffort: 'high' })
-  const res = await call(ctx, '/optimize', { text: '草稿' })
-  check('settings 的 high 会被发送', ctx.calls[0].reasoningEffort === 'high' && res.json.value.effort === 'high')
-}
-
-{
-  const ctx = makeCtx([textStep('x')])
-  registerRoutes(ctx)
-  await call(ctx, '/save', { reasoningEffort: 'auto' })
   await call(ctx, '/optimize', { text: '草稿' })
-  check('auto 完全不发送 reasoningEffort 字段', !('reasoningEffort' in ctx.calls[0]))
+  check('改写始终发送 off（旧键已无作用）', ctx.calls[0].reasoningEffort === 'off', String(ctx.calls[0].reasoningEffort))
 }
 
 {
-  const ctx = makeCtx([textStep('x')], { reasoning: { reasoning: { efforts: [{ id: 'off' }, { id: 'high' }], defaultEffort: 'high' } } })
+  const ctx = makeCtx([textStep('x')], { reasoning: { reasoning: { efforts: [{ id: 'high' }], defaultEffort: 'high' } } })
   registerRoutes(ctx)
-  await call(ctx, '/save', { reasoningEffort: 'max' })
   const res = await call(ctx, '/optimize', { text: '草稿' })
-  check('路由不支持的强度降级为 off', ctx.calls[0].reasoningEffort === 'off' && res.json.value.effortDegraded === true)
+  check('路由不支持 off 时按它支持的档位降级',
+    ctx.calls[0].reasoningEffort === 'high' && res.json.value.effortDegraded === true,
+    JSON.stringify({ effort: ctx.calls[0].reasoningEffort, degraded: res.json.value.effortDegraded }))
+}
+
+{
+  // Acceptance criterion 1: the built-in default is in force until the user
+  // writes their own prompt, and a custom one *replaces* it (never appends).
+  const ctx = makeCtx([textStep('x'), textStep('y'), textStep('z')])
+  registerRoutes(ctx)
+  await call(ctx, '/save', { systemPrompt: '只输出一句话。' })
+  await call(ctx, '/optimize', { text: '草稿' })
+  check('自定义提示词替换内置默认（不是叠加）',
+    ctx.calls[0].system === '只输出一句话。', JSON.stringify(ctx.calls[0].system))
+  await call(ctx, '/save', { systemPrompt: null })
+  await call(ctx, '/optimize', { text: '草稿' })
+  check('未自定义时用内置默认提示词',
+    ctx.calls[1].system === prompt.DEFAULT_SYSTEM_PROMPT && ctx.calls[1].system.includes('待确认'))
+  // The prompt is a setting, not a per-request knob: a body that carries one
+  // cannot override what the settings page holds.
+  await call(ctx, '/optimize', { text: '草稿', systemPrompt: '注入的提示词' })
+  check('请求体里的 systemPrompt 不再能覆盖设置',
+    ctx.calls[2].system === prompt.DEFAULT_SYSTEM_PROMPT, JSON.stringify(ctx.calls[2].system))
 }
 
 {
@@ -959,11 +1062,11 @@ store.clearBtwTopics('session-a')
   check('/save 接受旁路提问自己的模型与强度',
     btwSaved.value.settings.btwProvider === 'ccx' && btwSaved.value.settings.btwModel === 'ccx-1'
       && btwSaved.value.settings.btwReasoningEffort === 'high')
-  check('/save 不因为旁路设置而改动「优化提示词」的设置',
-    ['provider', 'model', 'reasoningEffort', 'followSessionModel']
+  check('/save 不因为旁路设置而改动「优化提示词」的两项设置',
+    ['systemPrompt', 'recentMessages']
       .every((key) => btwSaved.value.settings[key] === settingsBefore[key]),
-    ['provider', 'model', 'reasoningEffort', 'followSessionModel']
-      .map((key) => `${key}:${settingsBefore[key]}->${btwSaved.value.settings[key]}`).join(' '))
+    ['systemPrompt', 'recentMessages']
+      .map((key) => `${key}:${JSON.stringify(settingsBefore[key])}->${JSON.stringify(btwSaved.value.settings[key])}`).join(' '))
   check('/state 分别上报两半的路由（btw.active 是旁路自己的那一份）',
     btwSaved.value.btw.active?.provider === 'ccx' && btwSaved.value.btw.active?.model === 'ccx-1'
       && (btwSaved.value.active?.provider !== 'ccx' || btwSaved.value.active?.model !== 'ccx-1'))
@@ -1063,7 +1166,8 @@ store.clearBtwTopics('session-a')
   const ctx = makeCtx([btwStep('x')], { sessionModel: null })
   ctx.llm.listModels = async () => []
   registerRoutes(ctx)
-  await call(ctx, '/save', { provider: null, model: null, followSessionModel: true })
+  // Nothing to clear any more: the rewrite has no pinned model, so with an empty
+  // catalog and no session selection there is simply no route at all.
   const res = await call(ctx, '/btw', { question: '问题' })
   check('/btw 无可用模型时回 no-model', res.json?.error?.code === 'no-model' && ctx.calls.length === 0)
 }
@@ -1968,14 +2072,7 @@ const STATE = {
   value: {
     settings: {
       systemPrompt: null,
-      provider: 'deepseek-official',
-      model: 'deepseek-flash',
-      reasoningEffort: 'off',
-      followSessionModel: false,
-      style: 'standard',
-      applyMode: 'auto',
-      route: 'plugin',
-      shortcut: true,
+      recentMessages: 8,
       btwContextTurns: 'all',
       btwSaveHistory: true,
       compactionTokens: { 'deepseek-official/deepseek-flash': 250_000 },
@@ -1993,15 +2090,15 @@ const STATE = {
     custom: false,
     models: [{ id: 'deepseek-official', name: 'DeepSeek', models: [{ id: 'deepseek-flash', name: 'Flash' }], error: null }],
     active: { provider: 'deepseek-official', model: 'deepseek-flash' },
-    sessionModel: { provider: 'deepseek-official', model: 'deepseek-flash' },
-    reasoning: { efforts: ['off', 'low', 'high'], defaultEffort: 'high' },
     effortChoices: [...store.EFFORT_CHOICES],
-    styleChoices: [...store.STYLE_CHOICES],
-    applyModes: [...store.APPLY_MODES],
-    routes: [...store.REWRITE_ROUTES],
-    agentTemplate: { text: prompt.AGENT_TEMPLATE, placeholder: prompt.AGENT_TEMPLATE_PLACEHOLDER },
     configFile: store.CONFIG_FILE,
-    limits: { maxDraftChars: prompt.MAX_DRAFT_CHARS, maxSystemPromptChars: prompt.MAX_SYSTEM_PROMPT_CHARS },
+    limits: {
+      maxDraftChars: prompt.MAX_DRAFT_CHARS,
+      maxSystemPromptChars: prompt.MAX_SYSTEM_PROMPT_CHARS,
+      minRecentMessages: store.MIN_RECENT_MESSAGES,
+      maxRecentMessages: store.MAX_RECENT_MESSAGES,
+      defaultRecentMessages: store.DEFAULT_RECENT_MESSAGES,
+    },
     btw: {
       contextTurns: 'all',
       saveHistory: true,
@@ -2009,6 +2106,10 @@ const STATE = {
       maxQuestionChars: prompt.MAX_BTW_QUESTION_CHARS,
       historyFile: store.BTW_HISTORY_FILE,
       prompt: prompt.BTW_SYSTEM_PROMPT,
+      // The host resolves the side-question half's own pair too, so the tab can
+      // render what a question would actually use and which efforts it accepts.
+      active: { provider: 'deepseek-official', model: 'deepseek-flash' },
+      reasoning: { efforts: ['off', 'low', 'high'], defaultEffort: 'high' },
     },
     compaction: {
       tokens: { 'deepseek-official/deepseek-flash': 250_000 },
@@ -2024,9 +2125,9 @@ const STATE = {
       // The summary contract: which route a completion would condense through,
       // and the fixed request it makes (`off`). The tab renders its model row
       // only when the host advertises this, so a host that predates the
-      // summarizer cannot hand the page a pair it would then forget.
+      // summarizer cannot hand the page a pair it would then forget. No
+      // `reasoning` rides along: nothing here may pick an effort.
       active: { provider: 'deepseek-official', model: 'deepseek-flash' },
-      reasoning: { efforts: ['off', 'low', 'high'], defaultEffort: 'high' },
       thinking: 'off',
       maxInputChars: notifySummary.NOTIFY_SUMMARY_INPUT_CHARS,
       fallbackBody: notifySummary.NOTIFY_SUMMARY_FALLBACK_BODY,
@@ -2240,8 +2341,7 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
     text: '原始草稿',
     draftRev: 1,
     actions: input.props.inputActions,
-    style: null,
-    state: STATE.value,
+    records: [],
     readDraft: () => '用户在优化期间新写的内容',
   })
   const session = bundle.readSession('session-a')
@@ -2257,15 +2357,63 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
 }
 
 {
+  // The conversation excerpt, browser side: the newest n records, in flow order,
+  // as individual strings — and `0` sends none.
+  const records = Array.from({ length: 4 }, (_, index) => ({ kind: 'message', seq: index + 1, text: `第${index + 1}条` }))
   const fetchImpl = makeFetch()
   const bundle = loadClientBundle(fetchImpl)
   await bundle.settingsStore.load(true)
-  bundle.settingsStore.get().state.settings.applyMode = 'review'
-  const input = makeInput({ draft: '原始草稿' })
+  bundle.settingsStore.get().state.settings.recentMessages = 2
+  const input = makeInput({ draft: '接着上面那个改' }, records)
   await clickAndSettle(bundle, buttonsOf(bundle.OptimizeButton(input.props))[0])
-  check('applyMode=review 时不自动替换', bundle.readSession('session-a').phase === 'review' && input.state.draft === '原始草稿')
-  bundle.settingsStore.get().state.settings.applyMode = 'auto'
+  const sent = fetchImpl.seen.filter((entry) => entry.action === 'optimize.stream').pop()
+  check('只把最近 n 条会话记录发给宿主',
+    Array.isArray(sent?.body?.records) && sent.body.records.length === 2, JSON.stringify(sent?.body?.records?.length))
+  // Indexed with `?.` rather than after a separate length check: a body that
+  // carries no records at all would otherwise abort the whole run here instead of
+  // naming the two checks that failed (found by mutating the excerpt away).
+  check('记录按时间正序（最旧的在前）',
+    sent?.body?.records?.[0]?.includes('第3条') === true && sent.body.records[1]?.includes('第4条') === true,
+    JSON.stringify(sent?.body?.records))
+  check('草稿仍然随请求发出', sent?.body?.text === '接着上面那个改')
+  check('请求体不再携带档位 / 路线 / 模型',
+    sent?.body?.style === undefined && sent?.body?.route === undefined
+    && sent?.body?.provider === undefined && sent?.body?.model === undefined,
+    JSON.stringify(sent?.body))
   bundle.__restore()
+
+  const few = makeFetch()
+  const bundleFew = loadClientBundle(few)
+  await bundleFew.settingsStore.load(true)
+  bundleFew.settingsStore.get().state.settings.recentMessages = 8
+  const oneInput = makeInput({ draft: '只有一条' }, [records[0]])
+  await clickAndSettle(bundleFew, buttonsOf(bundleFew.OptimizeButton(oneInput.props))[0])
+  const oneSent = few.seen.filter((entry) => entry.action === 'optimize.stream').pop()
+  check('会话消息不足 n 条时按实际条数拼接、不报错',
+    oneSent?.body?.records?.length === 1 && bundleFew.readSession('session-a').phase === 'applied',
+    JSON.stringify({ records: oneSent?.body?.records?.length, phase: bundleFew.readSession('session-a').phase }))
+  bundleFew.__restore()
+
+  const off = makeFetch()
+  const bundleOff = loadClientBundle(off)
+  await bundleOff.settingsStore.load(true)
+  bundleOff.settingsStore.get().state.settings.recentMessages = 0
+  const offInput = makeInput({ draft: '不带上下文' }, records)
+  await clickAndSettle(bundleOff, buttonsOf(bundleOff.OptimizeButton(offInput.props))[0])
+  const offSent = off.seen.filter((entry) => entry.action === 'optimize.stream').pop()
+  check('n=0 时带上空记录列表（只发草稿）', Array.isArray(offSent?.body?.records) && offSent.body.records.length === 0)
+  bundleOff.__restore()
+
+  // A seat without a chat snapshot (or a shell without the chat view) must
+  // degrade to "no context", not to a crash.
+  const bare = makeFetch()
+  const bundleBare = loadClientBundle(bare)
+  await bundleBare.settingsStore.load(true)
+  const bareInput = makeInput({ draft: '没有会话快照' })
+  await clickAndSettle(bundleBare, buttonsOf(bundleBare.OptimizeButton(bareInput.props))[0])
+  const bareSent = bare.seen.filter((entry) => entry.action === 'optimize.stream').pop()
+  check('没有会话快照时按 0 条处理', Array.isArray(bareSent?.body?.records) && bareSent.body.records.length === 0)
+  bundleBare.__restore()
 }
 
 {
@@ -2302,21 +2450,31 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
 }
 
 {
-  // Preview-card style switch re-runs with another style.
+  // The review card's one remaining re-run: no style switch, no route switch —
+  // and it must carry the same conversation excerpt the button does.
+  const records = Array.from({ length: 4 }, (_, index) => ({ kind: 'message', seq: index + 1, text: `第${index + 1}条` }))
   const fetchImpl = makeFetch()
   const bundle = loadClientBundle(fetchImpl)
   await bundle.settingsStore.load(true)
-  const input = makeInput({ draft: '原始草稿' })
+  bundle.settingsStore.get().state.settings.recentMessages = 2
+  const input = makeInput({ draft: '原始草稿' }, records)
   await clickAndSettle(bundle, buttonsOf(bundle.OptimizeButton(input.props))[0])
   const panel = bundle.TaskPanel(input.props)
-  const slim = buttonsOf(panel).find((candidate) => labelOf(candidate).trim() === '精简')
-  await clickAndSettle(bundle, slim)
-  const last = fetchImpl.seen.filter((entry) => entry.action === 'optimize.stream').pop()
-  check('卡片可切换档位重跑', last?.body?.style === 'slim', JSON.stringify(last?.body))
-  const again = buttonsOf(bundle.TaskPanel(input.props)).find((candidate) => labelOf(candidate).trim() === '再改一次')
+  check('预览卡片不再渲染档位按钮',
+    !buttonsOf(panel).some((candidate) => ['标准', '精简', '结构化', '扩写'].includes(labelOf(candidate).trim())))
+  const again = buttonsOf(panel).find((candidate) => labelOf(candidate).trim() === '再改一次')
   await clickAndSettle(bundle, again)
+  const sent = fetchImpl.seen.filter((entry) => entry.action === 'optimize.stream').shift()
   const resent = fetchImpl.seen.filter((entry) => entry.action === 'optimize.stream').pop()
-  check('再改一次以当前结果为输入', resent?.body?.text === '改写结果', JSON.stringify(resent?.body?.text))
+  // `carriedRecordCount` is the shared reading of the setting: the card used to
+  // fall back to the host default while the button read the setting raw, so this
+  // asserts the two entry points agree, not just that a list was sent.
+  check('再改一次以当前结果为输入，并带上与按钮相同的最近 n 条记录',
+    resent?.body?.text === '改写结果'
+    && resent?.body?.records?.length === 2
+    && resent.body.records[0].includes('第3条') && resent.body.records[1].includes('第4条')
+    && JSON.stringify(resent.body.records) === JSON.stringify(sent?.body?.records),
+    JSON.stringify({ text: resent?.body?.text, records: resent?.body?.records }))
   bundle.__restore()
 }
 
@@ -2347,18 +2505,17 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
 }
 
 {
-  // Agent route: zero model calls, template written into the composer.
+  // The agent route is gone with the multi-mode feature: nothing writes a
+  // template into the composer, and no request can name a rewrite route.
   const fetchImpl = makeFetch()
   const bundle = loadClientBundle(fetchImpl)
   await bundle.settingsStore.load(true)
-  bundle.settingsStore.get().state.settings.route = 'agent'
   const input = makeInput({ draft: '把登录页改快一点' })
-  const button = buttonsOf(bundle.OptimizeButton(input.props))[0]
-  check('agent 路由在无模型时也可用', button.props.disabled === false)
-  await button.props.onClick()
-  check('agent 路由不发起任何请求', fetchImpl.seen.filter((entry) => entry.action.startsWith('optimize')).length === 0)
-  check('agent 路由写入含草稿的模板', input.state.draft.includes('把登录页改快一点') && input.state.draft.includes('改写为一条更明确'))
-  bundle.settingsStore.get().state.settings.route = 'plugin'
+  await clickAndSettle(bundle, buttonsOf(bundle.OptimizeButton(input.props))[0])
+  const calls = fetchImpl.seen.filter((entry) => entry.action.startsWith('optimize'))
+  check('单一模式：点击始终走模型调用（没有零调用路线）', calls.length === 1 && calls[0].action === 'optimize.stream')
+  check('单一模式：草稿被改写结果替换，而不是写入模板',
+    input.state.draft === '改写结果' && !input.state.draft.includes('改写为一条更明确'))
   bundle.__restore()
 }
 
@@ -2374,8 +2531,8 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
   const render = mountClient(bundle, bundle.SettingsPanel)
   const page = () => render({ close() {} })
 
-  const TAB_IDS = ['model', 'rewrite', 'prompt', 'btw', 'title', 'compaction', 'notify']
-  const TAB_KEYS = ['tabModel', 'tabRewrite', 'tabPrompt', 'tabBtw', 'tabTitle', 'tabCompaction', 'tabNotify']
+  const TAB_IDS = ['optimize', 'btw', 'title', 'compaction', 'notify']
+  const TAB_KEYS = ['tabOptimize', 'tabBtw', 'tabTitle', 'tabCompaction', 'tabNotify']
   const TAB_LABELS = TAB_KEYS.map((key) => bundle.DICT.zh[key])
   const PAGE_NODES = ['dspo-meta', 'dspo-set-ok', 'dspo-set-error']
   const tabButton = (tree, id) => findAll(tree, (node) => node.props?.id === `dspo-tab-${id}`)[0]
@@ -2409,13 +2566,19 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
   const firstTabs = tabsOf(first)
   check('设置页有 role="tablist" 的标签栏', rail !== undefined && rail.props.className === 'dspo-tabs'
     && rail.props['aria-label'] === bundle.DICT.zh.settingsTabs, JSON.stringify(rail?.props))
-  check('标签栏恰好七个 role="tab" 按钮', firstTabs.length === 7, String(firstTabs.length))
-  check('七个页签按文档顺序排列，id 与文案各自对应',
+  check('标签栏恰好五个 role="tab" 按钮（提示词优化只占一个）', firstTabs.length === 5, String(firstTabs.length))
+  check('五个页签按文档顺序排列，id 与文案各自对应',
     JSON.stringify(firstTabs.map((tab) => tab.props.id)) === JSON.stringify(TAB_IDS.map((id) => `dspo-tab-${id}`))
       && JSON.stringify(firstTabs.map(labelOf)) === JSON.stringify(TAB_LABELS),
     firstTabs.map((tab) => `${tab.props.id}=${labelOf(tab)}`).join(' '))
-  check('页签文案就是文档写死的六个中文标签',
-    JSON.stringify(TAB_LABELS) === JSON.stringify(['模型', '改写', '提示词', '旁路提问', '标题', '压缩', '通知']), TAB_LABELS.join(','))
+  check('页签文案就是文档写死的五个中文标签',
+    JSON.stringify(TAB_LABELS) === JSON.stringify(['优化提示词', '旁路提问', '标题', '压缩', '通知']), TAB_LABELS.join(','))
+  // The acceptance criterion for this refactor: exactly one tab carries the
+  // rewrite. The old 模型 / 改写 / 提示词 trio must not exist as tabs at all.
+  check('与本功能相关的页签只有一个',
+    firstTabs.filter((tab) => tab.props.id === 'dspo-tab-optimize').length === 1
+      && !firstTabs.some((tab) => ['dspo-tab-model', 'dspo-tab-rewrite', 'dspo-tab-prompt'].includes(tab.props.id)),
+    firstTabs.map((tab) => tab.props.id).join(','))
   check('每个页签都是 button，aria-controls 指向自己的面板',
     firstTabs.every((tab) => tab.props.type === 'button'
       && tab.props['aria-controls'] === `dspo-panel-${tab.props.id.slice('dspo-tab-'.length)}`))
@@ -2435,34 +2598,34 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
     `${selectedTab(first).props['aria-controls']} vs ${visiblePanel(first).props.id}`)
 
   /* ── lazy mounting: visited panels stay, unvisited ones do not exist ── */
-  check('首次渲染只挂载 model 面板',
-    panelsOf(first).length === 1 && panelsOf(first)[0].props.id === 'dspo-panel-model',
+  check('首次渲染只挂载 optimize 面板',
+    panelsOf(first).length === 1 && panelsOf(first)[0].props.id === 'dspo-panel-optimize',
     panelsOf(first).map((panel) => panel.props.id).join(','))
   check('没访问过的页签根本没有面板（btw 还不存在）',
     !panelsOf(first).some((panel) => panel.props.id === 'dspo-panel-btw'))
 
-  const afterRewrite = clickTab(first, 'rewrite')
+  const afterBtw = clickTab(first, 'btw')
   check('点击页签同时移动选中与可见面板',
-    selectedTab(afterRewrite).props.id === 'dspo-tab-rewrite'
-      && visiblePanel(afterRewrite).props.id === 'dspo-panel-rewrite'
-      && selectedTabs(afterRewrite).length === 1
-      && visiblePanels(afterRewrite).length === 1)
+    selectedTab(afterBtw).props.id === 'dspo-tab-btw'
+      && visiblePanel(afterBtw).props.id === 'dspo-panel-btw'
+      && selectedTabs(afterBtw).length === 1
+      && visiblePanels(afterBtw).length === 1)
   check('访问过的面板继续挂载、只是 hidden',
-    panelsOf(afterRewrite).length === 2
-      && panelsOf(afterRewrite).filter((panel) => panel.props.hidden === true).length === 1
-      && panelsOf(afterRewrite).find((panel) => panel.props.id === 'dspo-panel-model').props.hidden === true,
-    panelsOf(afterRewrite).map((panel) => `${panel.props.id}:${panel.props.hidden}`).join(' '))
+    panelsOf(afterBtw).length === 2
+      && panelsOf(afterBtw).filter((panel) => panel.props.hidden === true).length === 1
+      && panelsOf(afterBtw).find((panel) => panel.props.id === 'dspo-panel-optimize').props.hidden === true,
+    panelsOf(afterBtw).map((panel) => `${panel.props.id}:${panel.props.hidden}`).join(' '))
 
-  const afterPrompt = clickTab(afterRewrite, 'prompt')
-  check('访问 rewrite 与 prompt 后恰好三个面板，早先的都是 hidden',
-    panelsOf(afterPrompt).length === 3
-      && panelsOf(afterPrompt).filter((panel) => panel.props.hidden === true).length === 2
-      && visiblePanel(afterPrompt).props.id === 'dspo-panel-prompt',
-    panelsOf(afterPrompt).map((panel) => `${panel.props.id}:${panel.props.hidden}`).join(' '))
-  check('btw 面板在访问它之前始终不存在',
-    !panelsOf(afterPrompt).some((panel) => panel.props.id === 'dspo-panel-btw'))
-  const allTabs = clickTab(afterPrompt, 'btw')
-  check('访问 btw 后四个面板齐备', panelsOf(allTabs).length === 4, String(panelsOf(allTabs).length))
+  const afterTitle = clickTab(afterBtw, 'title')
+  check('访问 optimize 与 title 后恰好三个面板，早先的都是 hidden',
+    panelsOf(afterTitle).length === 3
+      && panelsOf(afterTitle).filter((panel) => panel.props.hidden === true).length === 2
+      && visiblePanel(afterTitle).props.id === 'dspo-panel-title',
+    panelsOf(afterTitle).map((panel) => `${panel.props.id}:${panel.props.hidden}`).join(' '))
+  check('compaction 面板在访问它之前始终不存在',
+    !panelsOf(afterTitle).some((panel) => panel.props.id === 'dspo-panel-compaction'))
+  const allTabs = clickTab(afterTitle, 'compaction')
+  check('访问 compaction 后四个面板齐备', panelsOf(allTabs).length === 4, String(panelsOf(allTabs).length))
 
   /* ── one walk that collects each tab's rows and re-checks the wiring ── */
   const labelsByTab = {}
@@ -2485,56 +2648,56 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
   /* ── every original surface assertion, unioned over the tabs ── */
   const panelsById = Object.fromEntries(panelsOf(walk).map((panel) => [panel.props.id, panel]))
   const panelText = TAB_IDS.map((id) => textOf(panelsById[`dspo-panel-${id}`])).join('\n')
-  check('设置页含模型 / 强度 / 档位 / 应用方式 / 路由 / 提示词',
-    ['优化模型', '思考强度', '默认档位', '改写完成后', '改写方式', '自定义优化提示词'].every((label) => panelText.includes(label)))
-  check('设置页提供「跟随当前会话的模型」开关',
-    panelText.includes('跟随当前会话的模型')
-      && findAll(walk, (node) => node.props?.id === 'dspo-follow' && node.props?.type === 'checkbox').length === 1)
-  check('设置页提供快捷键开关',
-    panelText.includes('Alt+O')
-      && findAll(walk, (node) => node.props?.id === 'dspo-shortcut' && node.props?.type === 'checkbox').length === 1)
+  check('提示词优化页签只有该功能的两项设置',
+    panelText.includes('自定义优化提示词') && panelText.includes('携带最近会话消息'))
+  check('提示词优化页签如实说明模型与思考是固定的（不是设置项）',
+    panelText.includes('跟随当前会话的模型') && panelText.includes('deepseek-flash') && panelText.includes('不开启思考'))
+  // Everything the multi-mode feature exposed is gone, rows included.
+  check('已移除的设置项不再渲染成行',
+    !['跟随当前会话的模型（推荐）', '优化模型', '思考强度', '默认档位', '改写完成后', '改写方式', '启用 Alt+O 触发优化']
+      .some((label) => findAll(walk, (node) => node.props?.className === 'dspo-set-label' && textOf(node) === label).length > 0))
+  check('没有档位 / 应用方式 / 路线 / 快捷键控件的 id 残留',
+    ['dspo-style', 'dspo-apply', 'dspo-route', 'dspo-shortcut', 'dspo-follow', 'dspo-provider', 'dspo-model', 'dspo-effort']
+      .every((id) => findAll(walk, (node) => node.props?.id === id).length === 0))
   const selects = findAll(walk, (node) => node.type === 'select')
-  const effortSelect = selects.find((select) => select.props.id === 'dspo-effort')
-  check('设置页渲染出多个下拉', selects.length >= 4, String(selects.length))
-  check('思考强度下拉列出适配器自报的档位',
-    selects.some((select) => (select.children ?? []).length === 3)
-      && effortSelect !== undefined
-      && (effortSelect.children ?? []).length === STATE.value.reasoning.efforts.length,
-    `${(effortSelect?.children ?? []).length} / ${STATE.value.reasoning.efforts.length}`)
+  check('设置页仍渲染出旁路 / 标题的下拉（模型 + 强度）', selects.length >= 6, String(selects.length))
+  check('提示词优化页签里没有下拉（模型与强度不是这里的选择项）',
+    findAll(panelsById['dspo-panel-optimize'], (node) => node.type === 'select').length === 0)
   const textarea = findAll(walk, (node) => node.type === 'textarea')[0]
   check('自定义提示词框留空（不预填默认）', textarea !== undefined && textarea.props.value === '')
   check('设置页可展开查看内置默认', textOf(walk).includes('查看内置默认提示词'))
-  check('设置页的上下文下拉默认选中「全部历史记录」', textOf(walk).includes('全部历史记录')
-    && findAll(walk, (node) => node.type === 'select').some((select) => select.props.value === 'all'))
+  check('携带条数是一个 0–50 的数字输入框（默认 8）',
+    findAll(panelsById['dspo-panel-optimize'], (node) => node.props?.id === 'dspo-recent' && node.props.type === 'number')
+      .some((input) => input.props.min === 0 && input.props.max === 50 && input.props.value === '8'))
+  check('设置页的上下文下拉默认选中「全部历史记录」（旁路提问的，不属于本功能）', textOf(walk).includes('全部历史记录')
+    && selects.some((select) => select.props.value === 'all'))
 
   // What the lazy mounting buys: the panel is never unmounted, so a half-typed
   // prompt draft is still there after a round trip through another tab.
   const promptArea = (tree) => findAll(
-    findAll(tree, (node) => node.props?.role === 'tabpanel' && node.props.id === 'dspo-panel-prompt')[0],
+    findAll(tree, (node) => node.props?.role === 'tabpanel' && node.props.id === 'dspo-panel-optimize')[0],
     (node) => node.type === 'textarea',
   )[0]
   promptArea(walk).props.onChange({ target: { value: '半截草稿' } })
-  walk = clickTab(clickTab(walk, 'model'), 'prompt')
+  walk = clickTab(clickTab(walk, 'btw'), 'optimize')
   const keptDraft = promptArea(walk)
   check('切到别的页签再切回来，半截的提示词草稿没被重置',
     keptDraft.props.value === '半截草稿', String(keptDraft.props.value))
 
   /* ── the split's acceptance criterion: no omission, no duplication ── */
   // Keyed off the `dspo-set-label` nodes on purpose: the 说明 blocks re-print
-  // some of these names, so raw text would double-count them. The shortcut row
-  // renders `shortcutToggle` ("启用 Alt+O 触发优化"); `shortcutLabel` ("快捷键")
-  // is in the dictionary but is not a row name, so it is not in this list.
-  const ROW_KEYS = ['followSession', 'modelLabel', 'effortLabel', 'styleLabelSetting', 'applyModeLabel', 'routeLabel', 'shortcutToggle', 'promptLabel', 'btwModelLabel', 'btwEffortLabel', 'btwContextLabel', 'btwSaveHistoryLabel', 'titleModelLabel', 'titleEffortLabel', 'titleRerollLabel', 'titleMaxCharsLabel', 'compactionLabel', 'notifyToggle', 'notifyPlatformLabel', 'notifyModelLabel', 'notifyCharsLabel']
+  // some of these names, so raw text would double-count them.
+  const ROW_KEYS = ['recentMessagesLabel', 'promptLabel', 'btwModelLabel', 'btwEffortLabel', 'btwContextLabel', 'btwSaveHistoryLabel', 'titleModelLabel', 'titleEffortLabel', 'titleRerollLabel', 'titleMaxCharsLabel', 'compactionLabel', 'notifyToggle', 'notifyPlatformLabel', 'notifyModelLabel', 'notifyCharsLabel']
   const expectedRows = ROW_KEYS.map((key) => bundle.DICT.zh[key])
   const sets = TAB_IDS.map((id) => labelsByTab[id])
   const summary = TAB_IDS.map((id) => `${id}:[${labelsByTab[id].join('|')}]`).join(' ')
   check('每个页签都渲染出设置行', sets.every((labels) => labels.length > 0), summary)
-  check('七个页签的设置行两两不相交、页签内部也不重复',
+  check('五个页签的设置行两两不相交、页签内部也不重复',
     sets.every((labels) => new Set(labels).size === labels.length)
       && sets.every((labels, index) => sets.slice(index + 1).every((other) => labels.every((label) => !other.includes(label)))),
     summary)
   const union = [...new Set(sets.flat())].sort()
-  check('七个页签的行标签并集恰好是词典里的这 21 行（无遗漏、无重复）',
+  check('五个页签的行标签并集恰好是词典里的这 15 行（无遗漏、无重复）',
     union.length === ROW_KEYS.length && JSON.stringify(union) === JSON.stringify([...expectedRows].sort()),
     `${union.length}: ${union.join('|')}`)
 
@@ -2557,9 +2720,14 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
     perTab.every((entry) => entry.ok), perTab.filter((entry) => !entry.ok).map((entry) => entry.id).join(','))
 
   // A failed save paints the page-level error line; it is page furniture too.
-  walk = clickTab(walk, 'rewrite')
-  findAll(visiblePanel(walk), (node) => node.type === 'select' && node.props.id === 'dspo-style')[0]
-    .props.onChange({ target: { value: 'slim' } })
+  // The save is driven through the prompt box, the one place this feature owns
+  // that can change a value and then commit it.
+  walk = clickTab(walk, 'optimize')
+  findAll(visiblePanel(walk), (node) => node.type === 'textarea')[0]
+    .props.onChange({ target: { value: '这段自定义提示词会让保存失败' } })
+  walk = page()
+  findAll(visiblePanel(walk), (node) => node.type === 'button' && node.props['data-kind'] === 'primary')[0]
+    .props.onClick()
   await new Promise((resolve) => setTimeout(resolve, 0))
   await new Promise((resolve) => setTimeout(resolve, 0))
   const errored = page()
@@ -2579,7 +2747,8 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
   // The other half of that feedback pair: a save the host accepted paints the
   // ok line. It needs its own mount — the store above now carries the failure —
   // and a host that accepts `/save`.
-  const okBundle = loadClientBundle(makeFetch({ saveOk: true }))
+  const okFetch = makeFetch({ saveOk: true })
+  const okBundle = loadClientBundle(okFetch)
   await okBundle.settingsStore.load(true)
   const okRender = mountClient(okBundle, okBundle.SettingsPanel)
   const okPage = () => okRender({ close() {} })
@@ -2589,11 +2758,11 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
     okRail(tree, id).props.onClick()
     return okPage()
   }
-  let okTree = okClickTab(okPage(), 'prompt')
-  findAll(okPanel(okTree, 'prompt'), (node) => node.type === 'textarea')[0]
+  let okTree = okClickTab(okPage(), 'optimize')
+  findAll(okPanel(okTree, 'optimize'), (node) => node.type === 'textarea')[0]
     .props.onChange({ target: { value: '自定义提示词' } })
   okTree = okPage()
-  const okSave = findAll(okPanel(okTree, 'prompt'), (node) => node.type === 'button' && node.props['data-kind'] === 'primary')[0]
+  const okSave = findAll(okPanel(okTree, 'optimize'), (node) => node.type === 'button' && node.props['data-kind'] === 'primary')[0]
   const okSaveEnabled = okSave.props.disabled === false
   okSave.props.onClick()
   await new Promise((resolve) => setTimeout(resolve, 0))
@@ -2608,35 +2777,61 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
   check('保存成功的提示行同样是页级节点（面板之外、切页签后仍在）',
     okSaveEnabled && okLine !== undefined && textOf(okLine) === okBundle.DICT.zh.saved && okPerTab.every((ok) => ok === true),
     `${okSaveEnabled ? '' : 'disabled '}${textOf(okLine ?? 'missing')}`)
+  check('提示词保存只发 systemPrompt 这一个键',
+    JSON.stringify(okFetch.seen.filter((entry) => entry.action === 'save').at(-1)?.body ?? null) === JSON.stringify({ systemPrompt: '自定义提示词' }),
+    JSON.stringify(okFetch.seen.filter((entry) => entry.action === 'save').at(-1)?.body ?? null))
+
+  // The record count is the feature's other setting: committed on Enter (or on
+  // blur) rather than per keystroke, and an out-of-range value is refused with a
+  // visible reason instead of being silently clamped.
+  const recentOf = (tree) => findAll(okPanel(tree, 'optimize'), (node) => node.props?.id === 'dspo-recent')[0]
+  recentOf(okTree).props.onChange({ target: { value: '12' } })
+  okTree = okPage()
+  recentOf(okTree).props.onKeyDown({ key: 'Enter' })
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  const recentBody = okFetch.seen.filter((entry) => entry.action === 'save').at(-1)?.body ?? null
+  check('改写条数只发 recentMessages 一个键',
+    JSON.stringify(recentBody) === JSON.stringify({ recentMessages: 12 }), JSON.stringify(recentBody))
+  okTree = okPage()
+  recentOf(okTree).props.onChange({ target: { value: '99' } })
+  okTree = okPage()
+  recentOf(okTree).props.onKeyDown({ key: 'Enter' })
+  okTree = okPage()
+  const recentError = findAll(okPanel(okTree, 'optimize'), (node) => node.props?.className === 'dspo-set-status' && node.props['data-tone'] === 'error')[0]
+  check('条数越界不保存、并就地说出可填范围',
+    (okFetch.seen.filter((entry) => entry.action === 'save').at(-1)?.body?.recentMessages ?? null) === 12
+      && recentError !== undefined && textOf(recentError).includes('0–50'),
+    `${JSON.stringify(okFetch.seen.filter((entry) => entry.action === 'save').at(-1)?.body ?? null)} / ${recentError === undefined ? 'no error line' : textOf(recentError)}`)
   okBundle.__restore()
 
   /* ── the rail walks with the keyboard, like the shell's own ── */
-  let keys = clickTab(page(), 'model')
-  const steppedRight = press(keys, 'model', 'ArrowRight')
+  let keys = clickTab(page(), 'optimize')
+  const steppedRight = press(keys, 'optimize', 'ArrowRight')
   keys = page()
   check('ArrowRight 选中下一个页签', steppedRight === true
-    && selectedTab(keys).props.id === 'dspo-tab-rewrite' && selectedTabs(keys).length === 1)
-  const steppedLeft = press(keys, 'rewrite', 'ArrowLeft')
+    && selectedTab(keys).props.id === 'dspo-tab-btw' && selectedTabs(keys).length === 1)
+  const steppedLeft = press(keys, 'btw', 'ArrowLeft')
   keys = page()
-  check('ArrowLeft 选中上一个页签', steppedLeft === true && selectedTab(keys).props.id === 'dspo-tab-model')
-  const wrappedBack = press(keys, 'model', 'ArrowLeft')
+  check('ArrowLeft 选中上一个页签', steppedLeft === true && selectedTab(keys).props.id === 'dspo-tab-optimize')
+  const wrappedBack = press(keys, 'optimize', 'ArrowLeft')
   keys = page()
   check('ArrowLeft 从第一个页签回绕到最后一个',
     wrappedBack === true && selectedTab(keys).props.id === 'dspo-tab-notify')
   const wrappedForward = press(keys, 'notify', 'ArrowRight')
   keys = page()
   check('ArrowRight 从最后一个页签回绕到第一个',
-    wrappedForward === true && selectedTab(keys).props.id === 'dspo-tab-model')
-  const ended = press(keys, 'model', 'End')
+    wrappedForward === true && selectedTab(keys).props.id === 'dspo-tab-optimize')
+  const ended = press(keys, 'optimize', 'End')
   keys = page()
   check('End 选中最后一个页签', ended === true && selectedTab(keys).props.id === 'dspo-tab-notify')
   const homed = press(keys, 'notify', 'Home')
   keys = page()
-  check('Home 选中第一个页签', homed === true && selectedTab(keys).props.id === 'dspo-tab-model')
-  const untouched = press(keys, 'model', 'Enter')
+  check('Home 选中第一个页签', homed === true && selectedTab(keys).props.id === 'dspo-tab-optimize')
+  const untouched = press(keys, 'optimize', 'Enter')
   keys = page()
   check('未处理的按键不调用 preventDefault、也不改选中',
-    untouched === false && selectedTab(keys).props.id === 'dspo-tab-model')
+    untouched === false && selectedTab(keys).props.id === 'dspo-tab-optimize')
   check('键盘移动后 data-active / tabIndex / 唯一性都跟着选中走',
     selectedTabs(keys).length === 1
       && tabsOf(keys).every((tab) => tab.props.tabIndex === (tab.props['aria-selected'] === true ? 0 : -1)
@@ -2647,9 +2842,9 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
 }
 
 {
-  // 「旁路提问」自己的模型与强度：与「优化提示词」同形、同值、互不影响。
-  // Its own bundle with a host that accepts saves, so what the two pickers write
-  // is read off the requests themselves rather than off a fixture echo.
+  // 「旁路提问」与「标题」各自的模型与强度：同形、同值、互不影响。 (The rewrite
+  // has no model or effort row any more, so the two remaining pickers are the
+  // side question's and the title's.)
   const fetchImpl = makeFetch({ saveOk: true })
   const bundle = loadClientBundle(fetchImpl)
   await bundle.settingsStore.load(true)
@@ -2666,16 +2861,16 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
     await new Promise((resolve) => setTimeout(resolve, 0))
   }
 
-  let walk = openTab(page(), 'model')
-  walk = openTab(walk, 'btw')
+  let walk = openTab(page(), 'btw')
+  walk = openTab(walk, 'title')
   const btwPanel = panelOf(walk, 'btw')
-  const modelPanel = panelOf(walk, 'model')
+  const titlePanel = panelOf(walk, 'title')
   const btwProvider = findAll(btwPanel, (node) => node.props?.id === 'dspo-btw-provider')[0]
   const btwModel = findAll(btwPanel, (node) => node.props?.id === 'dspo-btw-model-pick')[0]
   const btwEffort = findAll(btwPanel, (node) => node.props?.id === 'dspo-btw-effort')[0]
-  const modelProvider = findAll(modelPanel, (node) => node.props?.id === 'dspo-provider')[0]
-  const modelPick = findAll(modelPanel, (node) => node.props?.id === 'dspo-model')[0]
-  const modelEffort = findAll(modelPanel, (node) => node.props?.id === 'dspo-effort')[0]
+  const titleProvider = findAll(titlePanel, (node) => node.props?.id === 'dspo-title-provider')[0]
+  const titlePick = findAll(titlePanel, (node) => node.props?.id === 'dspo-title-model-pick')[0]
+  const titleEffort = findAll(titlePanel, (node) => node.props?.id === 'dspo-title-effort')[0]
   const labelsOf = (select) => (select?.children ?? []).map(textOf)
   const valuesOf = (select) => (select?.children ?? []).map((option) => option.props.value)
 
@@ -2683,17 +2878,20 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
     btwProvider?.type === 'select' && btwModel?.type === 'select')
   check('旁路提问页签里有思考强度选择项', btwEffort?.type === 'select')
   check('两处模型可选值完全一致（同一份目录，逐个相同）',
-    JSON.stringify(labelsOf(btwProvider)) === JSON.stringify(labelsOf(modelProvider))
-      && JSON.stringify(labelsOf(btwModel)) === JSON.stringify(labelsOf(modelPick)),
-    `${labelsOf(btwModel).join(',')} vs ${labelsOf(modelPick).join(',')}`)
+    JSON.stringify(labelsOf(btwProvider)) === JSON.stringify(labelsOf(titleProvider))
+      && JSON.stringify(labelsOf(btwModel)) === JSON.stringify(labelsOf(titlePick)),
+    `${labelsOf(btwModel).join(',')} vs ${labelsOf(titlePick).join(',')}`)
   check('两处思考等级可选值完全一致（逐个相同）',
-    JSON.stringify(labelsOf(btwEffort)) === JSON.stringify(labelsOf(modelEffort))
-      && JSON.stringify(valuesOf(btwEffort)) === JSON.stringify(valuesOf(modelEffort)),
-    `${labelsOf(btwEffort).join(',')} vs ${labelsOf(modelEffort).join(',')}`)
+    JSON.stringify(labelsOf(btwEffort)) === JSON.stringify(labelsOf(titleEffort))
+      && JSON.stringify(valuesOf(btwEffort)) === JSON.stringify(valuesOf(titleEffort)),
+    `${labelsOf(btwEffort).join(',')} vs ${labelsOf(titleEffort).join(',')}`)
+  // The btw tab reads the btw half's own advertised list (there is no longer a
+  // top-level `reasoning` to borrow), so this pins that the dropdown shows that
+  // route's set and not a fixed internal list.
   check('两处的强度档位就是适配器自报的那一组',
-    JSON.stringify(valuesOf(btwEffort)) === JSON.stringify(STATE.value.reasoning.efforts))
-  check('旁路的模型与强度默认未选择（模型空值、强度 off，与「优化提示词」的默认一致）',
-    btwModel.props.value === '' && btwEffort.props.value === 'off' && modelEffort.props.value === 'off')
+    JSON.stringify(valuesOf(btwEffort)) === JSON.stringify(STATE.value.btw.reasoning.efforts))
+  check('旁路与标题的模型默认未选择、强度默认 off',
+    btwModel.props.value === '' && titlePick.props.value === '' && btwEffort.props.value === 'off' && titleEffort.props.value === 'off')
 
   const lastSave = () => fetchImpl.seen.filter((entry) => entry.action === 'save').at(-1)?.body ?? null
   btwEffort.props.onChange({ target: { value: 'high' } })
@@ -2709,7 +2907,7 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
     JSON.stringify(patch))
   check('改旁路的两项设置都不携带「优化提示词」的键',
     patch !== null && !('provider' in patch) && !('model' in patch)
-      && !('reasoningEffort' in patch) && !('followSessionModel' in patch))
+      && !('reasoningEffort' in patch) && !('recentMessages' in patch))
   bundle.__restore()
 }
 
@@ -3188,7 +3386,7 @@ function makeClientCtx(face) {
   const input = makeInput({ draft: 'make the login page faster' })
   const button = buttonsOf(bundle.OptimizeButton(input.props))[0]
   check('locale=en 时按钮文案为英文', labelOf(button).includes('Optimize prompt'), labelOf(button))
-  check('locale=en 时设置页为英文', textOf(bundle.SettingsPanel({ close() {} })).includes('Optimization model'))
+  check('locale=en 时设置页为英文', textOf(bundle.SettingsPanel({ close() {} })).includes('Carry recent session messages'))
   bundle.__restore()
 }
 
@@ -3200,7 +3398,24 @@ function makeClientCtx(face) {
   check('中英文词典键完全一致', JSON.stringify(zhKeys) === JSON.stringify(enKeys), `${zhKeys.length} vs ${enKeys.length}`)
   const literalKeys = [...clientSource.matchAll(/\bt\('([a-zA-Z][\w]*)'/g)].map((match) => match[1])
   const missing = [...new Set(literalKeys)].filter((key) => !zhKeys.includes(key) && !/^effort[A-Z]/.test(key) && !/^style[A-Z]/.test(key))
-  check('代码里用到的文案键都在词典里', missing.length === 0, missing.join(','))
+  // The reverse direction. A key that no line outside the dictionaries mentions
+  // is dead weight, and dead keys accumulate quietly: every removed feature
+  // leaves its strings behind (the two the single-mode rewrite orphaned, and
+  // eight older ones, were invisible because only `used ⊆ dictionary` was ever
+  // asserted). Keys are referenced through variables and label strings as often
+  // as through a literal `t('…')` — `{ id: 'optimize', label: 'tabOptimize' }`
+  // is the tab case — so the mention is looked for anywhere outside both
+  // dictionaries. `effort*` is the one family built from a template.
+  const dicts = ['zh', 'en'].map((id) => {
+    const at = clientSource.indexOf(`${id}: {`)
+    return { at, end: clientSource.indexOf('\n      },', at) }
+  })
+  const mentionable = clientSource.slice(0, dicts[0].at)
+    + clientSource.slice(dicts[0].end, dicts[1].at)
+    + clientSource.slice(dicts[1].end)
+  const orphans = zhKeys.filter((key) => !mentionable.includes(key) && !/^effort[A-Z]/.test(key))
+  check('文案键双向一致（用到的都在词典里，词典里的都有人引用）',
+    missing.length === 0 && orphans.length === 0, [...missing, ...orphans].join(','))
   check('词典无遗留的占位文本', !zhKeys.some((key) => /todo|lorem/i.test(key)))
 
   function bundleKeysOf(id) {

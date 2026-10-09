@@ -1,12 +1,13 @@
 {
   "name": "dsh-prompt-tuner",
   "version": "0.1.0",
-  "description": "A personal DSH Web plugin suite for the composer: prompt rewriting (streamed through a model you choose, by default the session's own) plus read-only side questions, with every knob on one settings page",
+  "description": "A personal DSH Web plugin suite for the composer: single-mode prompt rewriting (a built-in default prompt, or your own, plus the newest n session messages, riding the session's own model) with one settings tab, plus read-only side questions, desktop notifications and session titles",
   "type": "module",
   "main": "./lib/index.js",
   "files": [
     "lib",
     "scripts",
+    "docs",
     "cordis.patch.yml",
     "README.md",
     "LICENSE"
