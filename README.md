@@ -135,6 +135,10 @@ thresholdRatio = 你要的 token 数 ÷ 该模型窗口大小
 
 **完成判定**用的就是 shell 自己的会话状态通道：客户端订阅 `remote.$on('api-session/status', (sessionId, running) => …)`，只有在**真正发生 running → idle 跳变**时才发（会话第一次报 `false` 是初始态，不算完成；idle → idle 也不重复发）。因此**后台会话跑完一样会通知**——你通常正是在看别处的时候，之前启动的任务才跑完。摘要由会话座位从 chat 快照里**结构化**取出（最后一条带 assistant 标记的记录里的 `text` 字段，流式中的 `partial` 也算），取不到就如实说「没有可用的回答摘要」，不编造。
 
+> **为什么订阅要「等」而不是「读一次」**：插件自己的 bundle 与承载 `remote` 的 `dsh-api-gateway` **不是同一个 bundle**，各自独立装载，所以插件激活那一刻网关可能还没把服务提供出来。而且本插件**没有** inject `remote`——声明它会让「除了通知不要这个通道」的部署连输入框按钮一起装不上，这个功能可以自己等着。于是订阅端按 500ms 一次、最多 30 秒地重试（`ctx.get` 对「晚一步提供」的服务照样能读到，实测有效），拿到就订阅；始终等不到才在控制台写明这一项**已关闭**。这条曾经是静默的：读一次、抛错被吞、订阅从未安装，表面上就像「功能没问题但不发通知」。
+>
+> 控制台会打三行可核对的日志：安装时 `[prompt-tuner] completion notifications: watching session status`、每次 running/idle 跳变、以及真要发通知时的会话与摘要长度。没有通知时先看第一行——它把「订阅没装上」和「没有任务完成」区分开。
+
 设置页「通知」页签只有一个总开关，外加显示本机实际的派发方式和一个**发送测试通知**按钮。
 
 ## 设置页
@@ -262,7 +266,7 @@ thresholdRatio = 你要的 token 数 ÷ 该模型窗口大小
 ## 自检与基准
 
 ```sh
-npm run check                 # 442 项，含宿主路由、压缩/通知模块与浏览器半区
+npm run check                 # 446 项，含宿主路由、压缩/通知模块与浏览器半区
 npm run check:shape           # 对**已安装**的 DSH 复核旁路提问的消息形状（需要本机有 DSH）
 node scripts/bench.mjs --runs 3 --effort off
 node scripts/bench.mjs --runs 3 --effort auto     # 对照：省掉字段要多花多少时间

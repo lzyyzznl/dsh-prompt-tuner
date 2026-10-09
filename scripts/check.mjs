@@ -2617,7 +2617,43 @@ section('4b. 压缩与通知的浏览器半区')
   dispose()
   check('disposer 已转交', disposed === true)
   check('没有 remote 服务时静默降级、不抛',
-    typeof wired.watchCompletions({}) === 'function' && typeof wired.watchCompletions(null) === 'function')
+    typeof wired.watchCompletions({}, { attempts: 1, intervalMs: 0 }) === 'function'
+      && typeof wired.watchCompletions(null, { attempts: 1, intervalMs: 0 }) === 'function')
+
+  // The regression that made this feature a silent no-op on a real shell: this
+  // plugin's bundle is not the one carrying `remote`, so at activation time the
+  // gateway has not provided it yet. Reading once (or giving up on the first
+  // miss) left the watcher permanently unsubscribed.
+  {
+    const laterRemote = {
+      $on: (type, handler) => {
+        handlers.push({ type, handler })
+        return () => {}
+      },
+    }
+    let available = false
+    const lateCtx = { get: (name) => (name === 'remote' && available ? laterRemote : undefined) }
+    const before = handlers.length
+    const stop = wired.watchCompletions(lateCtx, { attempts: 20, intervalMs: 1 })
+    check('remote 尚未提供时不立即订阅（也没有放弃）', handlers.length === before)
+    available = true
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    check('remote 晚一步出现后仍会订阅上（激活时的竞态被吸收）',
+      handlers.length === before + 1 && handlers[before].type === 'api-session/status',
+      `${handlers.length - before} subscription(s)`)
+    stop()
+    const afterStop = handlers.length
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    check('disposer 停掉重试后不再新增订阅', handlers.length === afterStop)
+  }
+  {
+    let attemptsSeen = 0
+    const hopeless = { get: () => { attemptsSeen += 1; return undefined } }
+    const stop = wired.watchCompletions(hopeless, { attempts: 3, intervalMs: 1 })
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    check('重试预算用尽后停止尝试（不无限轮询）', attemptsSeen === 3, String(attemptsSeen))
+    stop()
+  }
 
   /* ── the settings tabs render their controls ── */
   const renderPage = mountClient(bundle, bundle.SettingsPanel)
