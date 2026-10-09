@@ -68,16 +68,16 @@ check('client 不静态 import @deepseek-ai（避免预发布 peer 冲突）', !
 check('host 四个源文件均无外部依赖', !/from '@deepseek-ai/.test(hostSource + routeSource + promptSource + storeSource))
 
 const registers = [...clientSource.matchAll(/slots\.register\(\{\s*name:\s*'([^']+)'/g)].map((m) => m[1])
-check('恰好 5 个字面 slots.register（预检按字面读取）', registers.length === 5, registers.join(','))
+check('恰好 6 个字面 slots.register（预检按字面读取）', registers.length === 6, registers.join(','))
 check(
-  '注册座位 = 工具行×2 + 输入卡浮层 + composer dock + 设置页',
+  '注册座位 = 工具行×2 + 输入卡浮层×2（旁路提问 + 完成通知）+ composer dock + 设置页',
   registers.includes('conversation.input.left')
     && registers.includes('conversation.input.overlay')
     && registers.includes('conversation.input.dock')
     && registers.includes('settings.section'),
   registers.join(','),
 )
-check('每个注册都带 id 与 order', (clientSource.match(/slots\.register\(\{[^}]*id: ID[^}]*order:/g) ?? []).length === 5)
+check('每个注册都带 id 与 order', (clientSource.match(/slots\.register\(\{[^}]*id: ID[^}]*order:/g) ?? []).length === 6)
 check('侧问座位用 session 作用域（浮层在输入卡内，拿得到 useChat）', clientSource.includes("const OVERLAY_SLOT = 'conversation.input.overlay'"))
 // A list slot rejects a second entry under an id it already holds, and that
 // rejection fails activation — so the two composer-row entries must not share one.
@@ -134,6 +134,8 @@ check('滚动容器不留 block-start 内边距（头部与滚动口齐平，不
 
 const prompt = await import('../lib/prompt.js')
 const store = await import('../lib/store.js')
+const compaction = await import('../lib/compaction.js')
+const notify = await import('../lib/notify.js')
 
 section('2. 提示词与设置')
 
@@ -370,9 +372,17 @@ function makeCtx(script, options = {}) {
       listModels: async (id) => (id === 'deepseek-official'
         ? [{ id: 'deepseek-flash', name: 'Flash' }, { id: 'deepseek-pro', name: 'Pro' }]
         : [{ id: 'ccx-1', name: 'CCX 1' }]),
-      resolveModelInfo: async () => (options.reasoning === undefined
-        ? { reasoning: { efforts: [{ id: 'off' }, { id: 'low' }, { id: 'high' }], defaultEffort: 'high' } }
-        : options.reasoning),
+      resolveModelInfo: async (provider, model) => {
+        const base = options.reasoning === undefined
+          ? { reasoning: { efforts: [{ id: 'off' }, { id: 'low' }, { id: 'high' }], defaultEffort: 'high' } }
+          : options.reasoning
+        return {
+          ...(base ?? {}),
+          // Real adapters advertise `context.contextWindow`; the compaction half
+          // reads it to turn a fixed token count into that model's ratio.
+          ...(options.contextWindow === undefined ? {} : { context: { contextWindow: options.contextWindow } }),
+        }
+      },
       stream(call) {
         const index = calls.length
         calls.push(call)
@@ -387,6 +397,7 @@ function makeCtx(script, options = {}) {
     },
   }
   ctx.calls = calls
+  if (options.configEditor !== undefined) ctx.configEditor = options.configEditor
   return ctx
 }
 
@@ -805,6 +816,257 @@ store.clearBtwTopics('session-a')
   await call(ctx, '/save', { btwSaveHistory: true })
 }
 
+/* ───────────────────────── 3b. compaction + notifications ───────────────────────── */
+
+section('3b. 压缩阈值与桌面通知')
+
+/* ── the fixed-token → ratio conversion ── */
+{
+  const exact = compaction.compactionPolicy('deepseek-official', 'deepseek-pro', 250_000, 1_000_000)
+  check('固定 token 数换算成该模型窗口占比后仍是同一个绝对数（窗口约掉）',
+    exact.ok === true && Math.abs(exact.policy.thresholdRatio - 0.25) < 1e-12 && exact.effectiveTokens === 250_000,
+    JSON.stringify(exact))
+  check('每个模型各自成一条策略：同一阈值在不同窗口下换算不同',
+    compaction.compactionPolicy('p', 'big', 250_000, 1_000_000).policy.thresholdRatio
+      !== compaction.compactionPolicy('p', 'small', 250_000, 500_000).policy.thresholdRatio)
+  check('retainRatio 严格小于 thresholdRatio（DSH 加载时的硬约束）',
+    exact.ok === true
+      && exact.policy.retainRatio < exact.policy.thresholdRatio
+      && exact.policy.retainRatio <= compaction.DEFAULT_RETAIN_RATIO,
+    JSON.stringify(exact.policy))
+  check('阈值超过模型窗口时拒绝并说明原因',
+    compaction.compactionPolicy('p', 'm', 300_000, 128_000).ok === false
+      && compaction.compactionPolicy('p', 'm', 300_000, 128_000).reason === 'exceeds-window')
+  check('阈值超出可写范围时拒绝',
+    compaction.compactionPolicy('p', 'm', 16, 1_000_000).reason === 'tokens'
+      && compaction.compactionPolicy('p', 'm', 5_000_000, 1_000_000).reason === 'tokens')
+  check('窗口未知（适配器没声明）时不生成策略',
+    compaction.compactionPolicy('p', 'm', 250_000, null).ok === false
+      && compaction.compactionPolicy('p', 'm', 250_000, null).reason === 'context')
+  const nearFull = compaction.compactionPolicy('p', 'm', 990_000, 1_000_000)
+  check('贴着窗口上限的阈值被压到 0.95 以内并如实标记 capped',
+    nearFull.ok === true && nearFull.policy.thresholdRatio <= compaction.MAX_THRESHOLD_RATIO && nearFull.capped === true)
+
+  const plan = compaction.planCompactionPolicies(
+    { 'a/x': 250_000, 'a/y': 250_000, 'a/z': 999, 'bad-key': 250_000, 'a/w': 200_000 },
+    (provider, model) => (model === 'x' || model === 'w' ? 1_000_000 : null),
+  )
+  check('批量计划只保留能换算的行，并逐行报告未生效原因',
+    plan.policies.length === 2
+      && plan.skipped.length === 3
+      && plan.skipped.some((row) => row.target === 'a/y' && row.reason === 'context')
+      && plan.skipped.some((row) => row.target === 'a/z' && row.reason === 'tokens')
+      && plan.skipped.some((row) => row.target === 'bad-key' && row.reason === 'route'),
+    JSON.stringify(plan.skipped))
+  check('批量计划保留索引顺序（同一份设置得到同一份策略）',
+    plan.policies[0].model === 'x' && plan.policies[1].model === 'w',
+    JSON.stringify(plan.policies.map((row) => row.model)))
+
+  const existing = [{ provider: 'a', model: 'x', thresholdRatio: 0.1 }, { provider: 'hand', model: 'made', thresholdRatio: 0.5 }]
+  const merged = compaction.mergeModelPolicies(existing, [compaction.compactionPolicy('a', 'x', 250_000, 1_000_000).policy])
+  check('合并策略：同 route 被替换，手写的其它 route 原样保留',
+    merged.length === 2
+      && merged.find((row) => row.provider === 'a' && row.model === 'x').thresholdRatio === 0.25
+      && merged.some((row) => row.provider === 'hand'),
+    JSON.stringify(merged))
+  check('合并时非数组的既有值被当作空表', compaction.mergeModelPolicies(null, []).length === 0)
+
+  const yaml = compaction.renderCompactionYaml([compaction.compactionPolicy('a', 'x', 250_000, 1_000_000).policy])
+  check('等效补丁片段带 entry id、provider/model 与两个 ratio',
+    yaml.includes('id: compaction-basic') && yaml.includes('provider: "a"') && yaml.includes('model: "x"')
+      && yaml.includes('thresholdRatio: 0.25') && /retainRatio: 0\.1[0-9]*/.test(yaml),
+    yaml.split('\n').slice(0, 6).join(' | '))
+}
+
+/* ── the config-editor write ── */
+{
+  const entry = { options: { id: 'compaction-basic', name: '@deepseek-ai/dsh-compaction-basic', config: {} } }
+  const policy = compaction.compactionPolicy('a', 'x', 250_000, 1_000_000).policy
+  let written = null
+  const editor = {
+    entries: () => [entry],
+    edit: async (_entry, change) => {
+      written = change({ modelPolicies: [{ provider: 'hand', model: 'made' }] })
+    },
+  }
+  const applied = await compaction.applyCompactionPolicies(editor, [policy])
+  check('写入走 configEditor.edit，合并后落进 compaction-basic 的 config',
+    applied.ok === true && applied.entry === 'compaction-basic' && applied.count === 1
+      && written.modelPolicies.length === 2,
+    JSON.stringify(applied))
+  check('写入保留该 entry 的其它配置字段',
+    (await (async () => {
+      let next = null
+      const withName = { entries: () => [entry], edit: async (_e, change) => { next = change({ auto: true, modelPolicies: [] }) } }
+      await compaction.applyCompactionPolicies(withName, [policy])
+      return next.auto === true
+    })()) === true)
+  check('配置编辑器缺席时如实报告 unavailable、不抛异常',
+    (await compaction.applyCompactionPolicies(null, [policy])).code === 'unavailable')
+  check('地址表中没有 compaction-basic 时报 entry-missing',
+    (await compaction.applyCompactionPolicies({ entries: () => [], edit: async () => {} }, [policy])).code === 'entry-missing')
+  check('reconcile 抛错时把错误交回调用方、不吞掉',
+    (await compaction.applyCompactionPolicies({
+      entries: () => [entry],
+      edit: async () => {
+        throw new Error('loader rejected the change')
+      },
+    }, [policy])).message === 'loader rejected the change')
+  check('按包名也能找到被改过 id 的 entry',
+    compaction.findCompactionEntry([{ options: { id: 'renamed', name: '@deepseek-ai/dsh-compaction-basic' } }]) !== null)
+}
+
+/* ── platform dispatch ── */
+{
+  check('Windows 走 Windows 通知',
+    notify.notifyPlatform({}, 'win32') === 'windows')
+  check('Linux 有 DISPLAY 走 notify-send',
+    notify.notifyPlatform({ DISPLAY: ':0' }, 'linux') === 'linux')
+  check('Linux 只有 Wayland 也算有桌面',
+    notify.notifyPlatform({ WAYLAND_DISPLAY: 'wayland-0' }, 'linux') === 'linux')
+  check('Linux 没有 DISPLAY / Wayland 时不派发（无头环境不刷失败）',
+    notify.notifyPlatform({}, 'linux') === null)
+  check('WSL 路由到 Windows 通知（Linux 进程、Windows 桌面）',
+    notify.notifyPlatform({ WSL_DISTRO_NAME: 'Ubuntu' }, 'linux') === 'windows'
+      && notify.notifyPlatform({ WSL_INTEROP: '/run/WSL/1' }, 'linux') === 'windows')
+  check('其它平台不派发', notify.notifyPlatform({}, 'darwin') === null)
+
+  const linuxCommand = notify.buildNotifyCommand('linux', { title: 'T', body: 'B' })
+  check('Linux 命令是 notify-send，标题正文各是一个 argv（无 shell）',
+    linuxCommand.command === 'notify-send' && linuxCommand.args.includes('T') && linuxCommand.args.includes('B')
+      && !linuxCommand.args.some((arg) => arg.includes(';') || arg.includes('$(')),
+    JSON.stringify(linuxCommand.args))
+  const windowsCommand = notify.buildNotifyCommand('windows', { title: 'T', body: 'B' })
+  check('Windows 命令是 powershell -EncodedCommand（标题正文不进 argv 明文）',
+    windowsCommand.command === 'powershell.exe' && windowsCommand.args.includes('-EncodedCommand')
+      && !windowsCommand.args.includes('T') && !windowsCommand.args.includes('B'),
+    JSON.stringify(windowsCommand.args.slice(0, 4)))
+  const decoded = Buffer.from(windowsCommand.args[windowsCommand.args.indexOf('-EncodedCommand') + 1], 'base64').toString('utf16le')
+  check('EncodedCommand 解出真实脚本，标题正文在里面',
+    decoded.includes("'T'") && decoded.includes("'B'") && decoded.includes('ToastNotificationManager'))
+  check('PowerShell 单引号转义：正文里的引号被翻倍（注入不成立）',
+    notify.windowsToastScript("a'b", "c'd").includes("'a''b'")
+      && notify.windowsToastScript("a'b", "c'd").includes("'c''d'"))
+
+  const okRun = async () => ({ error: null })
+  const failRun = async () => ({ error: new Error('notify-send not found') })
+  check('sendNotification 成功时 ok=true 并回报平台与命令',
+    (await notify.sendNotification({ title: 'T', body: 'B' }, { platform: 'linux', env: { DISPLAY: ':0' }, run: okRun })).ok === true)
+  check('sendNotification 失败时 ok=false 并带上原因、不抛',
+    (await notify.sendNotification({ title: 'T', body: 'B' }, { platform: 'linux', env: { DISPLAY: ':0' }, run: failRun })).error === 'notify-send not found')
+  check('无桌面时跳过并说明 skipped，不调用任何命令',
+    (await notify.sendNotification({ title: 'T', body: 'B' }, { platform: 'linux', env: {} })).skipped === 'no-display')
+  let capturedArgs = null
+  const captureRun = async (_command, args) => {
+    capturedArgs = args
+    return { error: null }
+  }
+  await notify.sendNotification(
+    { title: 'x'.repeat(500), body: 'y'.repeat(2000) },
+    { platform: 'linux', env: { DISPLAY: ':0' }, run: captureRun },
+  )
+  check('超长标题正文被折叠截断后才进命令（120 / 600 字符上限）',
+    capturedArgs !== null
+      && capturedArgs.includes('x'.repeat(notify.NOTIFY_TITLE_CHARS))
+      && capturedArgs.includes('y'.repeat(notify.NOTIFY_BODY_CHARS)),
+    capturedArgs === null ? 'no command' : `${capturedArgs[capturedArgs.length - 2].length}/${capturedArgs[capturedArgs.length - 1].length}`)
+  await notify.sendNotification(
+    { title: 'a\nb', body: 'c\td' },
+    { platform: 'linux', env: { DISPLAY: ':0' }, run: captureRun },
+  )
+  check('换行等控制字符被折叠成空格', capturedArgs.includes('a b') && capturedArgs.includes('c d'), JSON.stringify(capturedArgs))
+}
+
+/* ── the new routes ── */
+{
+  const ctx = makeCtx([], { contextWindow: 1_000_000 })
+  registerRoutes(ctx)
+
+  const state = await call(ctx, '/state', {})
+  check('/state 上报压缩契约（entry id、范围、配置编辑器可见性、计划）',
+    state.json?.ok === true
+      && state.json.value.compaction?.entryId === 'compaction-basic'
+      && state.json.value.compaction.configEditor === false
+      && state.json.value.compaction.limits.minTokens === compaction.MIN_COMPACTION_TOKENS
+      && Array.isArray(state.json.value.compaction.plan.policies),
+    JSON.stringify(state.json?.value?.compaction ?? null))
+  check('/state 上报通知契约（开关、平台、标题正文上限）',
+    state.json?.value?.notify?.onComplete === true
+      && 'platform' in state.json.value.notify
+      && state.json.value.notify.limits.titleChars === notify.NOTIFY_TITLE_CHARS
+      && state.json.value.notify.limits.bodyChars === notify.NOTIFY_BODY_CHARS)
+
+  const saved = await call(ctx, '/save', { compactionTokens: { 'deepseek-official/deepseek-flash': 250_000 } })
+  check('/save 收下合法的 per-model 阈值并回读',
+    saved.json?.ok === true
+      && saved.json.value.settings.compactionTokens['deepseek-official/deepseek-flash'] === 250_000,
+    JSON.stringify(saved.json?.value?.settings?.compactionTokens ?? null))
+  check('/save 拒绝不是 provider/model 的键',
+    (await call(ctx, '/save', { compactionTokens: { nope: 250_000 } })).json?.ok === false)
+  check('/save 拒绝超出可写范围的阈值',
+    (await call(ctx, '/save', { compactionTokens: { 'a/b': 9_000_000 } })).json?.ok === false)
+  check('/save 拒绝非对象的阈值表',
+    (await call(ctx, '/save', { compactionTokens: [250_000] })).json?.ok === false)
+  check('/save 拒绝非布尔的通知开关',
+    (await call(ctx, '/save', { notifyOnComplete: 'yes' })).json?.ok === false)
+  check('/save 存下通知开关并回读',
+    (await call(ctx, '/save', { notifyOnComplete: false })).json?.value?.settings?.notifyOnComplete === false)
+
+  const windowsView = await call(ctx, '/compaction.windows', {})
+  check('/compaction.windows 列出目录里的每个模型与其宿主解析出的窗口',
+    windowsView.json?.ok === true
+      && windowsView.json.value.models.length === 3
+      && windowsView.json.value.models.every((row) => row.contextWindow === 1_000_000),
+    JSON.stringify(windowsView.json?.value?.models ?? null))
+  check('/compaction.windows 带出已存阈值',
+    windowsView.json.value.models.find((row) => row.model === 'deepseek-flash')?.tokens === 250_000)
+
+  const noEditor = await call(ctx, '/compaction.apply', {})
+  check('/compaction.apply 无 configEditor 时报 unavailable、不写任何东西',
+    noEditor.json?.ok === true
+      && noEditor.json.value.applied.ok === false
+      && noEditor.json.value.applied.code === 'unavailable'
+      && noEditor.json.value.plan.policies.length === 1,
+    JSON.stringify(noEditor.json?.value?.applied ?? null))
+
+  let edited = null
+  const withEditor = makeCtx([], {
+    contextWindow: 1_000_000,
+    configEditor: {
+      entries: () => [{ options: { id: 'compaction-basic', name: '@deepseek-ai/dsh-compaction-basic' } }],
+      edit: async (_entry, change) => {
+        edited = change({ modelPolicies: [] })
+      },
+    },
+  })
+  registerRoutes(withEditor)
+  const applied = await call(withEditor, '/compaction.apply', {})
+  check('/compaction.apply 写入并如实上报条数',
+    applied.json?.value?.applied?.ok === true && applied.json.value.applied.count === 1,
+    JSON.stringify(applied.json?.value?.applied ?? null))
+  check('/compaction.apply 写入的是换算后的 modelPolicies（固定 token → 该模型占比）',
+    edited?.modelPolicies?.length === 1
+      && edited.modelPolicies[0].provider === 'deepseek-official'
+      && edited.modelPolicies[0].model === 'deepseek-flash'
+      && Math.abs(edited.modelPolicies[0].thresholdRatio - 0.25) < 1e-12,
+    JSON.stringify(edited))
+
+  // The dispatch itself is covered above with an injected runner. These two are
+  // deliberately limited to the paths that cannot pop a real notification on the
+  // machine running the suite: the switch being off, and a host with no desktop.
+  const disabled = await call(ctx, '/notify', { title: 'T', body: 'B' })
+  check('/notify 开关关闭时不派发（不落到桌面）',
+    disabled.json?.ok === true && disabled.json.value.sent === false && disabled.json.value.skipped === 'disabled',
+    JSON.stringify(disabled.json?.value ?? null))
+  if (notify.notifyPlatform(process.env, process.platform) === null) {
+    const probe = await call(ctx, '/notify.test', {})
+    check('/notify.test 在无桌面环境如实报 skipped',
+      probe.json?.ok === true && probe.json.value.sent === false && typeof probe.json.value.skipped === 'string',
+      JSON.stringify(probe.json?.value ?? null))
+  }
+}
+
+
 /* ───────────────────────── 4. browser half ───────────────────────── */
 
 section('4. 浏览器半区')
@@ -998,6 +1260,8 @@ const STATE = {
       shortcut: true,
       btwContextTurns: 'all',
       btwSaveHistory: true,
+      compactionTokens: { 'deepseek-official/deepseek-flash': 250_000 },
+      notifyOnComplete: true,
     },
     defaultSystemPrompt: prompt.DEFAULT_SYSTEM_PROMPT,
     custom: false,
@@ -1019,6 +1283,19 @@ const STATE = {
       maxQuestionChars: prompt.MAX_BTW_QUESTION_CHARS,
       historyFile: store.BTW_HISTORY_FILE,
       prompt: prompt.BTW_SYSTEM_PROMPT,
+    },
+    compaction: {
+      tokens: { 'deepseek-official/deepseek-flash': 250_000 },
+      entryId: 'compaction-basic',
+      limits: { minTokens: 8192, maxTokens: 4_000_000 },
+      configEditor: false,
+      plan: { policies: [], skipped: [], capped: [], yaml: '' },
+    },
+    notify: {
+      onComplete: true,
+      platform: 'linux',
+      appName: 'DSH',
+      limits: { titleChars: 120, bodyChars: 600 },
     },
   },
 }
@@ -1092,6 +1369,17 @@ function makeFetch(options = {}) {
     }
     if (action === 'btw.history') {
       return new Response(JSON.stringify({ ok: true, value: { topics: options.btwTopics ?? [], saveHistory: options.btwSaveHistory !== false } }), { status: 200 })
+    }
+    if (action === 'compaction.windows') {
+      return new Response(JSON.stringify({
+        ok: true,
+        value: {
+          limits: { minTokens: compaction.MIN_COMPACTION_TOKENS, maxTokens: compaction.MAX_COMPACTION_TOKENS },
+          models: options.compactionWindows ?? [
+            { provider: 'deepseek-official', model: 'deepseek-flash', contextWindow: 1_000_000, tokens: 250_000 },
+          ],
+        },
+      }), { status: 200 })
     }
     if (action === 'btw.save') {
       const body = seen[seen.length - 1].body ?? {}
@@ -1329,8 +1617,8 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
   const render = mountClient(bundle, bundle.SettingsPanel)
   const page = () => render({ close() {} })
 
-  const TAB_IDS = ['model', 'rewrite', 'prompt', 'btw']
-  const TAB_KEYS = ['tabModel', 'tabRewrite', 'tabPrompt', 'tabBtw']
+  const TAB_IDS = ['model', 'rewrite', 'prompt', 'btw', 'compaction', 'notify']
+  const TAB_KEYS = ['tabModel', 'tabRewrite', 'tabPrompt', 'tabBtw', 'tabCompaction', 'tabNotify']
   const TAB_LABELS = TAB_KEYS.map((key) => bundle.DICT.zh[key])
   const PAGE_NODES = ['dspo-meta', 'dspo-set-ok', 'dspo-set-error']
   const tabButton = (tree, id) => findAll(tree, (node) => node.props?.id === `dspo-tab-${id}`)[0]
@@ -1364,13 +1652,13 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
   const firstTabs = tabsOf(first)
   check('设置页有 role="tablist" 的标签栏', rail !== undefined && rail.props.className === 'dspo-tabs'
     && rail.props['aria-label'] === bundle.DICT.zh.settingsTabs, JSON.stringify(rail?.props))
-  check('标签栏恰好四个 role="tab" 按钮', firstTabs.length === 4, String(firstTabs.length))
-  check('四个页签按文档顺序排列，id 与文案各自对应',
+  check('标签栏恰好六个 role="tab" 按钮', firstTabs.length === 6, String(firstTabs.length))
+  check('六个页签按文档顺序排列，id 与文案各自对应',
     JSON.stringify(firstTabs.map((tab) => tab.props.id)) === JSON.stringify(TAB_IDS.map((id) => `dspo-tab-${id}`))
       && JSON.stringify(firstTabs.map(labelOf)) === JSON.stringify(TAB_LABELS),
     firstTabs.map((tab) => `${tab.props.id}=${labelOf(tab)}`).join(' '))
-  check('页签文案就是文档写死的四个中文标签',
-    JSON.stringify(TAB_LABELS) === JSON.stringify(['模型', '改写', '提示词', '旁路提问']), TAB_LABELS.join(','))
+  check('页签文案就是文档写死的六个中文标签',
+    JSON.stringify(TAB_LABELS) === JSON.stringify(['模型', '改写', '提示词', '旁路提问', '压缩', '通知']), TAB_LABELS.join(','))
   check('每个页签都是 button，aria-controls 指向自己的面板',
     firstTabs.every((tab) => tab.props.type === 'button'
       && tab.props['aria-controls'] === `dspo-panel-${tab.props.id.slice('dspo-tab-'.length)}`))
@@ -1479,17 +1767,17 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
   // some of these names, so raw text would double-count them. The shortcut row
   // renders `shortcutToggle` ("启用 Alt+O 触发优化"); `shortcutLabel` ("快捷键")
   // is in the dictionary but is not a row name, so it is not in this list.
-  const ROW_KEYS = ['followSession', 'modelLabel', 'effortLabel', 'styleLabelSetting', 'applyModeLabel', 'routeLabel', 'shortcutToggle', 'promptLabel', 'btwModelLabel', 'btwEffortLabel', 'btwContextLabel', 'btwSaveHistoryLabel']
+  const ROW_KEYS = ['followSession', 'modelLabel', 'effortLabel', 'styleLabelSetting', 'applyModeLabel', 'routeLabel', 'shortcutToggle', 'promptLabel', 'btwModelLabel', 'btwEffortLabel', 'btwContextLabel', 'btwSaveHistoryLabel', 'compactionLabel', 'notifyToggle', 'notifyPlatformLabel']
   const expectedRows = ROW_KEYS.map((key) => bundle.DICT.zh[key])
   const sets = TAB_IDS.map((id) => labelsByTab[id])
   const summary = TAB_IDS.map((id) => `${id}:[${labelsByTab[id].join('|')}]`).join(' ')
   check('每个页签都渲染出设置行', sets.every((labels) => labels.length > 0), summary)
-  check('四个页签的设置行两两不相交、页签内部也不重复',
+  check('六个页签的设置行两两不相交、页签内部也不重复',
     sets.every((labels) => new Set(labels).size === labels.length)
       && sets.every((labels, index) => sets.slice(index + 1).every((other) => labels.every((label) => !other.includes(label)))),
     summary)
   const union = [...new Set(sets.flat())].sort()
-  check('四个页签的行标签并集恰好是词典里的这 12 行（无遗漏、无重复）',
+  check('六个页签的行标签并集恰好是词典里的这 15 行（无遗漏、无重复）',
     union.length === ROW_KEYS.length && JSON.stringify(union) === JSON.stringify([...expectedRows].sort()),
     `${union.length}: ${union.join('|')}`)
 
@@ -1577,15 +1865,15 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
   const wrappedBack = press(keys, 'model', 'ArrowLeft')
   keys = page()
   check('ArrowLeft 从第一个页签回绕到最后一个',
-    wrappedBack === true && selectedTab(keys).props.id === 'dspo-tab-btw')
-  const wrappedForward = press(keys, 'btw', 'ArrowRight')
+    wrappedBack === true && selectedTab(keys).props.id === 'dspo-tab-notify')
+  const wrappedForward = press(keys, 'notify', 'ArrowRight')
   keys = page()
   check('ArrowRight 从最后一个页签回绕到第一个',
     wrappedForward === true && selectedTab(keys).props.id === 'dspo-tab-model')
   const ended = press(keys, 'model', 'End')
   keys = page()
-  check('End 选中最后一个页签', ended === true && selectedTab(keys).props.id === 'dspo-tab-btw')
-  const homed = press(keys, 'btw', 'Home')
+  check('End 选中最后一个页签', ended === true && selectedTab(keys).props.id === 'dspo-tab-notify')
+  const homed = press(keys, 'notify', 'Home')
   keys = page()
   check('Home 选中第一个页签', homed === true && selectedTab(keys).props.id === 'dspo-tab-model')
   const untouched = press(keys, 'model', 'Enter')
@@ -2167,6 +2455,118 @@ function makeClientCtx(face) {
     for (const match of body.matchAll(/^\s{8}(\w+):/gm)) keys[match[1]] = true
     return keys
   }
+}
+
+/* ───────────────────────── 4b. compaction + notification UI ───────────────────────── */
+
+section('4b. 压缩与通知的浏览器半区')
+
+{
+  const bundle = loadClientBundle(makeFetch())
+  await bundle.settingsStore.load(true)
+
+  /* ── the summary extractor ── */
+  check('摘要取最后一条 assistant 记录的正文',
+    bundle.answerSummary([
+      { role: 'user', text: '问题' },
+      { role: 'assistant', content: [{ text: '第一段' }, { text: '第二段' }] },
+    ]) === '第一段\n第二段',
+    bundle.answerSummary([{ role: 'assistant', content: [{ text: '第一段' }, { text: '第二段' }] }]))
+  check('摘要跳过非 assistant 记录',
+    bundle.answerSummary([{ role: 'assistant', text: '答' }, { role: 'user', text: '又问' }]) === '答')
+  check('摘要把还在流式的 partial 也算进去',
+    bundle.answerSummary([{ role: 'assistant', text: '旧答' }], { role: 'assistant', text: '新答' }) === '新答')
+  check('没有可读正文时返回空串（不编造摘要）',
+    bundle.answerSummary([{ role: 'assistant' }]) === '' && bundle.answerSummary([]) === '')
+  check('assistant 标记嵌在更深一层也能认出来',
+    bundle.answerSummary([{ message: { header: { role: 'assistant' }, body: [{ text: '深处' }] } }]) === '深处')
+  check('非数组输入不会抛异常', bundle.answerSummary(null) === '')
+
+  /* ── the title reader ── */
+  const listCtx = {
+    get(name) {
+      if (name !== 'sessions') return undefined
+      return { list: { getSnapshot: () => ({ byId: { s1: { title: '登录页优化' } } }) } }
+    },
+  }
+  check('会话标题取自宿主会话列表', bundle.sessionTitleOf('s1', listCtx) === '登录页优化')
+  check('没有标题的会话返回 null（调用方回落而非显示空标题）',
+    bundle.sessionTitleOf('unknown', listCtx) === null && bundle.sessionTitleOf('s1', null) === null)
+
+  /* ── the status subscription ── */
+  const fetchCalls = []
+  const wired = loadClientBundle(async (url, init) => {
+    const action = String(url).slice(String(url).lastIndexOf('/') + 1)
+    fetchCalls.push({ action, body: JSON.parse(init.body) })
+    return new Response(JSON.stringify(action === 'state' ? STATE : { ok: true, value: { sent: true } }), { status: 200 })
+  })
+  await wired.settingsStore.load(true)
+  const handlers = []
+  let disposed = false
+  const dispose = wired.watchCompletions({
+    remote: {
+      $on: (type, handler) => {
+        handlers.push({ type, handler })
+        return () => {
+          disposed = true
+        }
+      },
+    },
+  })
+  check('订阅的是宿主会话状态通道', handlers.length === 1 && handlers[0].type === 'api-session/status', JSON.stringify(handlers.map((row) => row.type)))
+  handlers[0].handler('s1', false)
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  check('会话首次为 false 是初始态，不当作完成', fetchCalls.filter((row) => row.action === 'notify').length === 0)
+  handlers[0].handler('s1', true)
+  handlers[0].handler('s1', false)
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  const notified = fetchCalls.filter((row) => row.action === 'notify')
+  check('running → idle 的跳变发一次通知，并带上会话标题',
+    notified.length === 1 && notified[0].body.sessionId === 's1',
+    JSON.stringify(fetchCalls.map((row) => row.action)))
+  handlers[0].handler('s1', false)
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  check('idle → idle 不重复通知', fetchCalls.filter((row) => row.action === 'notify').length === 1)
+  check('返回的 disposer 就是 remote 给的取消订阅', typeof dispose === 'function')
+  dispose()
+  check('disposer 已转交', disposed === true)
+  check('没有 remote 服务时静默降级、不抛',
+    typeof wired.watchCompletions({}) === 'function' && typeof wired.watchCompletions(null) === 'function')
+
+  /* ── the settings tabs render their controls ── */
+  const renderPage = mountClient(bundle, bundle.SettingsPanel)
+  let page = renderPage({ close() {} })
+  const clickTab = (tree, id) => {
+    findAll(tree, (node) => node.props?.id === `dspo-tab-${id}`)[0].props.onClick()
+    return renderPage({ close() {} })
+  }
+  page = clickTab(page, 'compaction')
+  // The window lookup is adapter I/O and therefore async; the tab paints a
+  // loading line first and fills the rows when the host answers.
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  page = renderPage({ close() {} })
+  const compactionPanel = findAll(page, (node) => node.props?.id === 'dspo-panel-compaction')[0]
+  const thresholdInputs = findAll(compactionPanel, (node) => node.type === 'input' && node.props.type === 'number')
+  check('压缩页签渲染出每个模型的阈值输入与两个动作按钮',
+    thresholdInputs.length === 1
+      && thresholdInputs[0].props.value === '250000'
+      && buttonsOf(compactionPanel).some((button) => labelOf(button).includes('保存阈值'))
+      && buttonsOf(compactionPanel).some((button) => labelOf(button).includes('写入 DSH 配置')),
+    `${thresholdInputs.length} input(s), ${buttonsOf(compactionPanel).map(labelOf).join('|')}`)
+  check('无 configEditor 时写入按钮禁用并说明原因',
+    buttonsOf(compactionPanel).find((button) => labelOf(button).includes('写入 DSH 配置')).props.disabled === true
+      && textOf(compactionPanel).includes('配置编辑器'))
+
+  page = clickTab(page, 'notify')
+  const notifyPanel = findAll(page, (node) => node.props?.id === 'dspo-panel-notify')[0]
+  const notifyToggle = findAll(notifyPanel, (node) => node.props?.id === 'dspo-notify')[0]
+  check('通知页签渲染出总开关，且初值来自设置',
+    notifyToggle !== undefined && notifyToggle.props.type === 'checkbox' && notifyToggle.props.checked === true)
+  check('通知页签显示本机派发方式与测试按钮',
+    buttonsOf(notifyPanel).some((button) => labelOf(button).includes('发送测试通知')))
+  bundle.__restore()
 }
 
 /* ───────────────────────── report ───────────────────────── */
