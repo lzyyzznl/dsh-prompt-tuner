@@ -81,9 +81,35 @@ const readText = (path) => readFileSync(path, 'utf8').replace(/^\uFEFF/, '').rep
 const sha = (text) => createHash('sha256').update(text).digest('hex')
 const short = (text) => `${text.length} chars sha ${sha(text).slice(0, 8)}`
 
+// Composed through the plugin's own function rather than reimplemented here, so
+// "what the host will send" cannot drift from what the plugin ships.
+const { composeSystemPrompt } = await import('../lib/prompt.js')
+
+/**
+ * The system string the host says it will send for the arm it just armed.
+ * @param {{value?: object}|null|undefined} envelope - the `/state` envelope.
+ * @param {{lang: string}} arm - the arm being verified.
+ * @returns {string} the composed system prompt.
+ */
+function presentedSystem(envelope, arm) {
+  const value = envelope?.value ?? {}
+  const base = value.settings?.systemPrompt ?? null
+  const lang = value.settings?.outputLang ?? value.outputLang ?? null
+  return composeSystemPrompt(base, lang ?? arm.lang)
+}
+
 /**
  * Resolve one arm into the exact system string the host will send: its prompt
- * file, plus the runtime language line when the arm carries one.
+ * file, plus the runtime language line for the arm's language.
+ *
+ * The language is *pinned*, not merely appended. `composeSystemPrompt` appends
+ * the directive for the language in the settings, so an arm that baked the line
+ * into `systemPrompt` got it twice — and, once a language was stored in the
+ * settings, every arm produced that language no matter what `--lang` said. Two
+ * runs labelled zh and en then measured the same English configuration and
+ * looked like a language comparison. So an arm now saves the bare prompt and
+ * pins `outputLang`, which is exactly the lever a user has; `system` stays the
+ * string that composition must produce, for the report and the parity check.
  */
 function resolveArms(names) {
   return names.map((name) => {
@@ -91,10 +117,11 @@ function resolveArms(names) {
     if (def === undefined) throw new Error(`unknown arm "${name}" (known: ${ARM_DEFS.map((a) => a.name).join(', ')})`)
     const path = join(EVAL_DIR, def.file)
     if (!existsSync(path)) throw new Error(`arm "${name}" is missing its prompt file: ${path}`)
+    const lang = def.lang ?? String(flag('lang', 'zh'))
     const prompt = readText(path)
-    const line = def.lang === null ? null : readText(join(EVAL_DIR, `language-${def.lang}.txt`))
-    const system = line === null ? prompt : `${prompt}\n\n${line}`
-    return { name: def.name, note: def.note, lang: def.lang, promptPath: path, prompt, promptChars: prompt.length, line, system, systemSha: sha(system) }
+    const line = readText(join(EVAL_DIR, `language-${lang}.txt`))
+    const system = `${prompt}\n\n${line}`
+    return { name: def.name, note: def.note, lang, promptPath: path, prompt, promptChars: prompt.length, line, system, systemSha: sha(system) }
   })
 }
 
@@ -202,15 +229,23 @@ async function runLive(arms, set) {
     return
   }
   const original = state.envelope.value?.settings?.systemPrompt ?? null
-  console.log(`host reachable; original systemPrompt: ${original === null ? 'built-in default' : short(original)}\n`)
+  const originalLang = state.envelope.value?.settings?.outputLang ?? state.envelope.value?.outputLang ?? null
+  console.log(`host reachable; original systemPrompt: ${original === null ? 'built-in default' : short(original)}, original outputLang: ${String(originalLang)}\n`)
 
   const results = []
   try {
     for (const arm of arms) {
-      const saved = await call('/save', { systemPrompt: arm.system })
+      // The bare prompt plus a pinned language: the host composes the directive
+      // itself, so the arm measures one composition, not two.
+      const saved = await call('/save', { systemPrompt: arm.prompt, outputLang: arm.lang })
       if (saved.envelope?.ok !== true) {
         console.error(`  ${arm.name}: could not arm the host: ${JSON.stringify(saved.envelope?.error ?? saved.transport)}`)
         continue
+      }
+      const armed = await call('/state', {})
+      const armedSystem = presentedSystem(armed.envelope, arm)
+      if (armedSystem !== arm.system) {
+        console.error(`  ${arm.name}: the host armed a different system than expected (${armedSystem.length} vs ${arm.system.length} chars)`)
       }
       const rows = await mapLimit(set.drafts, concurrency, async (draft) => {
         const { ms, envelope, transport } = await call('/optimize', { text: draft.text, records: [] })
@@ -222,10 +257,12 @@ async function runLive(arms, set) {
       results.push(...rows)
     }
   } finally {
-    const restored = await call('/save', { systemPrompt: original })
+    const restored = await call('/save', { systemPrompt: original, outputLang: originalLang })
     const check = await call('/state', {})
     const now = check.envelope?.value?.settings?.systemPrompt ?? null
-    console.log(`\nrestored systemPrompt: ${restored.envelope?.ok === true && now === original ? 'ok' : 'CHECK THIS — the setting did not come back'}`)
+    const nowLang = check.envelope?.value?.settings?.outputLang ?? check.envelope?.value?.outputLang ?? null
+    const back = restored.envelope?.ok === true && now === original && nowLang === originalLang
+    console.log(`\nrestored systemPrompt/outputLang: ${back ? 'ok' : `CHECK THIS — systemPrompt ${now === original ? 'ok' : 'changed'}, outputLang ${String(nowLang)} vs ${String(originalLang)}`}`)
   }
 
   mkdirSync(outDir, { recursive: true })

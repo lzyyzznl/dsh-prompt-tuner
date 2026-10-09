@@ -26,9 +26,10 @@
  *   node scripts/eval-attribution.mjs                    newest run, offline half
  *   node scripts/eval-attribution.mjs --run scripts/eval/runs/<stamp>-rewrites.json
  *   node scripts/eval-attribution.mjs --judge            add the model half
+ *   node scripts/eval-attribution.mjs --judge --repeat 3 the model half, three times
  *   node scripts/eval-attribution.mjs --judge --limit 2  smoke run
  *
- * Flags: --run F --judge --url U --out D --concurrency N --limit N --arms a,b
+ * Flags: --run F --judge --repeat N --url U --out D --concurrency N --limit N --arms a,b
  *
  * The default base URL comes from DSH_WEB_URL, else http://127.0.0.1:3080.
  * Results land in `scripts/eval/runs/` next to the rewrite runs they read.
@@ -61,6 +62,7 @@ const base = String(flag('url', process.env.DSH_WEB_URL ?? 'http://127.0.0.1:308
 const outDir = String(flag('out', RUNS_DIR))
 const concurrency = num('concurrency', 3)
 const limit = num('limit', 0)
+const repeat = Math.max(1, Math.round(num('repeat', 1)))
 
 const readText = (path) => readFileSync(path, 'utf8').replace(/^\uFEFF/, '').replace(/\r\n/g, '\n')
 const stamp = () => new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
@@ -288,6 +290,19 @@ function attributionPayload(draft, rewrite) {
   ].join('\n\n')
 }
 
+/**
+ * The semantic half, optionally repeated.
+ *
+ * A repeat is not decoration. Two passes over the *same* rewrites once came back
+ * at 0.17 and 0.94 silent additions per rewrite — a 5.5x spread with no change to
+ * the input, driven mostly by how many rows that pass failed to return parseable
+ * items for. A single pass therefore cannot support a point estimate; `--repeat`
+ * makes the spread visible, and the counts it prints per pass are the honest form
+ * of this measurement.
+ * @param {Array<object>} rows - the rewrites to attribute.
+ * @param {Map<string, string>} draftsById - draft text by id.
+ * @returns {Promise<{summary: object[], passes: object[][], detail: object[]}|null>} the audit.
+ */
 async function runJudge(rows, draftsById) {
   const prompt = readText(join(EVAL_DIR, 'attribution-prompt.txt')).trim()
   const state = await call('/state', {})
@@ -296,33 +311,19 @@ async function runJudge(rows, draftsById) {
     process.exitCode = 1
     return null
   }
-  const original = state.envelope.value?.settings?.systemPrompt ?? null
-  const judged = []
-  try {
-    const armed = await call('/save', { systemPrompt: prompt })
-    if (armed.envelope?.ok !== true) throw new Error(`could not arm the auditor: ${JSON.stringify(armed.envelope?.error ?? armed.transport)}`)
-    const verdicts = await mapLimit(rows, concurrency, async (row) => {
-      const draft = draftsById.get(row.draftId) ?? ''
-      const { envelope, transport } = await call('/optimize', { text: attributionPayload(draft, row.text), records: [] })
-      const text = envelope?.ok === true ? String(envelope.value?.text ?? '') : ''
-      const parsed = parseAttribution(text)
-      const counts = Object.fromEntries(KINDS.map((kind) => [kind, parsed.items.filter((item) => item.kind === kind).length]))
-      console.log(`  ${row.arm.padEnd(10)} ${row.draftId.padEnd(9)} ${parsed.items.length} item(s)  silent ${counts.silent}  labeled ${counts.labeled}  dropped ${counts.dropped}${parsed.items.length === 0 ? `  FAILED ${transport ?? envelope?.error?.code ?? 'unparsable'}` : ''}`)
-      return { draftId: row.draftId, arm: row.arm, counts, items: parsed.items, summary: parsed.summary, raw: text, error: parsed.items.length === 0 ? String(transport ?? envelope?.error?.message ?? 'unparsable') : null }
-    })
-    judged.push(...verdicts)
-  } finally {
-    await call('/save', { systemPrompt: original })
-  }
+  const original = state.envelope?.value?.settings?.systemPrompt ?? null
+  const originalLang = state.envelope?.value?.settings?.outputLang ?? state.envelope?.value?.outputLang ?? null
   const arms = [...new Set(rows.map((row) => row.arm))]
-  const summary = arms.map((arm) => {
-    const list = judged.filter((row) => row.arm === arm)
+
+  /** One arm's totals over one pass. */
+  const rollUp = (list) => {
     const total = (kind) => list.reduce((sum, row) => sum + row.counts[kind], 0)
     const items = list.reduce((sum, row) => sum + row.items.length, 0)
     return {
-      arm,
+      arm: list[0]?.arm ?? '?',
       n: list.length,
       items,
+      unparsed: list.filter((row) => row.error !== null).length,
       stated: total('stated'),
       resolved: total('resolved'),
       labeled: total('labeled'),
@@ -333,8 +334,47 @@ async function runJudge(rows, draftsById) {
       rowsWithSilent: list.filter((row) => row.counts.silent > 0).length,
       rowsWithDropped: list.filter((row) => row.counts.dropped > 0).length,
     }
+  }
+
+  const detail = []
+  const passes = []
+  try {
+    const armed = await call('/save', { systemPrompt: prompt })
+    if (armed.envelope?.ok !== true) throw new Error(`could not arm the auditor: ${JSON.stringify(armed.envelope?.error ?? armed.transport)}`)
+    for (let pass = 1; pass <= repeat; pass += 1) {
+      if (repeat > 1) console.log(`\n  ── pass ${pass}/${repeat} ──`)
+      const verdicts = await mapLimit(rows, concurrency, async (row) => {
+        const draft = draftsById.get(row.draftId) ?? ''
+        const { envelope, transport } = await call('/optimize', { text: attributionPayload(draft, row.text), records: [] })
+        const text = envelope?.ok === true ? String(envelope.value?.text ?? '') : ''
+        const parsed = parseAttribution(text)
+        const counts = Object.fromEntries(KINDS.map((kind) => [kind, parsed.items.filter((item) => item.kind === kind).length]))
+        console.log(`  ${row.arm.padEnd(10)} ${row.draftId.padEnd(9)} ${parsed.items.length} item(s)  silent ${counts.silent}  labeled ${counts.labeled}  dropped ${counts.dropped}${parsed.items.length === 0 ? `  FAILED ${transport ?? envelope?.error?.code ?? 'unparsable'}` : ''}`)
+        return { pass, draftId: row.draftId, arm: row.arm, counts, items: parsed.items, summary: parsed.summary, raw: text, error: parsed.items.length === 0 ? String(transport ?? envelope?.error?.message ?? 'unparsable') : null }
+      })
+      detail.push(...verdicts)
+      passes.push(arms.map((arm) => rollUp(verdicts.filter((row) => row.arm === arm))))
+    }
+  } finally {
+    await call('/save', { systemPrompt: original, outputLang: originalLang })
+  }
+
+  // The headline number is the mean over passes, so a single pass reports itself
+  // and a repeated run reports the centre of a spread the caller can also see.
+  const summary = arms.map((arm) => {
+    const perPass = passes.map((pass) => pass.find((row) => row.arm === arm)).filter(Boolean)
+    const avg = (key) => Number((perPass.reduce((sum, row) => sum + (row[key] ?? 0), 0) / Math.max(1, perPass.length)).toFixed(2))
+    const spread = perPass.map((row) => row.silentPerRewrite)
+    return {
+      ...perPass[0],
+      silentPerRewrite: avg('silentPerRewrite'),
+      silentShare: avg('silentShare'),
+      silentPerRewriteMin: Math.min(...spread),
+      silentPerRewriteMax: Math.max(...spread),
+      passes: perPass.length,
+    }
   })
-  return { summary, detail: judged }
+  return { summary, passes, detail }
 }
 
 /* ────────────────────────────── entry ────────────────────────────── */
@@ -365,19 +405,20 @@ console.log(`arms      ${wanted.join(', ')}  (${rows.length} rewrite(s))`)
 
 // The audit only means something about the shipped prompt if the run measured
 // the shipped prompt, so the candidate arm's recorded system hash is recomputed
-// from today's files rather than trusted.
+// from today's files rather than trusted. The language line is the one the arm
+// itself recorded: arms pinned to different languages compose differently.
 const candidatePath = join(EVAL_DIR, 'prompt-candidate.txt')
-const languagePath = join(EVAL_DIR, 'language-zh.txt')
 const shipped = (await import('../lib/prompt.js')).DEFAULT_SYSTEM_PROMPT
 const recorded = run.arms?.find((arm) => arm.name === 'candidate')
 let parity = 'no candidate arm recorded in this run'
 if (existsSync(candidatePath) && recorded !== undefined) {
   const candidate = readText(candidatePath).trim()
+  const languagePath = join(EVAL_DIR, `language-${recorded.lang ?? 'zh'}.txt`)
   const language = existsSync(languagePath) ? readText(languagePath).trim() : ''
   const system = `${candidate}\n\n${language}`
   const nowSha = createHash('sha256').update(system).digest('hex')
   parity = [
-    recorded.sha256 === nowSha ? 'run system == today\'s candidate file' : `run system sha ${String(recorded.sha256).slice(0, 8)} != today's ${nowSha.slice(0, 8)}`,
+    recorded.sha256 === nowSha ? `run system (${recorded.lang ?? '?'}) == today's candidate file` : `run system sha ${String(recorded.sha256).slice(0, 8)} != today's ${nowSha.slice(0, 8)}`,
     candidate === shipped ? 'candidate == shipped DEFAULT_SYSTEM_PROMPT' : `candidate != shipped (${candidate.length} vs ${shipped.length} chars)`,
   ].join('; ')
 }
@@ -432,16 +473,23 @@ if (show !== null) {
 let judged = null
 if (judge) {
   console.log('\n── model half (--judge) ──')
-  console.log(`attribution prompt: scripts/eval/attribution-prompt.txt (${readText(join(EVAL_DIR, 'attribution-prompt.txt')).trim().length} chars)\n`)
+  console.log(`attribution prompt: scripts/eval/attribution-prompt.txt (${readText(join(EVAL_DIR, 'attribution-prompt.txt')).trim().length} chars)${repeat > 1 ? `, repeated ${repeat}x` : ''}\n`)
   judged = await runJudge(rows, draftsById)
   if (judged !== null) {
-    console.log('\narm         n  items  stated  labeled  silent  dropped  silent/rewrite  silent%  rowsWithSilent')
+    console.log('\narm         n  items  unparsed  stated  labeled  silent  dropped  silent/rewrite  silent%  rowsWithSilent')
     for (const row of judged.summary) {
-      console.log(`  ${row.arm.padEnd(10)} ${String(row.n).padStart(2)} ${String(row.items).padStart(6)} ${String(row.stated).padStart(7)} ${String(row.labeled).padStart(8)} ${String(row.silent).padStart(7)} ${String(row.dropped).padStart(8)} ${String(row.silentPerRewrite).padStart(15)} ${String(row.silentShare).padStart(8)} ${String(`${row.rowsWithSilent}/${row.n}`).padStart(16)}`)
+      console.log(`  ${row.arm.padEnd(10)} ${String(row.n).padStart(2)} ${String(row.items).padStart(6)} ${String(row.unparsed).padStart(9)} ${String(row.stated).padStart(7)} ${String(row.labeled).padStart(8)} ${String(row.silent).padStart(7)} ${String(row.dropped).padStart(8)} ${String(row.silentPerRewrite).padStart(15)} ${String(row.silentShare).padStart(8)} ${String(`${row.rowsWithSilent}/${row.n}`).padStart(16)}`)
     }
-    const examples = judged.detail.flatMap((row) => row.items.filter((item) => item.kind === 'silent').map((item) => ({ ...item, arm: row.arm, draftId: row.draftId })))
-    console.log(`\n${examples.length} silent item(s) total; first 12:`)
-    for (const item of examples.slice(0, 12)) console.log(`  ${item.arm.padEnd(10)} ${item.draftId.padEnd(9)} ${item.claim.slice(0, 88)}`)
+    if (repeat > 1) {
+      console.log('\nper pass (this is the honest shape of the number):')
+      for (const row of judged.summary) {
+        const perPass = judged.passes.map((pass) => pass.find((entry) => entry.arm === row.arm)).filter(Boolean)
+        console.log(`  ${row.arm.padEnd(10)} silent/rewrite ${perPass.map((entry) => entry.silentPerRewrite).join(', ')}  (min ${row.silentPerRewriteMin}, max ${row.silentPerRewriteMax})  unparsed ${perPass.map((entry) => entry.unparsed).join(', ')}`)
+      }
+    }
+    const examples = judged.detail.flatMap((row) => row.items.filter((item) => item.kind === 'silent').map((item) => ({ ...item, arm: row.arm, draftId: row.draftId, pass: row.pass })))
+    console.log(`\n${examples.length} silent item(s) across ${repeat} pass(es); first 12:`)
+    for (const item of examples.slice(0, 12)) console.log(`  p${item.pass} ${item.arm.padEnd(10)} ${item.draftId.padEnd(9)} ${item.claim.slice(0, 80)}`)
   }
 }
 
