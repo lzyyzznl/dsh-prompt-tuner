@@ -67,29 +67,31 @@ check('host 声明了 agentDefaultModel（否则「跟随会话模型」静默�
 check('client inject 含 slots', /exports\.inject = \['slots'\]/.test(clientSource))
 check('client 只 require react', [...clientSource.matchAll(/require\((['"])([^'"]+)\1\)/g)].every((m) => m[2] === 'react'))
 check('client 不静态 import @deepseek-ai（避免预发布 peer 冲突）', !/@deepseek-ai/.test(clientSource.replace(/@deepseek-ai\/dsh-client-ui-conversation/g, '')))
-const routerSource = read('lib/router.js')
-const routingSource = read('lib/routing.js')
+const routerSource = read('lib/service/router.js')
+const serviceClientSource = read('lib/service-client.js')
 check('host 源文件均无外部依赖',
-  !/from '@deepseek-ai/.test(hostSource + routeSource + promptSource + storeSource + titleSource + notifySummarySource + routerSource + routingSource))
+  !/from '@deepseek-ai/.test(hostSource + routeSource + promptSource + storeSource + titleSource + notifySummarySource + routerSource + serviceClientSource))
 check('通知摘要模块同样无外部依赖（只借 notify/prompt 的既有契约）',
   !/from '@deepseek-ai/.test(notifySummarySource)
     && /from '\.\/notify\.js'/.test(notifySummarySource)
     && /from '\.\/prompt\.js'/.test(notifySummarySource))
 check('纯逻辑的熔断状态机不 import 任何东西（可在自检里确定性地驱动）',
   (routerSource.match(/^import /gm) ?? []).length === 0)
-// The two hooks that make a failover stick must be the outermost listeners: the
-// agent rewrites the call config from the session's model selection, and
-// dsh-llm-retry vetoes RATE_LIMIT before an inner listener would ever run.
-check('两个 agent 钩子都以 prepend 注册（外层才压得住宿主自己的改写与退避）',
-  (routingSource.match(/ctx\.on\('agent\/(request|request-error)'/g) ?? []).length === 2
-    && (routingSource.match(/\}, \{ prepend: true \}\)/g) ?? []).length === 2,
-  String((routingSource.match(/\}, \{ prepend: true \}\)/g) ?? []).length))
-check('路由只在模型调用层拦截（不碰 HTTP / SDK / 业务层）',
-  routingSource.includes("ctx.on('agent/request-error'")
-    && routingSource.includes("ctx.on('agent/request'")
-    && !/\bfetch\(|axios|node:https?\b/.test(routingSource))
+// The hooks used to make a failover stick from inside the agent loop. They are
+// gone: the service owns the socket now, so there is nothing left to intercept —
+// and a plugin that still answered these would fight the service for the same
+// failures.
+check('熔断不再由插件钩子驱动（已整体搬进服务）',
+  !/ctx\.on\(\s*'agent\//.test(hostSource + routeSource)
+    && !/prepend: true/.test(hostSource + routeSource))
+check('插件侧只留下启动/转达服务的薄客户端',
+  /from '\.\/service\/config\.js'/.test(serviceClientSource)
+    && /fork\(/.test(serviceClientSource)
+    && /ROUTER_SERVICE_READY/.test(serviceClientSource))
 check('熔断状态只在内存里（不写会话、不写盘）',
-  !/writeFileSync|writeSettings/.test(routerSource + routingSource))
+  !/writeFileSync|writeSettings/.test(routerSource))
+check('服务配置的写入集中在 config.js 一处',
+  (read('lib/service/config.js').match(/writeFileSync\(/g) ?? []).length === 1)
 
 const registers = [...clientSource.matchAll(/slots\.register\(\{\s*name:\s*'([^']+)'/g)].map((m) => m[1])
 check('恰好 6 个字面 slots.register（预检按字面读取）', registers.length === 6, registers.join(','))
@@ -1434,8 +1436,7 @@ const {
   normalizeRouterConfig,
   retryWaitMs,
   switchBudget,
-} = await import('../lib/router.js')
-const { createRouting } = await import('../lib/routing.js')
+} = await import('../lib/service/router.js')
 
 section('3c. 路由：熔断状态机')
 
@@ -1613,563 +1614,98 @@ section('3c. 路由：熔断状态机')
   check('未配置 order 时 maxSwitches=0 的预算为 0（不会切换）', switchBudget({ order: [], maxSwitches: 0 }) === 0)
 }
 
-/** One fake host context for the routing half: listeners, logger, and an llm. */
-function makeRoutingCtx(options = {}) {
-  const listeners = new Map()
-  const ctx = {
-    logger: { info() {}, warn() {}, error() {}, debug() {} },
-    llm: options.llm ?? {
-      stream() {
-        return (async function* empty() {})()
-      },
-    },
-    on(name, handler, opts) {
-      const list = listeners.get(name) ?? []
-      // Cordis: `prepend` is an unshift into the same hook list.
-      if (opts?.prepend === true) list.unshift(handler)
-      else list.push(handler)
-      listeners.set(name, list)
-      return () => {
-        const index = list.indexOf(handler)
-        if (index >= 0) list.splice(index, 1)
-      }
-    },
-    get(name) {
-      return name === 'llm' ? ctx.llm : undefined
-    },
-    webServer: {
-      register(route) {
-        ctx.route = route
-        return () => {}
-      },
-    },
-  }
-  ctx.listeners = listeners
-  return ctx
-}
+section('3c. 路由：宿主路由只负责转达')
 
 /**
- * Drive one Cordis waterfall: listeners run outermost-first, and the last
- * argument is the innermost `next`, exactly as `EventsService.waterfall` composes
- * them. A listener that never calls `next()` vetoes everything after it.
+ * A stand-in routing-service client.
+ *
+ * The routes must not care whether the service is running, only report what the
+ * client answered — so the interesting cases here are the two failure shapes: a
+ * service that is down, and one that refuses an action.
  */
-async function driveWaterfall(listeners, payload, inner) {
-  let index = 0
-  const next = async () => {
-    const listener = listeners[index]
-    index += 1
-    if (listener === undefined) return inner()
-    return await listener(payload, next)
+function makeService(view, answers = {}) {
+  const calls = []
+  return {
+    calls,
+    view: async () => view,
+    call: async (path, body) => {
+      calls.push({ path, body })
+      return answers[path] ?? { ok: true, value: { action: path } }
+    },
+    url: () => view?.url ?? null,
+    stop() {},
   }
-  return next()
-}
-
-section('3c. 路由：宿主 wiring')
-
-{
-  const order = [
-    { provider: 'ccx', model: 'deepseek-v4-flash' },
-    { provider: 'deepseek-official', model: 'deepseek-flash' },
-  ]
-  store.writeSettings({ routerEnabled: true, routerOrder: order, routerRetries: 0, routerLogLevel: 'silent' })
-  const ctx = makeRoutingCtx()
-  const routing = createRouting(ctx)
-  const failures = ctx.listeners.get('agent/request-error') ?? []
-  const requests = ctx.listeners.get('agent/request') ?? []
-
-  check('两个失败/请求钩子都注册为 prepend（外层才能压过 dsh-agent 与 dsh-llm-retry）',
-    failures.length === 1 && requests.length === 1,
-    `${failures.length}/${requests.length}`)
-  check('会话事件钩子只注册一次', (ctx.listeners.get('session/event') ?? []).length === 1)
-
-  let delegated = 0
-  let rewritten = null
-  const errorPayload = { provider: 'ccx', turn: 1, step: 1, failure: { code: 'RATE_LIMIT', status: 429, message: '429' } }
-  const errorResult = await driveWaterfall(failures, errorPayload, () => {
-    delegated += 1
-    return undefined
-  })
-  check('任何失败都由路由当场接管（返回 retry，不再等下一位监听者的退避）',
-    errorResult?.kind === 'retry' && delegated === 0, JSON.stringify(errorResult))
-  check('熔断状态记在失败的那个 provider 上', routing.view().rows[0].state === OPEN)
-
-  const seed = { provider: 'ccx', model: 'deepseek-v4-flash', reasoningEffort: 'high', temperature: 0.3 }
-  rewritten = await driveWaterfall(requests, { turn: 1, step: 1 }, () => seed)
-  check('重跑的请求被改写到下一个候选', rewritten?.provider === 'deepseek-official' && rewritten?.model === 'deepseek-flash',
-    JSON.stringify(rewritten))
-  check('切换时丢掉目标行没声明的思考强度（否则会在供应商 I/O 之前被拒）',
-    rewritten !== null && !('reasoningEffort' in rewritten) && rewritten.temperature === 0.3)
-  check('切换被记进最近事件，可在设置页核对', routing.recent().some((event) => event.kind === 'switch'
-    && event.provider === 'ccx' && event.to === 'deepseek-official/deepseek-flash'))
-  check('累计统计只数真实发生的切换', routing.stats().switches >= 1 && routing.stats().failures === 1)
-
-  // A row that declares an effort keeps it: `max` is what the ccx route accepts.
-  store.writeSettings({
-    routerRetries: 0,
-    routerOrder: [
-      { provider: 'a', model: 'a1' },
-      { provider: 'b', model: 'b1', reasoningEffort: 'max' },
-    ],
-  })
-  const declaredCtx = makeRoutingCtx()
-  const declared = createRouting(declaredCtx)
-  await driveWaterfall(declaredCtx.listeners.get('agent/request-error') ?? [], { provider: 'a', turn: 1, step: 1, failure: { code: 'RATE_LIMIT' } }, () => undefined)
-  const declaredRewrite = await driveWaterfall(declaredCtx.listeners.get('agent/request') ?? [], {}, () => ({ provider: 'a', model: 'a1', reasoningEffort: 'high', temperature: 0.3 }))
-  check('行里声明了强度就带着它切换', declaredRewrite?.provider === 'b' && declaredRewrite?.reasoningEffort === 'max',
-    JSON.stringify(declaredRewrite))
-  check('带强度的行也能往返存储', declared.describe().order[1].reasoningEffort === 'max')
-
-  // A healthy requested provider is left alone.
-  const freshCtx = makeRoutingCtx()
-  const fresh = createRouting(freshCtx)
-  const freshSeed = { provider: 'ccx', model: 'deepseek-v4-flash', effort: 1 }
-  const untouched = await driveWaterfall(freshCtx.listeners.get('agent/request') ?? [], {}, () => freshSeed)
-  check('可用时不动请求（保留会话自己选的模型）', untouched === freshSeed && untouched.provider === 'ccx')
 }
 
 {
-  // Retries before the failover: any failure is retried in place `retries`
-  // times, and only the attempt after those opens the breaker and switches.
-  store.writeSettings({
-    routerOrder: [{ provider: 'a', model: 'a1' }, { provider: 'b', model: 'b1' }],
-    routerRetries: 3,
-    routerLogLevel: 'silent',
-  })
-  const waits = []
-  const ctx = makeRoutingCtx()
-  const routing = createRouting(ctx, { sleep: async (ms) => { waits.push(ms) } })
-  const failures = ctx.listeners.get('agent/request-error') ?? []
-  const payload = { provider: 'a', turn: 7, step: 1, failure: { code: 'SERVER', status: 503 } }
-  const outcomes = []
-  for (let i = 0; i < 3; i += 1) outcomes.push(await driveWaterfall(failures, payload, () => 'delegated'))
-  check('前 3 次失败都留在同一条路由上（不发切换）',
-    outcomes.every((result) => result?.kind === 'retry'), JSON.stringify(outcomes))
-  check('重试期间不算熔断、不切换，等待按 0.5s 翻倍',
-    routing.view().rows[0].state === CLOSED && routing.stats().switches === 0 && routing.stats().retries === 3
-      && waits[0] === 500 && waits[1] === 1_000 && waits[2] === 2_000, JSON.stringify(waits))
-  outcomes.push(await driveWaterfall(failures, payload, () => 'delegated'))
-  check('第 4 次失败（重试用尽）才熔断并切换',
-    outcomes[3]?.kind === 'retry' && routing.view().rows[0].state === OPEN
-      && routing.stats().switches === 1 && routing.stats().failures === 1, JSON.stringify(outcomes[3]))
-  check('重试被记进最近事件，能在设置页看到',
-    routing.recent().filter((event) => event.kind === 'retry').length === 3
-      && routing.recent().some((event) => event.kind === 'retry' && event.attempt === 2 && event.waitMs === 1_000))
-
-  // A fresh step starts with a fresh retry budget.
-  const otherStep = await driveWaterfall(failures, { ...payload, step: 2 }, () => 'delegated')
-  check('换一个步骤重试预算重新计算', otherStep?.kind === 'retry' && routing.stats().retries === 4)
-
-  // The caller withdrawing is not a provider failure.
-  const abortedCtx = makeRoutingCtx()
-  const aborted = createRouting(abortedCtx, { sleep: async () => {} })
-  const abortedFailures = abortedCtx.listeners.get('agent/request-error') ?? []
-  const abortedResult = await driveWaterfall(
-    abortedFailures,
-    { ...payload, signal: { aborted: true } },
-    () => 'delegated',
-  )
-  check('用户中断（signal 已 abort）不算失败', abortedResult === 'delegated' && aborted.stats().failures === 0)
-  const abortedCode = await driveWaterfall(abortedFailures, { ...payload, failure: { code: 'ABORTED' } }, () => 'delegated')
-  check('ABORTED 错误码同样交回宿主', abortedCode === 'delegated' && aborted.stats().failures === 0)
-  const noFailure = await driveWaterfall(abortedFailures, { provider: 'a', turn: 1, step: 1 }, () => 'delegated')
-  check('没有失败对象时不动任何状态', noFailure === 'delegated' && aborted.stats().retries === 0)
-
-  // A provider that asks for a long wait is not retried at all: failover wins.
-  const longWaits = []
-  const longCtx = makeRoutingCtx()
-  const longRouting = createRouting(longCtx, { sleep: async (ms) => { longWaits.push(ms) } })
-  const longFailures = longCtx.listeners.get('agent/request-error') ?? []
-  const longResult = await driveWaterfall(
-    longFailures,
-    { provider: 'a', turn: 9, step: 1, failure: { code: 'RATE_LIMIT', status: 429, providerRetryAfterMs: 60_000 } },
-    () => 'delegated',
-  )
-  check('retry-after 超过 5 秒时不重试、直接切换',
-    longResult?.kind === 'retry' && longWaits.length === 0 && longRouting.stats().switches === 1
-      && longRouting.stats().retries === 0, JSON.stringify({ longWaits, stats: longRouting.stats() }))
-}
-
-{
-  // The per-step switch budget: a fully degraded pool must not loop forever.
-  store.writeSettings({
-    routerOrder: [{ provider: 'a', model: 'a1' }, { provider: 'b', model: 'b1' }, { provider: 'c', model: 'c1' }],
-    routerRetries: 0,
-    routerMaxSwitches: 1,
-    routerLogLevel: 'silent',
-  })
-  const ctx = makeRoutingCtx()
-  const routing = createRouting(ctx)
-  const failures = ctx.listeners.get('agent/request-error') ?? []
-  const payload = { provider: 'a', turn: 4, step: 2, failure: { code: 'RATE_LIMIT' } }
-  const first = await driveWaterfall(failures, payload, () => 'delegated')
-  const second = await driveWaterfall(failures, payload, () => 'delegated')
-  check('预算内的第一次失败由路由接管', first?.kind === 'retry', JSON.stringify(first))
-  check('同一 turn/step 的第二次失败交回宿主（预算 1 已用尽）', second === 'delegated', JSON.stringify(second))
-  const otherStep = await driveWaterfall(failures, { ...payload, step: 3 }, () => 'delegated')
-  check('换一个 step 预算重新计算', otherStep?.kind === 'retry', JSON.stringify(otherStep))
-  check('预算用尽被记进最近事件', routing.recent().some((event) => event.kind === 'exhausted'))
-}
-
-{
-  // Recovery: the clock opens a probe, a committed assistant message closes it.
-  store.writeSettings({ routerOrder: [{ provider: 'a', model: 'a1' }], routerRetries: 0, routerCooldownMs: 1_000, routerLogLevel: 'silent' })
-  let now = 0
-  const ctx = makeRoutingCtx()
-  const routing = createRouting(ctx, { now: () => now })
-  const failures = ctx.listeners.get('agent/request-error') ?? []
-  const events = ctx.listeners.get('session/event') ?? []
-  await driveWaterfall(failures, { provider: 'a', turn: 1, step: 1, failure: { code: 'RATE_LIMIT' } }, () => undefined)
-  check('失败后处于 open', routing.router.stateOf('a', now) === OPEN)
-  now += 1_000
-  check('冷却到期进入 half-open', routing.router.stateOf('a', now) === HALF_OPEN)
-  const committed = { type: 'assistant/message', data: { message: { source: { provider: 'a', model: 'a1' } } } }
-  await events[0](null, committed)
-  check('会话事件里的 assistant 消息证明这条路可用 → 关闭熔断', routing.router.stateOf('a', now) === CLOSED)
-
-  // The event listener must read the provider off the committed message.
-  const closeCtx = makeRoutingCtx()
-  let closeNow = 0
-  const closeRouting = createRouting(closeCtx, { now: () => closeNow })
-  const closeFailures = closeCtx.listeners.get('agent/request-error') ?? []
-  await driveWaterfall(closeFailures, { provider: 'a', turn: 1, step: 1, failure: { code: 'RATE_LIMIT' } }, () => undefined)
-  closeNow += 2_000
-  const event = { type: 'assistant/message', data: { message: { source: { provider: 'a', model: 'a1' } } } }
-  await (closeCtx.listeners.get('session/event') ?? [])[0](null, event)
-  check('只有已提交的 assistant 消息才算证据', closeRouting.router.stateOf('a', closeNow) === CLOSED)
-  const unrelated = { type: 'user/message', data: { message: { source: { provider: 'a' } } } }
-  const otherCtx = makeRoutingCtx()
-  const otherRouting = createRouting(otherCtx, { now: () => closeNow })
-  const otherFailures = otherCtx.listeners.get('agent/request-error') ?? []
-  await driveWaterfall(otherFailures, { provider: 'a', turn: 1, step: 1, failure: { code: 'RATE_LIMIT' } }, () => undefined)
-  await (otherCtx.listeners.get('session/event') ?? [])[0](null, unrelated)
-  check('别的会话事件不带 source 时不误判成功', otherRouting.router.stateOf('a', closeNow) === OPEN)
-}
-
-{
-  // The switch itself: prove the rewritten request is what the loop would send,
-  // and that a disabled router touches nothing at all.
-  store.writeSettings({ routerEnabled: false, routerRetries: 0, routerOrder: [{ provider: 'a', model: 'a1' }, { provider: 'b', model: 'b1' }], routerLogLevel: 'silent' })
-  const ctx = makeRoutingCtx()
-  const routing = createRouting(ctx)
-  const failures = ctx.listeners.get('agent/request-error') ?? []
-  const requests = ctx.listeners.get('agent/request') ?? []
-  const delegated = await driveWaterfall(failures, { provider: 'a', turn: 1, step: 1, failure: { code: 'RATE_LIMIT' } }, () => 'delegated')
-  check('关掉总开关后失败交回宿主（不记熔断、不改路由）', delegated === 'delegated' && routing.stats().failures === 0)
-  const seed = { provider: 'b', model: 'b1' }
-  const passed = await driveWaterfall(requests, {}, () => seed)
-  check('关掉总开关后请求原样通过', passed === seed)
-  check('关掉总开关后仍然能看到配置本身', routing.describe().enabled === false && routing.describe().order.length === 2)
-
-  // Empty order: failures are tracked, nothing is switched to.
-  store.writeSettings({ routerEnabled: true, routerOrder: [], routerRetries: 0, routerLogLevel: 'silent' })
-  const emptyCtx = makeRoutingCtx()
-  const empty = createRouting(emptyCtx)
-  const emptyDelegated = await driveWaterfall(emptyCtx.listeners.get('agent/request-error') ?? [], { provider: 'a', turn: 1, step: 1, failure: { code: 'RATE_LIMIT' } }, () => 'delegated')
-  check('顺序表为空时只记录、不切换', emptyDelegated === 'delegated' && empty.recent().some((event) => event.kind === 'no-alternative'))
-  check('顺序表为空时 switchable 为 false', empty.view().switchable === false)
-}
-
-{
-  // The manual probe is a real call: it reports failure and is counted.
-  const probeCalls = []
-  const okLlm = {
-    stream(options) {
-      probeCalls.push(options)
-      return (async function* ok() {
-        yield { type: 'text-delta', text: 'pong' }
-        yield { type: 'finish', reason: { kind: 'stop' } }
-      })()
-    },
+  const live = {
+    available: true,
+    url: 'http://127.0.0.1:8790',
+    configFile: '/tmp/router-service.json',
+    error: null,
+    live: { rows: [{ provider: 'a', model: 'a1', state: 'closed' }], recent: [], stats: { requests: 0 } },
   }
-  store.writeSettings({ routerOrder: [{ provider: 'a', model: 'a1' }], routerRetries: 0, routerLogLevel: 'silent' })
-  const okCtx = makeRoutingCtx({ llm: okLlm })
-  const okRouting = createRouting(okCtx)
-  const okProbe = await okRouting.probe('a', 'a1')
-  check('探测成功返回 ok 与耗时', okProbe.ok === true && okProbe.text === 'pong' && Number.isFinite(okProbe.ms))
-  // The regression that made a working route report as broken: a thinking model
-  // spends its whole budget on reasoning and answers with no visible text.
-  check('探测给的输出预算足够思考模型答完（不再是 8）',
-    typeof probeCalls[0]?.maxTokens === 'number' && probeCalls[0].maxTokens >= 256,
-    String(probeCalls[0]?.maxTokens))
-  check('探测要求关闭思考（一句话不值得花推理 token）',
-    probeCalls[0]?.reasoningEffort === 'off', String(probeCalls[0]?.reasoningEffort))
-  // The escape hatch the probe route uses for a route that cannot turn thinking
-  // off: hand it `null` and the field is omitted entirely.
-  const bareCalls = []
-  const bareCtx = makeRoutingCtx({
-    llm: {
-      stream(options) {
-        bareCalls.push(options)
-        return (async function* () {
-          yield { type: 'text-delta', text: 'pong' }
-          yield { type: 'finish', reason: { kind: 'stop' } }
-        })()
-      },
-    },
-  })
-  const bareProbe = await createRouting(bareCtx).probe('a', 'a1', null)
-  check('显式传 null 时不带 reasoningEffort（给不支持 off 的路由留出口）',
-    !('reasoningEffort' in bareCalls[0]) && bareProbe.effort === null, JSON.stringify(bareProbe))
-
-  const reasoningLlm = {
-    stream() {
-      return (async function* thinking() {
-        yield { type: 'reasoning-delta', text: 'We need answer ping.' }
-        yield { type: 'reasoning-delta', text: ' Reply briefly.' }
-        yield { type: 'finish', reason: { kind: 'max-tokens' } }
-      })()
-    },
-  }
-  const reasoningCtx = makeRoutingCtx({ llm: reasoningLlm })
-  const reasoningRouting = createRouting(reasoningCtx)
-  const reasoningProbe = await reasoningRouting.probe('a', 'a1')
-  check('只有推理输出、没有正文不算不通（这正是 deepseek-flash 的情形）',
-    reasoningProbe.ok === true && reasoningProbe.code === 'no-text' && reasoningProbe.reasoning === 35,
-    JSON.stringify(reasoningProbe))
-  check('只有推理输出时不熔断（这条路是通的）',
-    reasoningRouting.view().rows[0].state === CLOSED && reasoningRouting.view().stats.probeOk === 1)
-  check('推理无正文在最近事件里单列一种结果',
-    reasoningRouting.recent()[0].outcome === 'no-text' && reasoningRouting.recent()[0].failure === null)
-
-  const nothingLlm = {
-    stream() {
-      return (async function* nothing() {
-        yield { type: 'finish', reason: { kind: 'stop' } }
-      })()
-    },
-  }
-  const nothingCtx = makeRoutingCtx({ llm: nothingLlm })
-  const nothingRouting = createRouting(nothingCtx)
-  const nothingProbe = await nothingRouting.probe('a', 'a1')
-  check('完全空的回答仍然判定为不通', nothingProbe.ok === false && nothingProbe.code === 'empty-answer')
-  check('完全空判不通时按熔断规则计入', nothingRouting.view().rows[0].state === OPEN
-    && nothingRouting.view().stats.failures === 1 &&
-    nothingRouting.recent()[0].outcome === 'empty')
-
-  const badLlm = {
-    stream() {
-      return (async function* bad() {
-        yield { type: 'finish', reason: { kind: 'error', failure: { code: 'RATE_LIMIT', status: 429, message: 'rate limited' } } }
-      })()
-    },
-  }
-  const badCtx = makeRoutingCtx({ llm: badLlm })
-  const badRouting = createRouting(badCtx)
-  const badProbe = await badRouting.probe('a', 'a1')
-  check('探测失败如实报错', badProbe.ok === false && badProbe.code === 'RATE_LIMIT' && badProbe.message === 'rate limited')
-  check('探测失败按熔断规则计入（这条路确实被限流了）', badRouting.view().rows[0].state === OPEN)
-  const thrownLlm = {
-    stream() {
-      return (async function* boom() {
-        const error = new Error('adapter exploded')
-        error.code = 'TRANSPORT'
-        throw error
-      })()
-    },
-  }
-  const thrownCtx = makeRoutingCtx({ llm: thrownLlm })
-  const thrownRouting = createRouting(thrownCtx)
-  const thrownProbe = await thrownRouting.probe('a', 'a1')
-  check('探测抛出带 code 的异常时保留该 code', thrownProbe.ok === false && thrownProbe.code === 'TRANSPORT')
-  const boomCtx = makeRoutingCtx({ llm: { stream() { throw new Error('adapter exploded') } } })
-  const boomRouting = createRouting(boomCtx)
-  check('探测抛异常也被收住，不把设置页打崩', (await boomRouting.probe('a', 'a1')).ok === false)
-
-  // The case this was written for, seen live on `maas-dsv4`: an adapter that
-  // advertises no efforts at all and rejects the explicit knob before any I/O.
-  // The rejection is a statement about the request, not about the route, so the
-  // probe asks again with the field omitted instead of reporting a working route
-  // as unreachable.
-  const noisyCalls = []
-  const noisyRouting = createRouting(makeRoutingCtx({
-    llm: {
-      stream(options) {
-        noisyCalls.push(options)
-        if (options.reasoningEffort !== undefined) {
-          return (async function* rejected() {
-            const error = new Error('provider "a" model "a1" does not support reasoning effort "off"')
-            error.code = 'UNSUPPORTED_REASONING_EFFORT'
-            throw error
-          })()
-        }
-        return (async function* fine() {
-          yield { type: 'text-delta', text: 'pong' }
-          yield { type: 'finish', reason: { kind: 'stop' } }
-        })()
-      },
-    },
-  }))
-  const noisyProbe = await noisyRouting.probe('a', 'a1')
-  check('适配器拒绝显式强度时自动去掉该字段重试一次',
-    noisyCalls.length === 2 && noisyCalls[0].reasoningEffort === 'off' && !('reasoningEffort' in noisyCalls[1]),
-    JSON.stringify(noisyCalls.map((call) => call.reasoningEffort)))
-  check('去掉字段后成功即算连通，并标出这次探测降级了',
-    noisyProbe.ok === true && noisyProbe.effort === null && noisyProbe.effortOmitted === true, JSON.stringify(noisyProbe))
-  check('被适配器拒绝的那次不记成供应商故障',
-    noisyRouting.view().rows[0].state === CLOSED && noisyRouting.view().stats.failures === 0
-      && noisyRouting.view().stats.probeOk === 1)
-
-  const stillBadRouting = createRouting(makeRoutingCtx({
-    llm: {
-      stream(options) {
-        return (async function* bad() {
-          if (options.reasoningEffort !== undefined) {
-            const error = new Error('provider "a" model "a1" does not support reasoning effort "off"')
-            error.code = 'UNSUPPORTED_REASONING_EFFORT'
-            throw error
-          }
-          yield { type: 'finish', reason: { kind: 'error', failure: { code: 'SERVER', status: 503, message: 'down' } } }
-        })()
-      },
-    },
-  }))
-  const stillBadProbe = await stillBadRouting.probe('a', 'a1')
-  check('降级重试也失败时按重试后的那次记账',
-    stillBadProbe.code === 'SERVER' && stillBadRouting.view().rows[0].state === OPEN,
-    JSON.stringify(stillBadProbe))
-}
-
-{
-  // reset() and the disposal path.
-  store.writeSettings({ routerOrder: [{ provider: 'a', model: 'a1' }], routerRetries: 0, routerLogLevel: 'silent' })
-  const ctx = makeRoutingCtx()
-  const routing = createRouting(ctx)
-  await driveWaterfall(ctx.listeners.get('agent/request-error') ?? [], { provider: 'a', turn: 1, step: 1, failure: { code: 'RATE_LIMIT' } }, () => undefined)
-  const cleared = routing.reset()
-  check('清空熔断状态后回到 closed、计数归零', cleared.rows[0].state === CLOSED
-    && cleared.stats.failures === 0 && cleared.recent.length === 0)
-  routing.dispose()
-  check('dispose 摘掉三个钩子', (ctx.listeners.get('agent/request-error') ?? []).length === 0
-    && (ctx.listeners.get('agent/request') ?? []).length === 0
-    && (ctx.listeners.get('session/event') ?? []).length === 0)
-  routing.dispose()
-  check('dispose 可以重复调用', true)
-}
-
-section('3c. 路由：宿主路由')
-
-{
-  store.writeSettings({ routerEnabled: true, routerRetries: 0, routerOrder: [{ provider: 'a', model: 'a1' }, { provider: 'b', model: 'b1' }], routerLogLevel: 'silent' })
-  const ctx = makeRoutingCtx()
-  const routing = createRouting(ctx)
-  registerRoutes(ctx, routing)
+  const service = makeService(live)
+  const ctx = makeCtx([[]])
+  registerRoutes(ctx, service)
 
   const state = (await call(ctx, '/state', {})).json
-  check('/state 带上路由配置与实时状态', state?.value?.router?.config?.order?.length === 2
-    && Array.isArray(state.value.router.live.rows), JSON.stringify(state?.value?.router?.config))
-  check('/state 带上 /save 会执行的边界与可选值',
-    state.value.router.limits.orderRows === ROUTER_LIMITS.orderRows
-      && JSON.stringify(state.value.router.recoveryModes) === JSON.stringify(['probe', 'immediate'])
-      && state.value.router.states.halfOpen === HALF_OPEN)
+  check('/state 直接转达服务的实时视图',
+    state?.value?.router?.available === true
+      && state.value.router.url === 'http://127.0.0.1:8790'
+      && Array.isArray(state.value.router.live.rows), JSON.stringify(state?.value?.router))
+  check('/state 不再自己发明路由边界与状态名',
+    state.value.router.limits === undefined && state.value.router.states === undefined
+      && state.value.router.config === undefined)
 
-  const saved = (await call(ctx, '/save', { routerOrder: [{ provider: 'b', model: 'b1' }], routerCooldownMs: 5_000, routerRecoveryMode: 'immediate', routerMaxSwitches: 2 })).json
-  check('/save 写入路由设置并回传新状态', saved?.ok === true && saved.value.settings.routerCooldownMs === 5_000)
-  check('保存后运行中的路由立刻用上新配置', routing.describe().cooldownMs === 5_000
-    && routing.describe().recoveryMode === 'immediate' && routing.describe().order.length === 1)
+  const installed = makeCtx([[]])
+  registerRoutes(installed)
+  const bare = (await call(installed, '/state', {})).json
+  check('没有服务客户端时 /state 说明未挂载而不是编一个状态',
+    bare?.value?.router?.available === false && typeof bare.value.router.error === 'string')
 
-  check('/save 拒绝非对象的顺序表', (await call(ctx, '/save', { routerOrder: 'a' })).json?.error?.code === 'bad-request')
-  check('/save 拒绝缺 provider 的行', (await call(ctx, '/save', { routerOrder: [{ model: 'a1' }] })).json?.error?.code === 'bad-request')
-  check('/save 拒绝空 provider', (await call(ctx, '/save', { routerOrder: [{ provider: '  ', model: 'a1' }] })).json?.error?.code === 'bad-request')
-  check('/save 拒绝超过行数上限的顺序表',
-    (await call(ctx, '/save', { routerOrder: Array.from({ length: ROUTER_LIMITS.orderRows + 1 }, (_, i) => ({ provider: `p${i}`, model: 'm' })) })).json?.error?.code === 'bad-request')
-  check('/save 接受空顺序表（装着但无处可切）', (await call(ctx, '/save', { routerOrder: [] })).json?.ok === true)
-  await call(ctx, '/save', { routerOrder: [{ provider: 'a', model: 'a1' }] })
-  const retried = (await call(ctx, '/save', { routerRetries: 2, routerCooldownFactor: 3, routerCooldownMaxMs: 600_000 })).json
-  check('/save 写入重试次数、递增倍数与上限',
-    retried?.ok === true && retried.value.settings.routerRetries === 2
-      && retried.value.settings.routerCooldownFactor === 3
-      && retried.value.settings.routerCooldownMaxMs === 600_000, JSON.stringify(retried?.error))
-  check('重试次数接受 0（失败即切换）', (await call(ctx, '/save', { routerRetries: 0 })).json?.value?.settings?.routerRetries === 0)
-  check('/save 拒绝越界的重试次数', (await call(ctx, '/save', { routerRetries: ROUTER_LIMITS.maxRetries + 1 })).json?.error?.code === 'bad-request')
-  check('/save 拒绝负数重试次数', (await call(ctx, '/save', { routerRetries: -1 })).json?.error?.code === 'bad-request')
-  check('/save 拒绝越界的递增倍数', (await call(ctx, '/save', { routerCooldownFactor: ROUTER_LIMITS.maxCooldownFactor + 1 })).json?.error?.code === 'bad-request')
-  check('/save 拒绝越界的熔断上限', (await call(ctx, '/save', { routerCooldownMaxMs: ROUTER_LIMITS.maxCooldownMs + 1 })).json?.error?.code === 'bad-request')
-  check('退役的错误码/状态码字段不再被受理', (await call(ctx, '/save', { routerCodes: ['RATE_LIMIT'] })).json?.value?.settings?.routerCodes === undefined
-    && (await call(ctx, '/save', { routerStatuses: [429] })).json?.value?.settings?.routerStatuses === undefined)
-  check('/save 拒绝越界的阈值', (await call(ctx, '/save', { routerFailureThreshold: 0 })).json?.error?.code === 'bad-request')
-  check('/save 拒绝越界的熔断时长', (await call(ctx, '/save', { routerCooldownMs: ROUTER_LIMITS.maxCooldownMs + 1 })).json?.error?.code === 'bad-request')
-  check('/save 拒绝非整数窗口', (await call(ctx, '/save', { routerWindowMs: 1.5 })).json?.error?.code === 'bad-request')
-  check('/save 拒绝未知恢复方式', (await call(ctx, '/save', { routerRecoveryMode: 'magic' })).json?.error?.code === 'bad-request')
-  check('/save 拒绝未知日志级别', (await call(ctx, '/save', { routerLogLevel: 'loud' })).json?.error?.code === 'bad-request')
-  check('/save 拒绝非布尔的总开关', (await call(ctx, '/save', { routerEnabled: 'yes' })).json?.error?.code === 'bad-request')
+  const polled = (await call(ctx, '/router.state', {})).json
+  check('/router.state 转达服务视图', polled?.ok === true && polled.value.available === true
+    && polled.value.live.rows.length === 1)
+  check('/router.state 不再回缺失适配器列表（那是服务的概念）', polled.value.missingProviders === undefined)
 
-  const live = (await call(ctx, '/router.state', {})).json
-  check('/router.state 回配置 + 实时行 + 缺失适配器列表',
-    live?.ok === true && Array.isArray(live.value.live.rows) && Array.isArray(live.value.missingProviders))
-  const under = makeCtx([[]])
-  registerRoutes(under)
-  check('没有路由运行时时 /router.state 明说 unavailable',
-    (await call(under, '/router.state', {})).json?.error?.code === 'unavailable')
-  check('没有路由运行时时 /router.reset 同样明说',
-    (await call(under, '/router.reset', {})).json?.error?.code === 'unavailable')
-  check('没有路由运行时时 /router.probe 同样明说',
-    (await call(under, '/router.probe', { provider: 'a', model: 'a1' })).json?.error?.code === 'unavailable')
-
-  check('/router.probe 只接受顺序表里的行',
-    (await call(ctx, '/router.probe', { provider: 'zz', model: 'nope' })).json?.error?.code === 'bad-request')
-}
-
-{
-  // The probe route against a scripted adapter, through the real HTTP handler.
-  store.writeSettings({ routerOrder: [{ provider: 'a', model: 'a1' }], routerRetries: 0, routerLogLevel: 'silent' })
-  const sent = []
-  const ctx = makeRoutingCtx({
-    llm: {
-      // No reasoning metadata: the adapter does not answer, so nothing is known
-      // about what this route accepts and `off` is sent as asked.
-      resolveModelInfo: async () => ({ reasoning: { efforts: [] } }),
-      stream(options) {
-        sent.push(options)
-        return (async function* ok() {
-          yield { type: 'text-delta', text: 'pong' }
-          yield { type: 'finish', reason: { kind: 'stop' } }
-        })()
-      },
-    },
-  })
-  const routing = createRouting(ctx)
-  registerRoutes(ctx, routing)
-  const probed = (await call(ctx, '/router.probe', { provider: 'a', model: 'a1' })).json
-  check('/router.probe 回目标、结果与刷新后的实时状态',
-    probed?.value?.target?.provider === 'a' && probed.value.outcome.ok === true
-      && Array.isArray(probed.value.live.rows))
-  check('宿主路由把「关闭思考」传进真实调用', sent[0]?.reasoningEffort === 'off', JSON.stringify(sent[0]))
-  check('确认该路由支持 off 时不标记降级',
-    probed.value.outcome.effort === 'off' && probed.value.outcome.effortDegraded === false)
   const reset = (await call(ctx, '/router.reset', {})).json
-  check('/router.reset 回清空后的实时状态', reset?.ok === true && reset.value.live.stats.failures === 0)
-}
+  check('/router.reset 转发成一次 POST（服务端只收 POST）', reset?.ok === true
+    && service.calls.at(-1)?.path === 'reset'
+    && JSON.stringify(service.calls.at(-1)?.body) === '{}')
 
-{
-  // A route that only offers thinking (like `ccx`, which declares `max` alone):
-  // `off` would be rejected before any I/O, so the probe degrades to a level the
-  // route accepts and says so.
-  store.writeSettings({ routerOrder: [{ provider: 'r', model: 'r1' }], routerRetries: 0, routerLogLevel: 'silent' })
-  const sent = []
-  const ctx = makeRoutingCtx({
-    llm: {
-      resolveModelInfo: async () => ({ reasoning: { efforts: [{ id: 'max' }], defaultEffort: 'max' } }),
-      stream(options) {
-        sent.push(options)
-        return (async function* ok() {
-          yield { type: 'reasoning-delta', text: 'thinking' }
-          yield { type: 'finish', reason: { kind: 'stop' } }
-        })()
-      },
-    },
-  })
-  const routing = createRouting(ctx)
-  registerRoutes(ctx, routing)
-  const probed = (await call(ctx, '/router.probe', { provider: 'r', model: 'r1' })).json
-  check('不支持关闭思考的路由退用它能接受的档位',
-    sent[0]?.reasoningEffort === 'max', JSON.stringify(sent[0]))
-  check('降级写在结果里，页面才能如实说明',
-    probed.value.outcome.effort === 'max' && probed.value.outcome.effortDegraded === true,
-    JSON.stringify(probed.value.outcome))
-  check('关不掉思考的路由只输出推理时仍算连通（预算足够）',
-    probed.value.outcome.ok === true && probed.value.outcome.code === 'no-text')
-}
+  const probed = (await call(ctx, '/router.probe', { provider: 'a', model: 'a1' })).json
+  check('/router.probe 转发 provider 与 model', probed?.ok === true
+    && service.calls.at(-1)?.path === 'probe'
+    && service.calls.at(-1)?.body?.provider === 'a' && service.calls.at(-1)?.body?.model === 'a1')
+  check('/router.probe 仍拒绝空的 provider/model',
+    (await call(ctx, '/router.probe', { provider: '  ', model: 'a1' })).json?.error?.code === 'bad-request'
+      && (await call(ctx, '/router.probe', { provider: 'a' })).json?.error?.code === 'bad-request')
 
+  const refused = { ok: false, error: { code: 'service', message: 'connect ECONNREFUSED' } }
+  const down = makeService({ available: false, url: 'http://127.0.0.1:8790', configFile: null, error: 'connect ECONNREFUSED', live: null }, { reset: refused, probe: refused })
+  const downCtx = makeCtx([[]])
+  registerRoutes(downCtx, down)
+  check('服务不可达时 /router.state 如实说原因',
+    (await call(downCtx, '/router.state', {})).json?.value?.error === 'connect ECONNREFUSED')
+  check('服务不可达时两个动作都回 unavailable，而不是抛错或假装成功',
+    (await call(downCtx, '/router.reset', {})).json?.error?.code === 'unavailable'
+      && (await call(downCtx, '/router.probe', { provider: 'a', model: 'a1' })).json?.error?.code === 'unavailable')
+
+  const refusing = makeService(live, { reset: { ok: false, error: { code: 'service', message: 'breaker state is locked' } } })
+  const refusingCtx = makeCtx([[]])
+  registerRoutes(refusingCtx, refusing)
+  check('服务拒绝动作时原样转达它的说法',
+    (await call(refusingCtx, '/router.reset', {})).json?.error?.message === 'breaker state is locked')
+
+  // `/save` must not accept a second writer for the service's configuration.
+  const saved = (await call(ctx, '/save', { routerOrder: [{ provider: 'b', model: 'b1' }], routerCooldownMs: 5_000 })).json
+  check('/save 不再受理路由字段（配置只有一个写入方）',
+    saved?.ok === true && saved.value.settings.routerOrder === undefined
+      && saved.value.settings.routerCooldownMs === undefined, JSON.stringify(saved?.value?.settings))
+  check('退役的路由字段被丢弃而不是报错（旧页面不会因此报故障）',
+    (await call(ctx, '/save', { routerEnabled: true, routerLogLevel: 'debug' })).json?.ok === true)
+}
 
 section('3b. 压缩阈值与桌面通知')
 
@@ -3128,64 +2664,94 @@ const STATE = {
         defaultChars: title.DEFAULT_TITLE_MAX_CHARS,
       },
     },
+    // What `/state` still reports about routing: the service's address, whether
+    // it answered, and the answer itself. The plugin owns none of it.
     router: {
-      limits: {
-        orderRows: 12,
-        maxRetries: 20,
-        failureThreshold: 100,
-        minWindowMs: 0,
-        maxWindowMs: 3_600_000,
-        minCooldownMs: 0,
-        maxCooldownMs: 3_600_000,
-        minCooldownFactor: 1,
-        maxCooldownFactor: 10,
-        minSwitches: 0,
-        maxSwitches: 20,
-      },
-      recoveryModes: ['probe', 'immediate'],
-      logLevels: ['silent', 'error', 'warn', 'info', 'debug'],
-      defaults: { retries: 3, cooldownMs: 60_000, cooldownFactor: 2, cooldownMaxMs: 1_800_000 },
-      states: { closed: 'closed', open: 'open', halfOpen: 'half-open' },
-      config: {
-        enabled: true,
-        order: [
-          { provider: 'deepseek-official', model: 'deepseek-flash' },
-          { provider: 'ccx', model: 'deepseek-v4-flash' },
-        ],
-        retries: 3,
-        failureThreshold: 1,
-        windowMs: 60_000,
-        cooldownMs: 60_000,
-        cooldownFactor: 2,
-        cooldownMaxMs: 1_800_000,
-        recoveryMode: 'probe',
-        maxSwitches: 0,
-        budget: 2,
-        logLevel: 'info',
-      },
+      available: true,
+      url: 'http://127.0.0.1:8790',
+      configFile: '/tmp/router-service.json',
+      error: null,
       live: {
-        enabled: true,
-        recoveryMode: 'probe',
-        cooldownMs: 60_000,
-        cooldownFactor: 2,
-        cooldownMaxMs: 1_800_000,
-        retries: 3,
-        windowMs: 60_000,
-        failureThreshold: 1,
-        budget: 2,
-        switchable: true,
+        version: '0.1.0',
+        uptimeMs: 90_000,
+        server: { host: '127.0.0.1', port: 8790 },
+        configFile: '/tmp/router-service.json',
+        converters: [
+          { id: 'maas', label: 'ZTE MaaS → api.deepseek.com 契约', providers: ['maas-dsv4'], models: ['deepseek-v4-flash'], loaded: true },
+        ],
+        providers: [
+          { id: 'maas-dsv4', label: 'dsv4', baseURL: 'https://maas-apigateway.dt.zte.com.cn/model/deepseek-v4-flash/v1', apiKey: 'sk-a…mnop', apiKeySet: true, models: ['deepseek-v4-flash'], headers: {} },
+          { id: 'ccx', label: 'ccx', baseURL: 'https://ccx.example/v1', apiKey: '', apiKeySet: false, models: ['deepseek-v4-flash'], headers: {} },
+        ],
+        router: {
+          enabled: true,
+          order: [
+            { provider: 'maas-dsv4', model: 'deepseek-v4-flash' },
+            { provider: 'ccx', model: 'deepseek-v4-flash' },
+          ],
+          retries: 3,
+          failureThreshold: 1,
+          windowMs: 60_000,
+          cooldownMs: 60_000,
+          cooldownFactor: 2,
+          cooldownMaxMs: 1_800_000,
+          recoveryMode: 'probe',
+          maxSwitches: 0,
+          budget: 2,
+          logLevel: 'info',
+        },
         rows: [
-          { provider: 'deepseek-official', model: 'deepseek-flash', state: 'closed', failures: 0, threshold: 1, trips: 0, nextCooldownMs: 60_000, openUntil: null, probeStartedAt: null, lastFailure: null },
-          { provider: 'ccx', model: 'deepseek-v4-flash', state: 'open', failures: 1, threshold: 1, trips: 2, nextCooldownMs: 240_000, openUntil: Date.now() + 30_000, probeStartedAt: null, lastFailure: { code: 'SERVER', status: 503, message: '503 Service Unavailable', at: Date.now() } },
+          {
+            provider: 'maas-dsv4',
+            model: 'deepseek-v4-flash',
+            state: 'closed',
+            failures: 0,
+            threshold: 1,
+            trips: 0,
+            nextCooldownMs: 60_000,
+            openUntil: null,
+            probeStartedAt: null,
+            lastFailure: null,
+            registered: true,
+            converter: 'maas',
+          },
+          {
+            provider: 'ccx',
+            model: 'deepseek-v4-flash',
+            state: 'open',
+            failures: 1,
+            threshold: 1,
+            trips: 2,
+            nextCooldownMs: 240_000,
+            openUntil: Date.now() + 30_000,
+            probeStartedAt: null,
+            lastFailure: { code: 'SERVER', status: 503, message: '503 Service Unavailable', at: Date.now() },
+            registered: true,
+            converter: null,
+          },
         ],
         recent: [
           { kind: 'retry', at: Date.now(), provider: 'ccx', failure: 'SERVER/503', message: null, state: 'closed', attempt: 1, waitMs: 500 },
-          { kind: 'failure', at: Date.now(), provider: 'ccx', failure: 'SERVER/503', message: '503 Service Unavailable', state: 'open' },
-          { kind: 'switch', at: Date.now(), provider: 'ccx', to: 'deepseek-official/deepseek-flash', failure: 'SERVER/503', message: null, state: 'open' },
+          { kind: 'success', at: Date.now(), provider: 'maas-dsv4', to: null, failure: null, message: null, state: 'closed' },
         ],
-        stats: { failures: 1, opens: 1, switches: 1, retries: 1, exhausted: 0, probes: 0, probeOk: 0 },
+        stats: { requests: 9, failures: 1, opens: 1, switches: 1, retries: 1, exhausted: 0, probes: 1, probeOk: 1, rejected: 0 },
+        limits: {
+          orderRows: 12,
+          maxRetries: 20,
+          failureThreshold: 100,
+          minWindowMs: 0,
+          maxWindowMs: 3_600_000,
+          minCooldownMs: 0,
+          maxCooldownMs: 3_600_000,
+          minCooldownFactor: 1,
+          maxCooldownFactor: 10,
+          minSwitches: 0,
+          maxSwitches: 20,
+        },
+        recoveryModes: ['probe', 'immediate'],
+        logLevels: ['silent', 'error', 'warn', 'info', 'debug'],
+        restartRequired: false,
       },
-      missingProviders: [],
     },
   },
 }
@@ -3198,10 +2764,19 @@ function makeFetch(options = {}) {
     seen.push({ action, body: init?.body === undefined ? null : JSON.parse(init.body), signal: init?.signal })
     if (options.fail === true) throw new Error('offline')
     if (action === 'state') {
-      // A host that loaded the bundle without the routing runtime reports the
-      // half as absent rather than as an empty table.
+      // The routing service is not answering: the plugin forwards that as an
+      // unreachable service, with the reason, rather than as an empty table.
       if (options.routerUnavailable === true) {
-        const value = { ...STATE.value, router: { ...STATE.value.router, config: null, live: null } }
+        const value = {
+          ...STATE.value,
+          router: {
+            available: false,
+            url: 'http://127.0.0.1:8790',
+            configFile: null,
+            error: 'connect ECONNREFUSED 127.0.0.1:8790',
+            live: null,
+          },
+        }
         return new Response(JSON.stringify({ ok: true, value }), { status: 200 })
       }
       if (options.routerGone === true) {
@@ -3213,7 +2788,15 @@ function makeFetch(options = {}) {
           ...STATE.value,
           settings: { ...STATE.value.settings, btwProvider: 'ccx', btwModel: 'deepseek-v4-flash' },
           models: STATE.value.models.filter((group) => group.id !== 'ccx'),
-          router: { ...STATE.value.router, missingProviders: ['ccx'] },
+          // The order row still names it, and the service reports it as
+          // unregistered — which the read-only table has to mark.
+          router: {
+            ...STATE.value.router,
+            live: {
+              ...STATE.value.router.live,
+              rows: STATE.value.router.live.rows.map((row) => (row.provider === 'ccx' ? { ...row, registered: false } : row)),
+            },
+          },
         }
         return new Response(JSON.stringify({ ok: true, value }), { status: 200 })
       }
@@ -3313,25 +2896,20 @@ function makeFetch(options = {}) {
       }
       return new Response(JSON.stringify({
         ok: true,
-        value: {
-          config: options.routerConfig ?? STATE.value.router.config,
-          live: options.routerLive ?? STATE.value.router.live,
-          missingProviders: options.routerMissing ?? STATE.value.router.missingProviders,
-        },
+        value: options.routerView ?? STATE.value.router,
       }), { status: 200 })
     }
     if (action === 'router.reset') {
+      // The service answers a reset with its whole refreshed state payload; the
+      // host forwards it verbatim.
       const live = STATE.value.router.live
       return new Response(JSON.stringify({
         ok: true,
         value: {
-          config: STATE.value.router.config,
-          live: {
-            ...live,
-            rows: live.rows.map((row) => ({ ...row, state: 'closed', failures: 0, openUntil: null, probeStartedAt: null, lastFailure: null })),
-            recent: [],
-            stats: { failures: 0, opens: 0, switches: 0, exhausted: 0, probes: 0, probeOk: 0 },
-          },
+          ...live,
+          rows: live.rows.map((row) => ({ ...row, state: 'closed', failures: 0, openUntil: null, probeStartedAt: null, lastFailure: null })),
+          recent: [],
+          stats: { requests: 0, failures: 0, opens: 0, switches: 0, retries: 0, exhausted: 0, probes: 0, probeOk: 0, rejected: 0 },
         },
       }), { status: 200 })
     }
@@ -3340,18 +2918,16 @@ function makeFetch(options = {}) {
         return new Response(JSON.stringify({
           ok: true,
           value: {
-            target: { provider: 'ccx', model: 'deepseek-v4-flash' },
-            outcome: { ok: false, code: 'RATE_LIMIT', message: '429 Too Many Requests', ms: 30, text: '' },
-            live: STATE.value.router.live,
+            probe: { ok: false, code: 'RATE_LIMIT', message: '429 Too Many Requests', ms: 30, text: '', reasoningChars: 0, attempts: 1 },
+            state: STATE.value.router.live,
           },
         }), { status: 200 })
       }
       return new Response(JSON.stringify({
         ok: true,
         value: {
-          target: { provider: 'deepseek-official', model: 'deepseek-flash' },
-          outcome: { ok: true, code: 'ok', message: null, ms: 42, text: 'pong' },
-          live: STATE.value.router.live,
+          probe: { ok: true, code: 'ok', message: null, ms: 42, text: 'pong', reasoningChars: 0, attempts: 1 },
+          state: STATE.value.router.live,
         },
       }), { status: 200 })
     }
@@ -3789,7 +3365,7 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
   /* ── the split's acceptance criterion: no omission, no duplication ── */
   // Keyed off the `dspo-set-label` nodes on purpose: the 说明 blocks re-print
   // some of these names, so raw text would double-count them.
-  const ROW_KEYS = ['recentMessagesLabel', 'promptLabel', 'outputLangLabel', 'rewriteModelLabel', 'rewriteEffortLabel', 'btwModelLabel', 'btwEffortLabel', 'btwContextLabel', 'btwSaveHistoryLabel', 'titleModelLabel', 'titleEffortLabel', 'titleRerollLabel', 'titleMaxCharsLabel', 'compactionLabel', 'notifyToggle', 'notifyPlatformLabel', 'notifyModelLabel', 'notifyEffortLabel', 'notifyCharsLabel', 'routerToggle', 'routerOrderLabel', 'routerRetriesLabel', 'routerThresholdLabel', 'routerWindowLabel', 'routerCooldownLabel', 'routerCooldownFactorLabel', 'routerCooldownMaxLabel', 'routerSwitchesLabel', 'routerRecoveryLabel', 'routerLogLevelLabel', 'routerLiveLabel']
+  const ROW_KEYS = ['recentMessagesLabel', 'promptLabel', 'outputLangLabel', 'rewriteModelLabel', 'rewriteEffortLabel', 'btwModelLabel', 'btwEffortLabel', 'btwContextLabel', 'btwSaveHistoryLabel', 'titleModelLabel', 'titleEffortLabel', 'titleRerollLabel', 'titleMaxCharsLabel', 'compactionLabel', 'notifyToggle', 'notifyPlatformLabel', 'notifyModelLabel', 'notifyEffortLabel', 'notifyCharsLabel', 'routerServiceLabel', 'routerOrderLabel', 'routerProvidersLabel', 'routerConvertersLabel', 'routerPolicyLabel', 'routerLiveStatsLabel', 'routerLiveLabel']
   const expectedRows = ROW_KEYS.map((key) => bundle.DICT.zh[key])
   const sets = TAB_IDS.map((id) => labelsByTab[id])
   const summary = TAB_IDS.map((id) => `${id}:[${labelsByTab[id].join('|')}]`).join(' ')
@@ -4014,211 +3590,99 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
 }
 
 {
-  // 「路由」页签：顺序表编辑、四个判定旋钮、实时熔断状态与两个动作。
-  // Everything here is read off the requests the page actually sends and off the
-  // host answer it renders, so a regression in either half shows up.
+  // 「路由」页签：只读。服务的地址与存活、顺序表、供应商、转换器、参数、实时熔断表，
+  // 以及服务不可达时的那句话。断言只读页真正渲染出来的东西与它实际发出的请求。
   const fetchImpl = makeFetch({ saveOk: true })
   const bundle = loadClientBundle(fetchImpl)
   await bundle.settingsStore.load(true)
   const render = mountClient(bundle, bundle.SettingsPanel)
   const page = () => render({ close() {} })
   const panelOf = (tree) => findAll(tree, (node) => node.props?.role === 'tabpanel' && node.props.id === 'dspo-panel-router')[0]
-  const rail = (tree) => findAll(tree, (node) => node.props?.id === 'dspo-tab-router')[0]
   const settle = async () => {
     await new Promise((resolve) => setTimeout(resolve, 0))
     await new Promise((resolve) => setTimeout(resolve, 0))
   }
   const Z = bundle.DICT.zh
-  const lastRequest = (action) => [...fetchImpl.seen].reverse().find((entry) => entry.action === action)
-  const lastSave = () => lastRequest('save')
-  const buttonsIn = (tree) => findAll(tree, (node) => node.type === 'button')
-  const clickLabel = (tree, label) => buttonsIn(tree).find((button) => labelOf(button).trim() === label)
-
-  rail(page()).props.onClick()
+  findAll(page(), (node) => node.props?.id === 'dspo-tab-router')[0].props.onClick()
   await settle()
-  let tree = page()
-  let panel = panelOf(tree)
-  check('路由页签渲染出面板', panel !== undefined)
-  check('路由页签列出全部 12 个设置行', findAll(panel, (node) => node.props?.className === 'dspo-set-label').length === 12,
-    String(findAll(panel, (node) => node.props?.className === 'dspo-set-label').length))
+  const panel = panelOf(page())
+  const text = textOf(panel)
+  const buttonsOf = (tree) => findAll(tree, (node) => node.type === 'button')
+  const labelOf = (node) => textOf(node) ?? ''
+  const findButton = (tree, label) => buttonsOf(tree).find((button) => labelOf(button).trim() === label)
 
-  /* ── the switch ── */
-  const toggle = findAll(panel, (node) => node.props?.id === 'dspo-router-enabled')[0]
-  check('总开关反映存储值（默认开）', toggle?.props?.type === 'checkbox' && toggle.props.checked === true)
-  toggle.props.onChange({ target: { checked: false } })
+  check('路由页签不再提供任何可写控件',
+    findAll(panel, (node) => node.type === 'input' || node.type === 'select' || node.type === 'textarea').length === 0,
+    String(findAll(panel, (node) => node.type === 'input' || node.type === 'select' || node.type === 'textarea').length))
+  check('页签不再有保存类动作',
+    findButton(panel, Z.routerOrderSave) === undefined && findButton(panel, Z.routerOrderAdd) === undefined
+      && findButton(panel, Z.routerOrderPrune) === undefined)
+
+  check('服务面板说明服务在运行', text.includes(Z.routerServiceUp) && text.includes('http://127.0.0.1:8790'))
+  check('服务面板给出配置文件与版本', text.includes('/tmp/router-service.json') && text.includes('0.1.0'))
+  const serviceLink = findAll(panel, (node) => node.props?.className === 'dspo-router-link')[0]
+  check('给出跳转服务管理页的链接（新窗口、带 rel）',
+    serviceLink?.props?.href === 'http://127.0.0.1:8790/' && serviceLink.props.target === '_blank'
+      && serviceLink.props.rel === 'noreferrer',
+    JSON.stringify(serviceLink?.props))
+
+  const orderRows = findAll(panel, (node) => node.props?.className === 'dspo-order-index')
+  const orderRowText = (index) => {
+    const cells = findAll(panel, (node) => node.props?.className === 'dspo-order-grid')[0]?.children ?? []
+    return cells.slice(4 + index * 4, 4 + (index + 1) * 4).map((cell) => textOf(cell)).join(' ')
+  }
+  check('顺序表按服务给的行数渲染', orderRows.length === 2, String(orderRows.length))
+  check('顺序表显示供应商与模型',
+    orderRowText(0).includes('maas-dsv4') && orderRowText(0).includes('deepseek-v4-flash')
+      && orderRowText(1).includes('ccx'), `${orderRowText(0)} | ${orderRowText(1)}`)
+  check('顺序表按服务给的顺序渲染', orderRowText(0).includes('maas-dsv4') && orderRowText(1).includes('ccx'))
+  check('行上标出它由哪个转换器接管', text.includes('maas'))
+  check('未设置密钥的供应商被标出', text.includes(Z.routerProviderNoKey))
+  check('已设置密钥只显示掩码', text.includes('sk-a…mnop') && !text.includes('sk-abcdefghij'))
+
+  check('参数区以键值对呈现，而不是表单',
+    text.includes(Z.routerRetriesLabel) && text.includes(Z.routerThresholdLabel)
+      && text.includes(Z.routerCooldownFactorLabel) && text.includes(Z.routerRecoveryLabel))
+  check('每步切换上限显示「自动」语义', text.includes(Z.routerSwitchesAuto.replace('{n}', '2')))
+  check('恢复方式显示为 probe 的可读说法', text.includes(Z.routerRecoveryProbe))
+
+  const liveText = text
+  check('实时区显示熔断状态与原因',
+    liveText.includes(Z.routerStateOpen) && liveText.includes('SERVER')
+      && liveText.includes(Z.routerLiveLastFailure.replace('{detail}', 'SERVER 503 503 Service Unavailable')))
+  check('统计区显示累计数字', liveText.includes(Z.routerStatRequests) && liveText.includes(Z.routerStatRejected))
+  check('最近事件按句子渲染', liveText.includes(Z.routerLiveRecent) && liveText.includes(Z.routerKindRetry))
+
+  // The two actions still go through the host, which forwards them to the service.
+  const beforeRefresh = fetchImpl.seen.filter((entry) => entry.action === 'router.state').length
+  findButton(panel, Z.routerLiveRefresh).props.onClick()
   await settle()
-  check('关掉总开关只发 routerEnabled 一个键',
-    JSON.stringify(lastSave().body) === JSON.stringify({ routerEnabled: false }), JSON.stringify(lastSave()?.body))
-  await bundle.settingsStore.save({ routerEnabled: true })
-  tree = page()
-  panel = panelOf(tree)
+  check('刷新按钮重新向宿主要一次状态',
+    fetchImpl.seen.filter((entry) => entry.action === 'router.state').length > beforeRefresh)
 
-  /* ── the order table ── */
-  const orderRows = (tree2) => findAll(panelOf(tree2), (node) => node.props?.className === 'dspo-order-row')
-  check('顺序表按存储的行数渲染', orderRows(tree).length === 2, String(orderRows(tree).length))
-  const providerValue = (tree2, index) => findAll(panelOf(tree2), (node) => node.props?.id === `dspo-router-provider-${index}`)[0]?.props?.value
-  const modelValue = (tree2, index) => findAll(panelOf(tree2), (node) => node.props?.id === `dspo-router-model-${index}`)[0]?.props?.value
-  check('每行的供应商与模型下拉选中已存的值',
-    providerValue(tree, 0) === 'deepseek-official' && providerValue(tree, 1) === 'ccx'
-      && modelValue(tree, 0) === 'deepseek-flash' && modelValue(tree, 1) === 'deepseek-v4-flash')
-  check('供应商下拉来自已配置的模型目录',
-    (findAll(panel, (node) => node.props?.id === 'dspo-router-provider-0')[0].children ?? []).length === 2)
-  const modelOptions = findAll(panel, (node) => node.props?.id === 'dspo-router-model-1')[0]
-  check('模型下拉跟随该行的供应商', modelOptions.props.disabled !== true
-    && (modelOptions.children ?? []).map((option) => option.props.value).join(',') === 'deepseek-v4-flash')
-
-  // Only `/save` requests count here: the stub's `useEffect` runs on every
-  // render, so each `page()` posts another `/router.state` by design.
-  const saveCount = () => fetchImpl.seen.filter((entry) => entry.action === 'save').length
-  const before = saveCount()
-  clickLabel(panel, Z.routerOrderAdd).props.onClick()
-  tree = page()
-  check('添加一行只改本地草稿（不写盘）',
-    orderRows(tree).length === 3 && saveCount() === before)
-  check('未保存时页面明说顺序表有改动', textOf(panelOf(tree)).includes(Z.routerOrderDirty))
-
-  // Reorder locally: the second row moves up, so the saved order must be the ring.
-  const upButtons = buttonsIn(panelOf(tree)).filter((button) => button.props['aria-label'] === Z.routerOrderUp)
-  upButtons[1].props.onClick()
-  tree = page()
-  check('上移把这一行换到前一行（本地）', providerValue(tree, 0) === 'ccx' && providerValue(tree, 1) === 'deepseek-official',
-    `${providerValue(tree, 0)},${providerValue(tree, 1)}`)
-
-  const removeButtons = buttonsIn(panelOf(tree)).filter((button) => button.props['aria-label'] === Z.routerOrderRemove)
-  removeButtons[2].props.onClick()
-  tree = page()
-  check('删除移除的是点中的那一行', orderRows(tree).length === 2)
-  check('撤销改动回到存储的顺序', (() => {
-    clickLabel(panelOf(tree), Z.routerOrderReset).props.onClick()
-    const restored = page()
-    return providerValue(restored, 0) === 'deepseek-official' && providerValue(restored, 1) === 'ccx'
-      && textOf(panelOf(restored)).includes(Z.routerOrderDirty) === false
-  })())
-
-  // Edit and save: the posted array is exactly the rows on screen.
-  tree = page()
-  findAll(panelOf(tree), (node) => node.props?.id === 'dspo-router-provider-0')[0]
-    .props.onChange({ target: { value: 'ccx' } })
-  tree = page()
-  check('换供应商时模型跟着换成该供应商的第一个', providerValue(tree, 0) === 'ccx' && modelValue(tree, 0) === 'deepseek-v4-flash')
-  findAll(panelOf(tree), (node) => node.props?.id === 'dspo-router-effort-0')[0]
-    .props.onChange({ target: { value: 'max' } })
-  tree = page()
-  clickLabel(panelOf(tree), Z.routerOrderSave).props.onClick()
+  const resetButton = buttonsOf(panel).find((button) => labelOf(button).trim() === Z.routerLiveReset)
+  check('服务在跑时清空按钮可用', resetButton !== undefined && resetButton.props.disabled !== true)
+  resetButton.props.onClick()
   await settle()
-  const posted = lastSave().body.routerOrder
-  check('保存顺序发出的是屏幕上那份行数组',
-    Array.isArray(posted) && posted.length === 2 && posted[0].provider === 'ccx'
-      && posted[0].model === 'deepseek-v4-flash' && posted[0].reasoningEffort === 'max',
-    JSON.stringify(posted))
-  check('行里没选的强度不会写成空字符串', posted[1].reasoningEffort === undefined, JSON.stringify(posted[1]))
-  tree = page()
-  check('保存成功后就地提示「顺序表已保存」',
-    textOf(panelOf(tree)).includes(Z.routerOrderSaved.replace('{n}', '2')), textOf(panelOf(tree)))
+  check('清空按钮转发成 router.reset', fetchImpl.seen.some((entry) => entry.action === 'router.reset'))
+  check('清空后就地重画实时区', textOf(panelOf(page())).includes(Z.routerLiveResetDone))
 
-  /* ── the judging knobs ── */
-  const numberInput = (field, tree2 = page()) => findAll(panelOf(tree2), (node) => node.props?.id === `dspo-${field}`)[0]
-  numberInput('routerRetries').props.onChange({ target: { value: '5' } })
-  numberInput('routerRetries').props.onBlur()
-  await settle()
-  check('重试次数按整数保存', lastRequest('save').body.routerRetries === 5, JSON.stringify(lastRequest('save').body))
-  check('重试次数一行带说明（写明 0 = 失败即切换）', textOf(panelOf(page())).includes(Z.routerRetriesHint))
-
-  const beforeBadRetries = saveCount()
-  numberInput('routerRetries').props.onChange({ target: { value: '21' } })
-  numberInput('routerRetries').props.onBlur()
-  await settle()
-  tree = page()
-  check('越界的重试次数被拒、输入框回到实际生效的值',
-    saveCount() === beforeBadRetries && numberInput('routerRetries', tree).props.value === '3'
-      && textOf(panelOf(tree)).includes(Z.routerIntInvalid.replace('{min}', '0').replace('{max}', '20')),
-    textOf(panelOf(tree)))
-
-  numberInput('routerCooldownFactor').props.onChange({ target: { value: '3' } })
-  numberInput('routerCooldownFactor').props.onBlur()
-  await settle()
-  check('递增倍数按整数保存', lastRequest('save').body.routerCooldownFactor === 3)
-  numberInput('routerCooldownMaxMs').props.onChange({ target: { value: '600000' } })
-  numberInput('routerCooldownMaxMs').props.onBlur()
-  await settle()
-  check('熔断上限（毫秒）按整数保存', lastRequest('save').body.routerCooldownMaxMs === 600_000)
-  check('退役的错误码/状态码输入框已从页面移除',
-    findAll(panelOf(page()), (node) => node.props?.id === 'dspo-router-codes').length === 0
-      && findAll(panelOf(page()), (node) => node.props?.id === 'dspo-router-statuses').length === 0)
-
-  const thresholdInput = () => findAll(panelOf(page()), (node) => node.props?.id === 'dspo-routerFailureThreshold')[0]
-  const beforeBad = saveCount()
-  thresholdInput().props.onChange({ target: { value: '0' } })
-  tree = page()
-  check('半截/越界数字先留在输入框里，不立刻拒绝', findAll(panelOf(tree), (node) => node.props?.id === 'dspo-routerFailureThreshold')[0].props.value === '0')
-  findAll(panelOf(tree), (node) => node.props?.id === 'dspo-routerFailureThreshold')[0].props.onBlur()
-  await settle()
-  tree = page()
-  check('离开输入框时越界值被拒、输入框回到实际生效的值',
-    saveCount() === beforeBad
-      && findAll(panelOf(tree), (node) => node.props?.id === 'dspo-routerFailureThreshold')[0].props.value === '1'
-      && textOf(panelOf(tree)).includes(Z.routerIntInvalid.replace('{min}', '1').replace('{max}', '100')),
-    textOf(panelOf(tree)))
-  findAll(panelOf(tree), (node) => node.props?.id === 'dspo-routerFailureThreshold')[0].props.onChange({ target: { value: '3' } })
-  findAll(panelOf(page()), (node) => node.props?.id === 'dspo-routerFailureThreshold')[0].props.onBlur()
-  await settle()
-  check('合法阈值按整数保存', lastRequest('save').body.routerFailureThreshold === 3)
-
-  const switchesHint = textOf(panelOf(page()))
-  check('切换次数提示当前生效的预算（0 = 自动 = 行数）', switchesHint.includes('2'))
-
-  findAll(panelOf(page()), (node) => node.props?.id === 'dspo-router-recovery')[0]
-    .props.onChange({ target: { value: 'immediate' } })
-  await settle()
-  check('恢复方式存的是 immediate', lastRequest('save').body.routerRecoveryMode === 'immediate')
-  findAll(panelOf(page()), (node) => node.props?.id === 'dspo-router-loglevel')[0]
-    .props.onChange({ target: { value: 'debug' } })
-  await settle()
-  check('日志级别存的是 debug', lastRequest('save').body.routerLogLevel === 'debug')
-
-  /* ── live state ── */
-  tree = page()
-  const livePanelText = textOf(panelOf(tree))
-  check('实时区渲染每个候选的状态徽标',
-    findAll(panelOf(tree), (node) => node.props?.className === 'dspo-state').length === 2)
-  const states = findAll(panelOf(tree), (node) => node.props?.className === 'dspo-state').map((node) => node.props['data-state'])
-  check('徽标状态来自宿主（closed / open）', states.join(',') === 'closed,open', states.join(','))
-  check('熔断行标出剩余冷却与最近失败', livePanelText.includes(Z.routerStateOpen) && livePanelText.includes('SERVER'))
-  check('实时区带累计统计', livePanelText.includes(Z.routerLiveStats.replace('{failures}', '1').replace('{retries}', '1').replace('{opens}', '1').replace('{switches}', '1').replace('{exhausted}', '0')))
-  check('实时区标出连续熔断次数与下一次冷却',
-    livePanelText.includes(Z.routerLiveTrips.replace('{n}', '2').replace('{ms}', '240000')))
-  check('最近事件按句子里出（重试/切换/失败）',
-    livePanelText.includes(Z.routerLiveRecent)
-      && livePanelText.includes(Z.routerRecentRetry.replace('{from}', 'ccx').replace('{failure}', 'SERVER/503').replace('{n}', '1').replace('{wait}', '500'))
-      && livePanelText.includes('ccx → deepseek-official/deepseek-flash'))
-
-  const probeButton = clickLabel(panelOf(tree), Z.routerProbe)
+  const probeButton = buttonsOf(panelOf(page())).find((button) => labelOf(button).trim() === Z.routerProbe)
+  check('每行一个测试按钮', probeButton !== undefined)
   probeButton.props.onClick()
   await settle()
-  const probeRequest = lastRequest('router.probe')
-  check('测试按钮发给宿主的是这一行的路由',
-    probeRequest.body.provider === 'deepseek-official' && probeRequest.body.model === 'deepseek-flash',
-    JSON.stringify(probeRequest?.body))
-  tree = page()
-  check('测试结果就地显示耗时', textOf(panelOf(tree)).includes(Z.routerProbeOk.replace('{ms}', '42')))
-
-  clickLabel(panelOf(tree), Z.routerLiveReset).props.onClick()
-  await settle()
-  tree = page()
-  check('清空熔断状态走 /router.reset 并用回传状态重画',
-    lastRequest('router.reset') !== undefined
-      && findAll(panelOf(tree), (node) => node.props?.className === 'dspo-state').every((node) => node.props['data-state'] === 'closed')
-      && textOf(panelOf(tree)).includes(Z.routerLiveResetDone))
+  const probed = fetchImpl.seen.filter((entry) => entry.action === 'router.probe').at(-1)
+  check('测试按钮把这一行的路由发出去',
+    probed?.body?.provider === 'maas-dsv4' && probed?.body?.model === 'deepseek-v4-flash', JSON.stringify(probed?.body))
+  check('测试结果就地显示耗时',
+    textOf(panelOf(page())).includes(Z.routerProbeOk.replace('{ms}', '42')), textOf(panelOf(page())).slice(0, 400))
   bundle.__restore()
 }
 
 {
-  // A provider the user deleted while its order row stayed behind. This is the
-  // regression the settings page showed live: a `<select>` whose `value` matches
-  // no `<option>` silently displays the *first* option, so a stale `ccx` row
-  // rendered as the provider next to it with a blank model column — the table
-  // looked like it had rewritten itself.
-  const fetchImpl = makeFetch({ saveOk: true, routerGone: true, routerMissing: ['ccx'] })
+  // 顺序表里有一行指向服务没有配置的供应商：这一页要标出来，并且那一行的测试按钮置灰
+  // （它只会返回 unconfigured，点了也没有可行动的信息）。
+  const fetchImpl = makeFetch({ saveOk: true, routerGone: true })
   const bundle = loadClientBundle(fetchImpl)
   await bundle.settingsStore.load(true)
   const render = mountClient(bundle, bundle.SettingsPanel)
@@ -4226,45 +3690,21 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
   const panelOf = (tree) => findAll(tree, (node) => node.props?.role === 'tabpanel' && node.props.id === 'dspo-panel-router')[0]
   findAll(page(), (node) => node.props?.id === 'dspo-tab-router')[0].props.onClick()
   await new Promise((resolve) => setTimeout(resolve, 0))
-  let tree = page()
+  await new Promise((resolve) => setTimeout(resolve, 0))
   const Z = bundle.DICT.zh
-  const at = (tree2, id) => findAll(panelOf(tree2), (node) => node.props?.id === id)[0]
-  const valuesOf = (select) => (select?.children ?? []).map((option) => option.props.value)
-  const labelsOf = (select) => (select?.children ?? []).map(textOf)
-
-  const provider1 = at(tree, 'dspo-router-provider-1')
-  check('已注销供应商的那一行仍然选中它自己（不再回落到第一个选项）',
-    provider1?.props?.value === 'ccx' && valuesOf(provider1)[0] === 'ccx',
-    `${provider1?.props?.value} / ${valuesOf(provider1).join(',')}`)
-  check('该行标出「未注册」，并且仍可改选一个已注册的供应商',
-    labelsOf(provider1)[0].includes(Z.providerUnregistered) && valuesOf(provider1).includes('deepseek-official'),
-    labelsOf(provider1).join(' | '))
-  check('该行的模型下拉显示存储的模型（不再是空白）',
-    at(tree, 'dspo-router-model-1')?.props?.value === 'deepseek-v4-flash'
-      && labelsOf(at(tree, 'dspo-router-model-1'))[0].includes('deepseek-v4-flash'),
-    labelsOf(at(tree, 'dspo-router-model-1')).join(' | '))
-  check('注册过的行不受影响',
-    at(tree, 'dspo-router-provider-0')?.props?.value === 'deepseek-official')
-  check('页面仍然明说哪个供应商没有注册',
-    textOf(panelOf(tree)).includes(Z.routerOrderMissing.replace('{list}', 'ccx')))
-
-  const prune = buttonsOf(panelOf(tree)).find((button) => labelOf(button).trim() === Z.routerOrderPrune)
-  check('提供「移除未注册的行」，且未注册时可用', prune !== undefined && prune.props.disabled === false)
-  prune.props.onClick()
-  tree = page()
-  check('一键移除只去掉未注册的那一行，并且仍要保存才写盘',
-    findAll(panelOf(tree), (node) => node.props?.className === 'dspo-order-row').length === 1
-      && at(tree, 'dspo-router-provider-0').props.value === 'deepseek-official'
-      && textOf(panelOf(tree)).includes(Z.routerOrderDirty))
-  check('没有未注册的行时按钮置灰（不会误删）',
-    buttonsOf(panelOf(tree)).find((button) => labelOf(button).trim() === Z.routerOrderPrune).props.disabled === true)
-
-  const probeButtons = buttonsOf(panelOf(tree)).filter((button) => labelOf(button).trim() === Z.routerProbe)
-  check('实时区里未注册行的测试按钮给出理由，而不是必然失败',
-    probeButtons.length === 2 && probeButtons[1].props.disabled === true && probeButtons[1].props.title === Z.routerProbeUnknown,
-    JSON.stringify(probeButtons.map((button) => [button.props.disabled, button.props.title])))
-  check('实时区里注册过的行仍可测试', probeButtons[0].props.disabled === false)
-  check('实时区标注了未注册的行', textOf(panelOf(tree)).includes(Z.routerLiveUnknown))
+  const panel = panelOf(page())
+  const cells = findAll(panel, (node) => node.props?.className === 'dspo-order-grid')[0]?.children ?? []
+  const rowText = (index) => cells.slice(4 + index * 4, 4 + (index + 1) * 4).map((cell) => textOf(cell)).join(' ')
+  check('未注册的那一行仍然显示它自己（不回落、不改写）',
+    findAll(panel, (node) => node.props?.className === 'dspo-order-index').length === 2
+      && rowText(1).includes('ccx') && rowText(1).includes('deepseek-v4-flash'), rowText(1))
+  check('未注册的行被明确标出', rowText(1).includes(Z.providerUnregistered), rowText(1))
+  check('注册过的行不受影响', rowText(0).includes('maas-dsv4') && !rowText(0).includes(Z.providerUnregistered), rowText(0))
+  const probeButtons = findAll(panel, (node) => node.type === 'button' && textOf(node).trim() === Z.routerProbe)
+  check('未注册行的测试按钮置灰并说明理由',
+    probeButtons.length === 2 && probeButtons[1].props.disabled === true,
+    String(probeButtons.length))
+  check('已注册的行仍可测试', probeButtons[0].props.disabled !== true)
 
   // The same stale provider pinned on the side-question tab: its picker used to
   // fall back to the first provider in the catalog, so the page showed a model
@@ -4286,8 +3726,7 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
 }
 
 {
-  // A host without the routing runtime: the tab must say so instead of showing an
-  // empty table, and the live actions must be unavailable rather than lying.
+  // 服务不可达：页面要说原因（而不是显示一张空表），并且不给出跳转链接与清空动作。
   const fetchImpl = makeFetch({ saveOk: true, routerUnavailable: true })
   const bundle = loadClientBundle(fetchImpl)
   await bundle.settingsStore.load(true)
@@ -4295,11 +3734,21 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
   const page = () => render({ close() {} })
   findAll(page(), (node) => node.props?.id === 'dspo-tab-router')[0].props.onClick()
   await new Promise((resolve) => setTimeout(resolve, 0))
-  const tree = page()
-  const panel = findAll(tree, (node) => node.props?.role === 'tabpanel' && node.props.id === 'dspo-panel-router')[0]
-  check('宿主没挂载路由运行时时页面说明原因', textOf(panel).includes(bundle.DICT.zh.routerLiveUnavailable))
-  check('没有实时状态时清空按钮不可用',
-    findAll(panel, (node) => node.type === 'button' && labelOf(node).trim() === bundle.DICT.zh.routerLiveReset)[0].props.disabled === true)
+  const Z = bundle.DICT.zh
+  const panel = findAll(page(), (node) => node.props?.role === 'tabpanel' && node.props.id === 'dspo-panel-router')[0]
+  const text = textOf(panel)
+  check('服务不可达时页面说明原因（带服务给的原话）',
+    text.includes(Z.routerServiceDown) && text.includes('connect ECONNREFUSED 127.0.0.1:8790'), text.slice(0, 300))
+  check('服务不可达时说明模型调用不会因此失败',
+    text.includes(Z.routerServiceDownWhy.replace('{error}', '').slice(0, 12)))
+  const link = findAll(panel, (node) => node.props?.className === 'dspo-router-link')[0]
+  check('服务不可达时仍然给出管理页入口（地址是知道的）',
+    link?.props?.href === 'http://127.0.0.1:8790/', JSON.stringify(link?.props))
+  check('服务不可达时说明读不到熔断状态', text.includes(Z.routerLiveUnavailable))
+  check('服务不可达时不渲染任何实时动作按钮（没有可做的事就不给按钮）',
+    findAll(panel, (node) => node.type === 'button' && textOf(node).trim() === Z.routerLiveReset).length === 0
+      && findAll(panel, (node) => node.type === 'button' && textOf(node).trim() === Z.routerProbe).length === 0,
+    JSON.stringify(findAll(panel, (node) => node.type === 'button').map((node) => textOf(node))))
   bundle.__restore()
 }
 

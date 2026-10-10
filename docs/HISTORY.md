@@ -16,6 +16,7 @@
 - [上下文压缩阈值](#上下文压缩阈值)
 - [任务完成通知](#任务完成通知)
 - [会话标题](#会话标题)
+- [路由服务与 maas 转换器](#路由服务与-maas-转换器2026-10-10)
 - [设置页](#设置页)
 - [延迟](#延迟)
 - [与其他同类插件的差异](#与其他同类插件的差异)
@@ -327,6 +328,11 @@ thresholdRatio = 你要的 token 数 ÷ 该模型窗口大小
 
 ## 供应商熔断与顺序切换
 
+> **2026-10-10 后续：这一半已整体拆成独立进程。** 下面记的判定规则、状态机与踩坑仍然成立，但**拦截在哪一层**已经作废——
+> 钩子不再存在于插件里，改由服务自己握着上游连接完成切换。当时的取舍与今天的取舍见
+> [路由服务与 maas 转换器](#路由服务与-maas-转换器2026-10-10)。
+
+
 一个供应商开始失败时，最费时间的往往不是等它恢复，而是**同一轮里反复回到它身上**：宿主自己的重试阶梯会原地退避（默认最多 5 次、500ms 起步翻倍到 10s），而这一段时间里另一条你付过钱的线路是空闲的。这一半做的事就是：**先在原路由上重试若干次，再熔断它，并按排好的顺序换到下一条线**。
 
 初版只对「熔断错误码 / HTTP 状态码」列表里的失败生效（默认只有 `RATE_LIMIT` / `429`）。结果是回 `SERVER`、`TIMEOUT`、`TRANSPORT`、`EMPTY_RESPONSE` 的供应商**永远不会被绕开**——同一件事上两个知识源（DSH 的可重试集合与本插件的错误码列表）互相矛盾，且后者是用户看不见的。现在改为**任何失败一视同仁**：重试 n 次后必然切换，两个错误码设置退役。
@@ -352,7 +358,7 @@ thresholdRatio = 你要的 token 数 ÷ 该模型窗口大小
 
 ### 重试多少次才切换
 
-「n 次重试」而不是「立刻切换」，是因为一次抖动不应该把一个健康供应商打成熔断。规则的边界都写死在一处（`lib/router.js` 的 `retryWaitMs`）：
+「n 次重试」而不是「立刻切换」，是因为一次抖动不应该把一个健康供应商打成熔断。规则的边界都写死在一处（`lib/service/router.js` 的 `retryWaitMs`）：
 
 - 重试次数就是设置页的**「切换前重试次数」**（默认 3，可设 0 = 失败即切换）。
 - 次数按 `${turn}:${step}:${供应商}` 记：换了步骤重新数，换了候选各数各的。每次失败都走同一个钩子，所以计数是「这条路由在本步骤里第几次失败」。
@@ -476,6 +482,117 @@ thresholdRatio = 你要的 token 数 ÷ 该模型窗口大小
 - 「实时熔断状态」的刷新是**轮询**（4 秒），不是推送：熔断是宿主内部事件，没有向浏览器广播的通道。
 - **判定不匹配错误文本**：只看「失败对象是否存在」以及它的结构化字段（用于显示）。供应商改措辞不影响行为，但**任何**失败都会走到切换——包括你不希望它切换的那些。
 
+## 路由服务与 maas 转换器（2026-10-10）
+
+把熔断与路由从插件运行时里拆出来，做成一个本地独立服务，并给它一个可注册的「协议转换器」接口；本次先按 MaaS 实现一个，
+让网关那两个模型（`maas-dsv4/deepseek-v4-flash`、`maas-coclaw/co-claw`）的**出入参**尽量对齐官方契约。
+
+### 为什么拆
+
+- **故障域不同。** 输入框旁边的按钮抛异常只损失一个按钮；熔断器抛异常损失的是这台机器上**每一次模型调用**。分进程之后，前者的 bug 碰不到后者。
+- **受众不同。** 故障切换对这台机器上每个 agent 都有用，不只是对碰巧装了本插件的那个会话有用。
+- **机制不同。** 钩子只能在**两次尝试之间**换路由，所以调用方看得见每一跳的失败（会收到错误事件）。代理自己握着 socket，
+  只要上游还没吐出头一个字节，失败的那一跳对调用方**完全不可见**——这才是「别等它退避，直接切」真正想要的东西。
+- **代价**：进程外拿不到 `agent/request-error` 的恢复权，所以 DSH 自己的流量必须走到服务里来；这也意味着切换不再作为
+  `request/header` 事件出现在会话日志里（会话只看到一个 provider）。这个代价是明说的，不是漏掉的。
+
+### 拆成了什么
+
+```
+插件（lib/index.js）
+  ├─ lib/service-client.js  → fork 子进程 / 已在跑就接入 / 转达三个管理动作
+  ├─ /dsh-prompt-optimizer/router.{state,reset,probe} → 转发到服务的管理 API
+  └─ 设置页「路由」页签 → 只读状态 + 跳转到服务自己的页面
+
+服务（lib/service/main.js，默认 127.0.0.1:8790）
+  ├─ router.js        熔断状态机（从 lib/router.js 原样搬来：纯逻辑、零 import、可注入时钟）
+  ├─ config.js        自己的配置文档 $DSH_HOME/router-service.json（读取修复、写入拒绝、原子写）
+  ├─ proxy.js         数据面：按顺序表选路、重试、熔断记账、失败切换
+  ├─ upstream.js      唯一发 HTTP 的地方：JSON + SSE、分相超时、读 retry-after
+  ├─ server.js        两个面：/v1/*（OpenAI 兼容，免鉴权）与 /admin/*（令牌）
+  ├─ ui.js            服务自带的管理页（零依赖、无 innerHTML 拼接、可见时才轮询）
+  └─ converters/      registry.js（注册接口）+ maas.js（本次的转换器）
+```
+
+**没有第二份实现。** 插件侧不再有熔断状态、不再有顺序表、不再有钩子；`lib/router.js` 与 `lib/routing.js` 从插件主体里消失，
+插件设置里的 `router*` 键也一并退役（旧文件里的键会被丢弃而不是报错，因为可能有一个升级前打开的页面还在写它）。
+
+### 为什么转换器是代码模块
+
+「注册转换器」听起来像一张声明式映射表，实际不是：它要改写**流式 SSE 的每一个增量**、要合成上游根本没发的 `usage`、
+要把厂商的错误信封在响应还开着的时候换掉、要判断一个 200 的 body 到底能不能解析。那些是状态机，能表达它们的 JSON 规则语言
+会是一门没有调试器的更差的编程语言。所以注册接口是 `defineConverter({...})`，缺省全是原样透传——**没注册转换器的路由行为不变**。
+
+### maas 转换器改了什么（逐条实测）
+
+判据全部来自对两个真实端点的实测，不是文档。右列是本次实测看到的结果。
+
+| 轴 | 参照契约 | ZTE 网关 | 转换器 | 实测 |
+| --- | --- | --- | --- | --- |
+| 思考开关 | `thinking: {type:'disabled'\|'enabled', budget_tokens}` + `effort` | 忽略 `thinking`，认 `reasoning_effort` | 译成 `reasoning_effort`；`thinking`/`effort` 从上游请求里删掉 | `thinking disabled` → 上游 `reasoning_effort:"none"`，响应无 `reasoning_content`（`deepseek-v4-flash` 与 `co-claw` 都成立） |
+| 思考开启 | 同上 | 同上 | `budget_tokens` 就近映射档位 | `budget_tokens: 2048` → `medium`；`reasoning_content` 34 字 |
+| 输出上限 | `max_tokens`（含思考 token） | 两种都认 | `max_completion_tokens` 折进 `max_tokens` | 请求里只出现 `max_tokens` |
+| `response_format: json_object` | 提示词无 "json" 就 400 | 无条件接受 | **强制**参照契约的前置条件 | 无 "json" → 400 且**没打到上游**；有 "json" → 200 |
+| 思考正文 | `message.reasoning_content` | `message.reasoning` | 改名 | message 字段集 = `{role, content}` 或 `{role, content, reasoning_content}` |
+| token 统计 | 总是上报 `reasoning_tokens` | `co-claw` 报，`deepseek-v4-flash` **不报** | 没思考就写 `0`；思考了但没报就**省略** | 关思考：`{reasoning_tokens: 0}`；开思考：字段缺席（不估算） |
+| `usage` 细节 | `prompt_cache_hit_tokens`/`miss_tokens` | `prompt_tokens_details.created_cache_tokens` 等 | 归一到参照契约，多出来的计数器丢掉 | `{prompt_tokens:9, completion_tokens:2, total_tokens:11, prompt_tokens_details:{cached_tokens:0}, prompt_cache_hit_tokens:0, prompt_cache_miss_tokens:9, completion_tokens_details:{reasoning_tokens:0}}` |
+| `model` 回显 | 请求的名字 | 后端名 `DeepSeek-V4-Flash-0731` | 回显请求名 | `deepseek-v4-flash` |
+| `system_fingerprint` | 有 | 有（`vllm-0.26.0-tp8-ep-b67fe5ed`） | 原样透传，缺失时合成 | 原样透传 |
+| 顶层噪声 | — | `service_tier`/`prompt_token_ids`/`prompt_text`/`kv_transfer_params`/`metrics`… | 摘掉 | 响应顶层只剩 `id/object/created/model/choices/system_fingerprint/usage` |
+| choice 噪声 | — | `stop_reason`/`token_ids`/`routed_experts` | 摘掉 | 同上 |
+| `/v1/models` | 有 | **404** | 由配置合成（模型名与 `provider/model` 两种拼写） | `["deepseek-v4-flash","maas-dsv4/deepseek-v4-flash","co-claw","maas-coclaw/co-claw"]` |
+| 错误体 | `{error:{message,type,param,code}}` | vLLM 自己的形状 | 按状态码重写 | 429 → `rate_limit_error` / `rate_limit_exceeded` |
+
+### 两个刻意的「不做」
+
+- **不发明默认值。** 调用方什么都没说时**一个字段都不发**，由网关自己的默认值决定（`co-claw` 默认思考开、`deepseek-v4-flash` 默认关）。
+  强行统一会让两条 MaaS 路由互相一致、却与参照契约**自己的**默认值不一致，并且会覆盖一个故意留空的调用方。转换器保证的是「显式控制两边同义」。
+- **不发明数字。** `deepseek-v4-flash` 不上报 `reasoning_tokens`。**没有思考**时写 `0`（这是事实，不是猜测）；**思考了但上游没报**时省略该字段，
+  而不是按正文长度估算。需要这个数的调用方可以走 `co-claw`，它上报。
+
+### 「比上游更严」是有意的
+
+`response_format` 那一行是转换器唯一一处比它适配的对象更严格。这是故意的：写一个客户端同时打两个端点的调用方，
+否则会在生产环境里发现差异，而网关的宽容会变成一个没有契约背书的依赖。早一点按参照契约自己的错误形状拒绝，才是「一致」诚实的拼写。
+
+### 换入换出的语义
+
+- **北向 `model` 决定从顺序表哪一行开始试**：能写成 `deepseek-v4-flash`（模型名）或 `maas-dsv4/deepseek-v4-flash`（全名）。
+  之后按顺序表往后走并**回绕**——顺序表是「一个池子加一个偏好」，不是单向链表。
+- **一旦字节上了线，就不能回头。** 流中途断掉会记账并给调用方一个错误帧结束流，而不是重放：调用方已经看到了半份答案。
+- **调用方的错误不切换。** 请求本身不合参照契约时转换器直接抛，立刻回 400：换一个 provider 会用同样的方式失败，只是把 400 的延迟乘以三。
+- **不可达的行不触发任何东西。** 顺序表指向一个被删掉的供应商是配置事实，不是供应商故障：跳过，并在管理页标成未注册。
+- **上游 200 但 body 不是 JSON** → 503 参照契约错误体，而不是把垃圾透传出去。
+
+### 配置、密钥与迁移
+
+- 自己的文档：`$DSH_HOME/router-service.json`（0600）。**读取修复、写入拒绝**——一个手写坏的端口不该让服务起不来，
+  而从页面保存是一次决定，静默改写它会让输入框和文件互相不一致。
+- **首次运行从插件的旧设置里搬顺序表**，并预置两条 MaaS 路由的地址；**不预置任何密钥**，密钥必须由人在页面上填。
+- **服务不读 DSH 的凭据库**：`MAAS_*` 是 DSH 的凭据引用（实体在 `~/.dsh/.credentials.yaml`），不会进入任何进程环境，
+  让服务偷偷去读那个私有文件格式，等于把「解耦」做成「隐式依赖」。密钥只以掩码回传（`sk-a…mnop`），
+  编辑时留空表示「保留原值」，所以改个标签不会顺手删掉凭据。
+- 管理面要令牌（页面自带）；`/v1/*` 不要——它只对回环开放，而它手上的凭据本来就在这台机器上。
+
+### 生命周期与已知边界
+
+- **随 DSH 退出而停**（插件 fork、不 detach）。这是为「零手工步骤」付的代价：DSH 一停，本机其他 agent 也就没有可用的路由面了。
+  想让它活过 DSH 重启就用 `systemd-run --user --unit=<name> node lib/service/main.js`——本机 `dsh-remote-gateway` 就是这么做的，
+  服务本身不关心是谁拉起它。插件发现端口上已经有服务在跑时会**接入**，不会再拉一个（重复绑定会表现成「服务挂了」，是最坏的诊断）。
+- **证书链**：网关走 HTTPS，Node 的 `fetch` 用系统证书；本机实测可直连。
+- **`--check` 模式**：`node lib/service/main.js --check` 只加载配置并打印摘要（供应商、顺序表行数、转换器加载情况、端口），
+  不绑定端口，用来在启动前判断配置是否可加载。
+
+### 自检
+
+`npm run check:service` —— 128 项，用**桩上游 + 真服务 + 真 socket**，离线、零 token：
+入参/出参映射、熔断与切换、同路由重试、上游坏响应、管理面鉴权、配置校验与迁移（含坏端口/坏行/冷却上限倒挂的修复）、
+转换器注册表（重复 id、非法 id、匹配抛异常视为不匹配）、SSE 行解析、以及**插件真的能 fork 起来、接入、转达、并随 disposer 停掉**。
+
+另有 `npm run check:live` —— 对**真实网关**的端到端实测（23 项，需要网络、需要在凭据库里配好 `MAAS_DSV4_API_KEY` 与 `MAAS_COCLAW_API_KEY`，会花真实 token；缺凭据时它**拒绝运行**而不是静默跳过，因为它证明的东西不能靠跳过得到）：
+上面「实测」一列的每个值都出自那一次；当时覆盖：两种思考写法、`co-claw` 与 `deepseek-v4-flash` 两条路由、
+流式与非流式、`response_format` 闸门、`/v1/models`、上游不可达时的切换、阈值以下不熔断/到阈值熔断、以及两条路由的连通性探测（857ms / 1202ms）。
+
 ## 设置页
 
 设置页按功能模块分成 **6 个页签**：**优化提示词 / 旁路提问 / 标题 / 压缩 / 通知 / 路由**。切换形态与 shell 自己的插件页一致（同一条下划线导轨、同一个 13px 标签与 2px 激活条、同一套焦点环），`←` `→` 与 `Home`/`End` 可在页签间走。切走的页签**保持挂载**，所以写在提示词框里的草稿不会因为切页签丢掉。
@@ -497,7 +614,7 @@ thresholdRatio = 你要的 token 数 ÷ 该模型窗口大小
 | 标题 | 标题长度上限 | 插件写出的标题最长多少**字符**（默认 **24**，可填 4–120），超出以 `...` 结尾。只作用于插件写的那条标题。 |
 | 压缩 | 上下文压缩阈值 | 按模型填**固定 token 数**（存进 `compactionTokens`）；另有「保存阈值 / 写入 DSH 配置 / 刷新模型与窗口」三个动作和等效补丁片段。见「上下文压缩阈值」一节。 |
 | 通知 | 任务完成时发桌面通知 / 摘要模型 / 压缩正文的思考强度 / 摘要最多显示字符数 | 默认开启（默认正文 120 字符）。任务结束时按平台弹系统通知（标题=会话标题，正文=**模型把本轮回答压成的一句话**，思考强度默认 `off` 可改），压不进上限再压一次、仍超才以 `...` 结尾；摘不出来时说明「摘要不可用」而不退回原文；另有本机派发方式与测试按钮。见「任务完成通知」一节。 |
-| 路由 | 供应商熔断时自动切换 / 故障切换顺序 / 切换前重试次数 / 触发熔断的失败次数 / 统计窗口 / 熔断时长 / 熔断时长递增倍数 / 熔断时长上限 / 恢复方式 / 每个步骤最多切换次数 / 路由日志级别 / 实时熔断状态 | 12 项；任何失败重试 n 次后按顺序表切换供应商，冷却时长按连续熔断次数递增，冷却后按所选方式恢复。顺序表是本地编辑 + 一次落盘（上移/下移/删除/添加都不写盘），实时状态只读、每 4 秒轮询一次，另有每行一个「测试」与一个「清空熔断状态」。见「供应商熔断与顺序切换」一节。 |
+| 路由 | 服务地址与存活 / 顺序表（只读）/ 熔断参数（只读）/ 转换器 / 供应商与密钥（掩码）/ 实时熔断状态 / 最近事件 / 统计 / 跳转服务页面 | **只读**。配置与熔断状态都在独立服务里，这个页签只显示服务此刻的样子，并提供跳转到服务自身页面的入口——两处都能改同一份配置就会漂移，而漂移的正是「线上炸了才去看」的那几个参数。实时状态每 4 秒轮询一次（页签可见时），每行一个「测试」，另有一个「清空熔断状态」。见「路由服务与 maas 转换器」一节。 |
 
 页签**之外**（任何页签下都看得到）：配置文件路径、旁路历史文件路径（宿主上报时）、保存结果与错误提示。
 
@@ -554,13 +671,13 @@ thresholdRatio = 你要的 token 数 ÷ 该模型窗口大小
   │      └─ ctx.commandUi.register('/btw')（拿不到就静默跳过，不影响其它座位）
   ├─ conversation.input.overlay → 不可见的完成通知座位（useChat 取本轮摘要）
   │      └─ remote.$on('api-session/status') 订阅 running→idle → POST /notify
-  └─ settings.section           → 设置页
+  └─ settings.section           → 设置页（「路由」页签只读：状态 + 跳转服务页面）
         │  POST /dsh-prompt-optimizer/{state,save,optimize,optimize.stream}
         │  POST /dsh-prompt-optimizer/{btw,btw.stream,btw.history,btw.save,btw.clear}
         │  POST /dsh-prompt-optimizer/{compaction.windows,compaction.apply,notify,notify.test}
-        │  POST /dsh-prompt-optimizer/{router.state,router.reset,router.probe}（实时状态 / 清空 / 测试连通）
+        │  POST /dsh-prompt-optimizer/{router.state,router.reset,router.probe}（转达给服务）
         ▼
-宿主（lib/index.js → lib/routes.js + lib/routing.js）
+宿主（lib/index.js → lib/routes.js）
   ├─ 回环信任围栏（socket + Host + sec-fetch-site + Origin）
   ├─ 模型目录缓存 / 思考强度元数据缓存 / 上下文窗口缓存
   ├─ 失败阶梯 + 首字看门狗 + 整体超时（改写 45s/120s，旁路 25s/60s）
@@ -569,14 +686,21 @@ thresholdRatio = 你要的 token 数 ÷ 该模型窗口大小
   ├─ 桌面通知派发（lib/notify.js：notify-send / PowerShell toast / WSL→Windows）
   ├─ 通知正文压缩（lib/notify-summary.js 提示词与清洗 → askNotifySummary，固定 `off`）
   ├─ 会话标题重总结（lib/title.js：监听 session/event → 到轮数 → askTitleModel → append session/title）
-  ├─ 熔断状态机（lib/router.js，纯逻辑、零 import）+ 事件 wiring（lib/routing.js）
-  │      ├─ ctx.on('agent/request-error', …, {prepend:true}) → 数重试 / 记熔断 + {kind:'retry'}（重试或切换）
-  │      ├─ ctx.on('agent/request', …)                       → 改写这次调用的 provider/model
-  │      └─ ctx.on('session/event', …)                       → 已提交的 assistant 消息 = 探测成功，关闭熔断
-  └─ ctx.llm.stream(...)  → SSE（delta / done / failed）
+  └─ lib/service-client.js → fork 路由服务（没在跑才拉；已在跑就接入）/ 转达三个管理动作
+        │
+        │  HTTP 127.0.0.1:8790
+        ▼
+路由服务（lib/service/，独立进程，随 DSH 退出）
+  ├─ server.js     /v1/*（OpenAI 兼容，免鉴权）· /admin/api/*（令牌）· /（自带管理页）
+  ├─ proxy.js      选路 → 重试 → 熔断记账 → 失败切换（字节上线后不再回头）
+  ├─ upstream.js   JSON + SSE、分相超时、读 retry-after
+  ├─ config.js     $DSH_HOME/router-service.json（读取修复、写入拒绝、原子写）
+  ├─ router.js     熔断状态机（纯逻辑、零 import、可注入时钟）
+  ├─ ui.js         服务自带的管理页（零依赖）
+  └─ converters/   registry.js（注册接口）+ maas.js（把 MaaS 对齐到 api.deepseek.com 契约）
 ```
 
-浏览器半区不 import 任何 `@deepseek-ai/*` 包（只用部署注入的 `react`），因此预发布 harness 上不会出现 peer 范围冲突。
+浏览器半区不 import 任何 `@deepseek-ai/*` 包浏览器半区不 import 任何 `@deepseek-ai/*` 包（只用部署注入的 `react`），因此预发布 harness 上不会出现 peer 范围冲突。
 
 | 文件 | 作用 |
 | --- | --- |
@@ -587,8 +711,18 @@ thresholdRatio = 你要的 token 数 ÷ 该模型窗口大小
 | `lib/notify.js` | 桌面通知：平台判定（含 WSL）、标题/正文折叠与 **`...` 缩写**、命令构造（argv / `-EncodedCommand`）、**Windows AppUserModelID 自举与回报**、有界派发 |
 | `lib/notify-summary.js` | 通知正文压缩的纯函数半边：两段系统提示词（按当前上限生成 / 更紧的重试）、输入组帧（头尾截取）、回答清洗（标签、引号、列表符号、多行）、上限判定与兜底裁剪 |
 | `lib/title.js` | 会话标题：消息筛选与窗口、上限裁剪、提示词与输入组帧，以及**每 N 条重总结**的监视器（计数器、并发、用户改名钉住、失败保留、卸载中止） |
-| `lib/router.js` | 熔断状态机与候选选择：纯逻辑、零 import、可注入时钟（`normalizeRouterConfig` / `retryWaitMs` / `createRouter`，含按连续熔断次数递增的冷却） |
-| `lib/routing.js` | 熔断 wiring：读设置（1s 缓存 + 保存即刷新）、三个事件钩子、实时快照、切换日志、累计统计、测试连通、清空 |
+| `lib/service-client.js` | 插件侧的全部路由职责：fork 服务或接入已在跑的那个、等就绪行、转达探测/清空/刷新；不含任何熔断状态 |
+| `lib/service/main.js` | 服务入口：读配置、按清单加载转换器、起 HTTP、就地重载配置、报告就绪、收退出信号 |
+| `lib/service/router.js` | 熔断状态机与候选选择：纯逻辑、零 import、可注入时钟（从插件原样搬来） |
+| `lib/service/proxy.js` | 数据面：把顺序表排成这次的尝试序列，重试→熔断→切换，转换器在转发前后各改一次 |
+| `lib/service/upstream.js` | 唯一发 HTTP 的地方：JSON 与 SSE、分相超时、`retry-after` 解析、失败即返回值而非抛异常 |
+| `lib/service/server.js` | 两个面（`/v1/*` 与 `/admin/*`）与回环围栏；SSE 写帧与错误帧 |
+| `lib/service/config.js` | 服务自己的配置文档：修复读、拒绝写、原子落盘、密钥掩码、从旧设置播种 |
+| `lib/service/converters/registry.js` | 转换器注册接口与「哪个转换器认领哪条路由」的匹配 |
+| `lib/service/converters/maas.js` | ZTE MaaS → `api.deepseek.com` 契约的字典：入参翻译、出参归一、错误重写、`/v1/models` 合成 |
+| `lib/service/ui.js` | 服务自带的管理页：供应商/密钥/顺序表/熔断参数可编辑，实时熔断表与最近事件可看 |
+| `scripts/check-service.mjs` | 服务自检：桩上游 + 真服务 + 真 socket，128 项，离线零 token |
+| `scripts/check-live.mjs` | 真实网关端到端实测，23 项，需网络与凭据，**不**随 `npm run check` 跑 |
 | `lib/store.js` | 配置读写（原子写、容错读）+ 旁路历史存储（每会话分片、裁剪） |
 | `lib/http.js` | JSON 信封、有上限的 body 读取、回环信任围栏 |
 | `lib/client.js` | 浏览器半区：六个注册入口 + per-session 状态机 + 完成通知订阅 |
@@ -599,7 +733,8 @@ thresholdRatio = 你要的 token 数 ÷ 该模型窗口大小
 ## 自检与基准
 
 ```sh
-npm run check                 # 826 项，含宿主路由、压缩/通知/标题/路由模块与浏览器半区
+npm run check                 # 735 项，含宿主压缩/通知/标题与路由服务提取契约
+npm run check:service         # 128 项，路由服务本体（桩上游，离线）
 npm run check:shape           # 对**已安装**的 DSH 复核旁路提问的消息形状（需要本机有 DSH）
 npm run check:title           # 对**已安装**的 DSH 复核标题重总结（真会话、真投影，不调模型）
 node scripts/bench.mjs --runs 3
@@ -611,7 +746,7 @@ node scripts/bench.mjs --runs 3
 
 **改写自己的模型与强度**（宿主与浏览器两侧）：`/save` 接受 `provider` / `model`（字符串或 null）与 `reasoningEffort`（闭集），非法取值一律拒；`/state` 的 `active` 在固定后立刻改用它，`reasoning` 上报该路由自报的档位；`/optimize` 的第一跳带着固定的一对与配置的档位（`auto` 则完全不发该字段），清空后回落会话模型；浏览器半区按真实点击走一遍：默认停在「跟随当前会话」且模型下拉禁用、选供应商把 provider 与它的第一个模型一起固定、选回「跟随」把两半一起写回 null、改强度只发 `reasoningEffort` 一个键，以及通知页签的强度行只发 `notifyReasoningEffort`；词典键双向一致、页签行标签并集恰好 31 项。
 
-**熔断与路由**（独立一层）：`lib/router.js` 用注入的时钟确定性地走完 closed → open → half-open → closed 的全部转移（阈值与窗口的裁剪、冷却到期、探测槽、探测超时释放、探测失败重新熔断、`immediate` 模式、环形顺序表、全候选熔断时回 null、`switchBudget` 的 0 = 自动语义、**按连续熔断次数递增的冷却与成功归零**、**`retryWaitMs` 的 0.5s 翻倍 / 听 retry-after / 超 5s 判「别重试了」**，以及「手改坏的文件按字段修复而不是让插件启动失败」）；`lib/routing.js` 用假 ctx 驱动真实的三个钩子（假 waterfall 与 Cordis 同序：最外层先跑、不调用 `next()` 即否决），覆盖「任何失败都由路由当场接管、不调用下一位监听者」「无关错误码（SERVER/503）同样切换」「重试 n 次期间不熔断也不切换、第 n+1 次才切换、换 step 重新数」「用户中断（abort/ABORTED）不算失败」「retry-after 超过 5s 时不重试直接切换」「重跑时改写 provider/model 并丢掉目标行没声明的强度」「行里声明了强度就带着它」「可用时原样放行」「同一 turn/step 的切换预算用尽后交回宿主、换 step 重新计算」「已提交的 assistant 消息才关闭熔断（其它会话事件不算）」「关掉总开关后三个钩子都不动状态」「顺序表为空只记录不切换」「测试连通成功/失败/抛异常三条路径」+「探测要求关闭思考、路由不支持 off 时退用它能接受的档位并把降级写在结果里、**适配器拒绝显式强度时自动去掉该字段重试一次且被拒的那次不记成供应商故障**；`complete()` 也复现同一路径（拒绝显式强度的适配器照样能答完旁路提问，且只降级一次、再失败就如实报错）、只有推理仍算连通、完全为空才算不通」「reset 与 dispose（含重复 dispose）」；路由层的每个字段都有正反两向：`/state` 带上配置 + 实时状态 + 边界，`/save` 接受合法值并把改动立刻应用到运行中的状态机，越界的重试次数/递增倍数/熔断时长/窗口/切换上限/未知枚举一律拒（退役的错误码与状态码字段不再受理）；`/router.state`、`/router.reset`、`/router.probe` 在没有运行时明说 `unavailable`、并且只接受顺序表里已有的行；浏览器半区再按真实点击走一遍「路由」页签：总开关只发一个键、顺序表的增删改与上移下移只改本地草稿、保存发出屏幕上的那份数组、三个新增判定旋钮（重试次数 / 递增倍数 / 上限）的提交与越界拒绝、退役的错误码/状态码输入框确实不在页面上、实时状态徽标与统计、连续熔断次数与下一次冷却的展示、测试按钮发的是这一行的路由、清空按钮用回传状态重画、以及宿主没挂载路由运行时时页面说明原因而不是显示空表；最后是**供应商被删掉以后**：顺序表里那一行仍选中它自己并标「未注册」（不再回落到第一个选项）、模型列显示存储的模型、注册过的行不受影响、「移除未注册的行」只改草稿且改完置灰、「旁路提问」的选择器同样如实显示、实时区里未注册的行标注原因且测试按钮置灰。
+**熔断与路由的状态机**（独立一层）：`lib/service/router.js` 用注入的时钟确定性地走完 closed → open → half-open → closed 的全部转移（阈值与窗口的裁剪、冷却到期、探测槽、探测超时释放、探测失败重新熔断、`immediate` 模式、环形顺序表、全候选熔断时回 null、`switchBudget` 的 0 = 自动语义、**按连续熔断次数递增的冷却与成功归零**、**`retryWaitMs` 的 0.5s 翻倍 / 听 retry-after / 超 5s 判「别重试了」**，以及「手改坏的文件按字段修复而不是让插件启动失败」）。**熔断与切换的行为**移到 `scripts/check-service.mjs`，用桩上游 + 真服务 + 真 socket 覆盖：同一条路由先重试、用完才切换、阈值以下只记账到阈值才熔断、已熔断的行被跳过、上游 200 但 body 不是 JSON 判 503、流式逐片归一并以 `[DONE]` 收尾、末尾片带 `usage`；管理面必须有令牌（无令牌/错令牌 401）、配置校验拒绝越界端口/缺 baseURL/缺 model、指向未注册供应商的行被接受但标 `registered:false`、留空密钥不抹掉已存密钥、密钥只以掩码回传；转换器注册表拒绝重复 id 与非法 id、匹配抛异常视为不匹配、六项缺省全是原样透传；配置修复覆盖坏端口/坏行丢弃/冷却上限倒挂；SSE 行三种含义与 `retry-after` 的秒/毫秒两种写法；最后是**插件真的能把它拉起来**：fork → 等就绪行 → `view()` 拿到服务状态 → 转达探测与 reset → 第二个客户端改为接入而不是再拉一个 → disposer 里停掉自己拉起的那个、接入方停不掉别人的。**插件侧只被验证「不再有钩子、也不再自己算路由」**：宿主半区不含 `agent/request` / `agent/request-error`，不含 `createRouter`/`createRouting`，`lib/router.js` 与 `lib/routing.js` 不在插件主体里，`/save` 丢掉路由字段而不报错，`/router.state|reset|probe` 在服务不可达时回 `unavailable`（带服务给的原话）而不是假装成功。
 
 **历史窗口**（浏览器半区里的独立一组）：用一个假会话面（`loadOlder()` 把 fixture 页前插进面板读的那个数组，`getSnapshot()` 像真实现一样缓存引用）驱动真实的 `ensureFullHistory`：一路拉回最早一页 → `complete`；页请求不前进 → 一次就停并报 `partial`；没有 `sessions` 服务 → `unavailable`；座位挂载即触发；提问时读的是补齐后的窗口。
 
@@ -623,7 +758,7 @@ node scripts/bench.mjs --runs 3
 - **为了「整个会话」真实成立，插件会替你把历史分页补齐**：DSH 打开会话时只装载最新一页事件（≥50、≤500 条），更早的只在滚动到顶部时拉取。插件的会话座位一挂载就沿会话面自己的 `loadOlder()` 往回走（上限 40 页 / 30 秒），所以进入历史会话后稍等片刻，整段历史就都在位了——**不依赖你滚动**。代价是长会话会把整段历史装进浏览器内存（这也是宿主默认分页的原因）；不想要这份代价时，把设置里的「携带上下文」改成「不带上下文」，插件就不会去拉历史。上限内没走完的极端情况会在面板上如实写成「更早的历史未载完」，不会假装。
 - **改写长度仍会波动**：默认提示词要求「长度与任务相称」，实测 35 字草稿得到 640–963 字（要求 600 字以内）。这是提示词约束力的上限，不是硬截断——硬截断会切坏答案。
 - **`maxTokens` 是按字符数估的**：极长的草稿会落在 8192 上限，可能截断后再走第 2 档重试。
-- **路由只服务回环地址**，且不做速率限制：本机任意页面若拿到同源能力，可以消耗你的模型额度。
+- **路由服务只监听回环地址**，且 `/v1/*` 不做鉴权与速率限制：本机任意进程（以及能对 `127.0.0.1` 发请求的页面，只要它不需要读回响应）都可以消耗你的模型额度。`/admin/api/*` 需要令牌，所以改配置与读掩码凭据不在此列。
 - 本仓库**没有自动化视觉验证**：自检覆盖渲染路径与点击链路，但不含真实浏览器截图。旁路提问浮层在真实 GUI 里手动验证过（按钮、浮层、流式答案与光标、追问带全部轮次、写入输入框、历史列表）。
 - **追问依赖 DSH 的 assistant 消息契约**：手搓的多轮消息必须给 assistant 轮次带 `source`，否则会在适配器分发阶段失败（自检锁住这个形状，`npm run check:shape` 直接驱动**已安装**包的 `LlmRuntime#forAdapter` 复核，含一条「不带 source 必须被拒」的反向对照）。这条契约不在插件的控制范围内，所以阶梯还留了「折成单轮」的兜底：即使形状被拒，追问也答得出来，只是面板会注明这一轮走了兜底。
 - **压缩阈值不是 DSH 的原生「绝对 token」字段**：`compaction-basic` 的触发线是「窗口 × 占比」，本插件用每个模型自己的窗口把你要的固定 token 数换算成占比（等价，但落地形式是占比）。配置写入走 profile 的 `configEditor`；**本部署没有暴露该服务时，插件不会替你写**，设置页会明说并给出等效补丁片段。写入是显式点击，不会在你保存阈值时顺手改 DSH 配置。
@@ -634,12 +769,15 @@ node scripts/bench.mjs --runs 3
 - **通知正文压缩在真实模型上实测过一次，但不是保证**：2026-10-09 重装后对 `deepseek-account/deepseek-flash` 实测——240 字正文一次压成 35 字（`attempts:1`、`truncated:false`、`reasoningEffort:'off'`），桌面正文结尾没有 `...`。自检另外用脚本化的假适配器逐条量过契约（关闭思考、上限写进提示词、超长再压一次、失败不退回原文、无原文不调模型）；但「某个真模型是否总能一次压到 120 字以内」取决于模型本身，本仓库无法替它保证。日常核对看日志：`notification shown (… summary from provider/model in K attempt(s))` 的 `K` 是实际调用次数，末尾带 `cut to fit` 说明这一次仍然切过；摘不出来时是 `notification summary failed (code): message`，桌面上看到的正文是「本轮已结束，摘要不可用」。
 - **摘不出来时不退回原文**：模型调不动、路由里没有可用模型、或整个压缩超过 20 秒时，通知照发，正文写「本轮已结束，摘要不可用」。这是刻意的取舍——回落到原文会让每一次失败都看起来像成功。
 - **通知只在真正 running → idle 时发**：会话第一次报 idle 是初始态，不算完成。首次启动/重连期间错过的跳变不会补发。
-- **熔断状态是进程内的**：只活在宿主进程内存里（不写盘、不写会话），`dsh web` 重启即清零，也不在多进程间共享。设置页的「实时熔断状态」因此是「读一次 + 每 4 秒轮询」，不是推送。
-- **同一件事只能有一个插件在做**：两个都把监听器 `prepend` 到 `agent/request-error` 的插件会互相屏蔽——最外层那个不调用 `next()`，另一个就永远跑不到。装这个功能时不要再装第二个供应商熔断插件（否则后装的会抢先处理，前装的设置页会一直显示「没有失败记录」）。
+- **熔断状态是服务进程内的**：只活在路由服务的内存里（不写盘、不写会话），服务重启即清零，也不在多进程间共享。设置页的「实时熔断状态」因此是「读一次 + 每 4 秒轮询」，不是推送。
+- **路由服务随 DSH 退出而停**：插件 fork 它、不 detach。这是为「零手工步骤」付的代价——DSH 一停，本机其他 agent 就没有可用的路由面了。想让它常驻就用 `systemd-run --user`（见「路由服务与 maas 转换器」）。
+- **同一件事只能有一个地方在做**：路由服务的切换对 DSH 是透明的，所以**不要再装第二个在 `agent/request-error` 上抢恢复权的插件**——那种插件会在服务接管之前就把失败重试/改写掉，服务的熔断表会一直显示「没有失败记录」。
 - **切换发生在重试用尽之后**：这条线路的前 n 次失败仍要付出（外加默认最多 3.5s 的重试等待）——插件不预判供应商的状态，它只保证不再反复回到同一个坑里。
 - **非故障类失败也会切换**：判定不再看错误码，所以上下文超限/请求非法这类「换条线也一样」的错误同样会走完重试→切换，由每步的切换预算兜住。
-- **「测试」是真的调一次模型**：只发一个 `ping`（`maxTokens: 512`，并**要求关闭思考**；路由不接受 `off` 时退用它能接受的档位并说明），但确实消耗额度；失败会按熔断规则计入，**只有推理、没有正文不算失败**（详见「『测试』曾经把一条好线路判成不通」）。
-- **路由不匹配错误文本**：只看「失败对象是否存在」，结构化字段（`code`/`status`）只用于显示。供应商改措辞不影响行为；代价是**任何**失败都会走到重试与切换。
+- **「测试」是真的调一次模型**：只发一个 `ping`（`max_tokens: 512`，并**要求关闭思考**：`reasoning_effort: "none"`），但确实消耗额度；失败会按熔断规则计入，**只有推理、没有正文不算失败**（详见「『测试』曾经把一条好线路判成不通」）。
+- **路由不匹配错误文本**：只看「这次调用成功没有」，上游给的状态码与消息只用于显示与错误体。供应商改措辞不影响行为；代价是**任何**失败都会走到重试与切换。
+- **转换器可能比上游更严**：`maas` 转换器会强制参照契约对 `response_format: json_object` 的前置条件（提示词里要有 "json"），所以一个在网关直连下能跑、在服务后面却 400 的请求是**设计如此**，不是 bug。
+- **代理不搬运无法搬运的东西**：适配器内部丢掉的字段（例如 `usage.reasoning_tokens` 在 pi-ai 里被丢弃）代理救不回来——那是调用方那一侧丢的，不是线上丢的。
 - **`probe` 模式要先探测成功才切回**：冷却到期后那条线是 half-open，只放行一个请求；要的是「时间一到就恢复」就把恢复方式改成 `immediate`。
 - **桌面通知依赖本机工具**：Linux 需要 `notify-send`（`libnotify`）且有 `DISPLAY`/`WAYLAND_DISPLAY`；Windows 依赖 `powershell.exe` 的 WinRT toast（**Windows PowerShell 5.1，Win10/Win11 自带**）**且该通知必须挂在一个注册过的 AppUserModelID 下**——插件自己往 `HKCU` 的两个键写（已注册的 id 原样不动），写不进去就按失败上报。**跨版本那一半是推断而非实测**：`Classes\AppUserModelId` 只在 Win11 26300 上量过，`PushNotifications\Backup` 是为更老的 Win10 备的保险，本机没有 Win10 可验证。工具缺失或没有桌面时不派发，并由设置页的测试按钮如实报出原因（不弹「静默成功」的假象）。
 
