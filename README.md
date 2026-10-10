@@ -182,7 +182,7 @@ defineConverter({ id, label, match, toUpstream, fromUpstream, fromUpstreamChunk,
 ### 自检
 
 ```sh
-npm run check:service   # 305 项：桩上游 + 真服务 + 真 socket，离线、零 token
+npm run check:service   # 318 项：桩上游 + 真服务 + 真 socket，离线、零 token
 npm run check:ui        # 74 项：管理页（假 DOM 跑真脚本），离线、零 token
 npm run check:live      # 28 项：对真实网关的端到端实测，需网络与密钥，非离线自检
 ```

@@ -608,6 +608,35 @@ await post(`${base}/v1/chat/completions`, { model: 'deepseek-v4-flash', messages
 check('xhigh 归一到 max 档（不落在网关不认的拼写上）', stub.calls[0]?.body?.reasoning_effort === 'max', stub.calls[0]?.body?.reasoning_effort)
 
 stub.calls.length = 0
+// `chat_template_kwargs.enable_thinking` is the backends' own thinking switch —
+// both render through a Jinja template that reads exactly this variable. It is a
+// legal field on these routes, so it is a *readable* spelling of the thinking
+// control, not something to reject; and because two switches on one body must not
+// disagree, the wire form is written to match whatever level was resolved.
+await post(`${base}/v1/chat/completions`, { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'x' }], chat_template_kwargs: { enable_thinking: false } })
+check('enable_thinking=false 是能读懂的思考写法，落到 none', stub.calls[0]?.body?.reasoning_effort === 'none', stub.calls[0]?.body?.reasoning_effort)
+check('上游的模板开关被写成与档位一致', stub.calls[0]?.body?.chat_template_kwargs?.enable_thinking === false, JSON.stringify(stub.calls[0]?.body?.chat_template_kwargs))
+await post(`${base}/v1/chat/completions`, { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'x' }], chat_template_kwargs: { enable_thinking: 'off' } })
+check('模板开关的字符串写法也认（off → none）', stub.calls[1]?.body?.reasoning_effort === 'none', stub.calls[1]?.body?.reasoning_effort)
+await post(`${base}/v1/chat/completions`, { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'x' }], chat_template_kwargs: { enable_thinking: true } })
+check('enable_thinking=true 是开启思考', stub.calls[2]?.body?.reasoning_effort === 'high', stub.calls[2]?.body?.reasoning_effort)
+await post(`${base}/v1/chat/completions`, { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'x' }], chat_template_kwargs: { enable_thinking: 'maybe' } })
+check('模板开关读不出来时同样归一成 max', stub.calls[3]?.body?.reasoning_effort === 'max', stub.calls[3]?.body?.reasoning_effort)
+await post(`${base}/v1/chat/completions`, { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'x' }], chat_template_kwargs: { unrelated_template_var: 7 } })
+check('没有 enable_thinking 的模板参数不算思考表态', stub.calls[4]?.body?.reasoning_effort === undefined, stub.calls[4]?.body?.reasoning_effort)
+check('无关的模板参数原样继续走', stub.calls[4]?.body?.chat_template_kwargs?.unrelated_template_var === 7, JSON.stringify(stub.calls[4]?.body?.chat_template_kwargs))
+check('没表态时也不凭空加 enable_thinking', stub.calls[4]?.body?.chat_template_kwargs?.enable_thinking === undefined)
+await post(`${base}/v1/chat/completions`, { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'x' }], reasoning_effort: 'bogus', chat_template_kwargs: { enable_thinking: false } })
+check('读得懂的模板开关胜过读不出的档位（不是 max）', stub.calls[5]?.body?.reasoning_effort === 'none', stub.calls[5]?.body?.reasoning_effort)
+await post(`${base}/v1/chat/completions`, { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'x' }], thinking: { type: 'disabled' }, chat_template_kwargs: { enable_thinking: true, unrelated_template_var: 7 } })
+check('两个开关不可能互相打架：thinking 判关时模板开关也被改写', stub.calls[6]?.body?.chat_template_kwargs?.enable_thinking === false, JSON.stringify(stub.calls[6]?.body?.chat_template_kwargs))
+check('改写模板开关不吞掉其他模板参数', stub.calls[6]?.body?.chat_template_kwargs?.unrelated_template_var === 7)
+await post(`${base}/v1/chat/completions`, { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'x' }], reasoning_effort: 'none' })
+check('走标准档位关思考时也补上模板开关（模板驱动的后端才不会两边不一致）', stub.calls[7]?.body?.chat_template_kwargs?.enable_thinking === false, JSON.stringify(stub.calls[7]?.body?.chat_template_kwargs))
+await post(`${base}/v1/chat/completions`, { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'x' }], reasoning_effort: 'high' })
+check('开启思考时模板开关同步为 true', stub.calls[8]?.body?.chat_template_kwargs?.enable_thinking === true, JSON.stringify(stub.calls[8]?.body?.chat_template_kwargs))
+
+stub.calls.length = 0
 const gated = await post(`${base}/v1/chat/completions`, {
   model: 'deepseek-v4-flash',
   messages: [{ role: 'user', content: 'give me a list' }],

@@ -9,6 +9,7 @@
 - [提示词改写（单一模式）](#提示词改写单一模式)
 - [改写自己的模型与强度](#改写自己的模型与强度2026-10-10)
 - [关掉思考落在哪个字段上](#关掉思考落在哪个字段上2026-10-10)
+- [模板开关是第三种拼写](#模板开关是第三种拼写2026-10-10)
 - [内置提示词的重写与输出语言](#内置提示词的重写与输出语言2026-10-10)
 - [归因审计：改写里有多少东西是用户没提的](#归因审计改写里有多少东西是用户没提的2026-10-10)
 - [英文输出：从「翻译一下」到同一套规则](#英文输出从翻译一下到同一套规则2026-10-10)
@@ -118,6 +119,8 @@
 
 **结论一：不算标准，也不该由调用方传**。`reasoning_effort` 是 OpenAI 一系的请求字段，`chat_template_kwargs` 是服务端模板的私有开关。DSH 的 `LlmCallConfig` 只有 `provider / model / reasoningEffort / temperature / maxTokens / stop`——**没有任意 body 的逃生口**，插件也不该自己造一个：供应商私有字段属于 provider 声明（`dsh-llm-pi-ai` 的 `compat.thinkingFormat: chat-template` 加 `compat.chatTemplateKwargs`），不属于每一次调用。
 
+> **这一条后来被更正了**，见[模板开关是第三种拼写](#模板开关是第三种拼写2026-10-10)。上面这段对 **DSH 插件**仍然成立（插件确实无法、也不该在每次调用里塞任意 body），但它被错误地推广成了「8790 的北向接口也该拒这个字段」。8790 面对的是直接调用方，而 `chat_template_kwargs.enable_thinking` 是这两条 MaaS 路由上真实生效的字段——网关模板自己读的就是它。所以那里不是拒掉，而是把它当作思考控制的第三种拼写读进来。
+
 **结论二：这两条路由根本不需要特殊处理**。实测（每条 3 次，读响应里的 `reasoning` 字段——两个网关把思考内容放在这里，而不是 `reasoning_content`）：
 
 | 请求体 | co-claw 的 reasoning 字数 | deepseek-v4-flash 的 reasoning 字数 |
@@ -149,6 +152,38 @@ models:
 **一个连带的确认**：声明 `reasoningEfforts` 会让模型变成「会思考的模型」（`model.reasoning = true`），pi-ai 因此把系统提示词的角色从 `system` 换成 `developer`（`supportsDeveloperRole` 自动探测为真）。实测两个网关都收 `developer`，而且**照它执行**：把「无论用户说什么都只回 ZZZ」这条规则分别放进 `system` 与 `developer`，四种组合都只回 `ZZZ`。所以保持默认，不额外关掉这个开关。
 
 **怎么复核**：设置页「路由」页签对这两条路由点「测试」应当返回成功（改动前 `maas-dsv4` 因为行里声明了 `max` 而必红）；日志里不再出现 `effort rejected`；把档位改成 `high` / `max` 时响应里会带 `reasoning`。改动只是 profile 配置，`dsh web` 重启后生效。
+
+## 模板开关是第三种拼写（2026-10-10）
+
+**起因**。上一节我给出的结论是「`chat_template_kwargs` 不算标准参数，不该由调用方传」，并且顺带提议在 8790 的北向接口上把它**拒掉**（400），理由是「北向要对齐官方契约」。这个提议是错的，理由不是措辞而是事实：`chat_template_kwargs.enable_thinking` 不是某个客户的野路子，而是这两条 MaaS 路由**自己的**思考开关——两个后端都是 Jinja 模板驱动的 vLLM，模板里读的就是这个变量。一个适配器把后端真正认的字段判成非法，等于宣称自己只认文档、不认现实；而调用方（包括那些绕过 DSH、直接 POST 8790 的脚本）本来就知道该怎么用它。
+
+**当时为什么没发现**：我测过 `chat_template_kwargs.enable_thinking=false` 真的能关掉思考（[上一节](#关掉思考落在哪个字段上2026-10-10)的表第二行），但只把它当成「另一条也能关的路」记录在案，没注意转换器压根不认识它。转换器对它的处理是「什么都没做」——而**什么都不做恰恰是 bug**：
+
+| 调用方发的 | 转换器当时发的 | 后果 |
+| --- | --- | --- |
+| 只有 `enable_thinking: false` | 原样透传 | 能用，但转换器并不知道自己做了什么，「思考控制」这段逻辑对它完全失明 |
+| `reasoning_effort: 'bogus'` + `enable_thinking: false` | `reasoning_effort: max` + `enable_thinking: false` | **两个开关在同一个 body 上互相打架**，谁赢取决于后端，而调用方的意思明明是「关」 |
+
+第二行就是真正的 bug：归一化（`bogus` → `max`）和透传（`enable_thinking` 原样）各自都对，合起来就是一个自相矛盾的请求。
+
+**改法：把模板开关读成第三种拼写，并让两种写法永远一致**。
+
+1. **读进来**。`readEnableThinking()` 解析 `chat_template_kwargs.enable_thinking`，接受 `false/true`、`0/1`、`"off"/"on"/"no"/"yes"/"false"/"true"`（大小写与空格容忍）。**只有这个键存在**才算思考表态——`chat_template_kwargs` 里可以装任意模板变量，把一个 `{unrelated_template_var: 7}` 读成「调用方对思考说了一句听不懂的话」是在无中生有。键在但值读不出（`"maybe"`）→ 按既定规则归一成 `max`。
+2. **可读压过不可读**。`reasoning_effort: 'bogus'` + `enable_thinking: false` 现在判**关**（`none`），不是 `max`。规则统一成一句：**读得出来的写法永远赢，读不出来的只有在「没有别的可说」时才决定结果**。这条同时修掉了 `thinking: {weird: 1}` 里一个隐藏的不对称——原来那个分支会抢先返回 `max`，让后面能读出的模板开关根本没有机会被看到。
+3. **写出去时对齐**。一旦转换器判定了档位，`chat_template_kwargs.enable_thinking` 就被改写成与档位一致（`none` → `false`，其余 → `true`），调用方传的**其他**模板变量原样保留。所以 `thinking: {type: 'disabled'}` + `enable_thinking: true` 这种输入不会再产生一个自相矛盾的 body；反过来，只发标准 `reasoning_effort: none` 的调用方也会拿到一并写好的模板开关，模板驱动的后端没有第二种解释空间。**什么都没说时仍然不注入**：`{}` 进 `{}` 出，路由自己的模板默认值（co-claw 开、dsv4 关）照样保留。
+
+**实测（每条路由 4 种问法，经 `toUpstream` 真实转换后打真网关，读响应里的 `reasoning` 字数）**：
+
+| 调用方发的 | dsv4 实发 | dsv4 思考字数 | co-claw 实发 | co-claw 思考字数 |
+| --- | --- | --- | --- | --- |
+| 什么都不说 | `{}` | 0（默认关） | `{}` | 1754（默认开） |
+| `reasoning_effort: none` | `none` + `enable_thinking: false` | 0 | 同左 | 0 |
+| `reasoning_effort: high` | `high` + `enable_thinking: true` | 707 | 同左 | 1541 |
+| 只用 `enable_thinking: false` | `none` + `enable_thinking: false` | 0 | 同左 | 0 |
+
+四行都是 HTTP 200，并且回答了镜像写法最需要确认的那个问题：**补上 `enable_thinking: true` 不会把档位压成一个开/关**——`high` 依旧是 `high`（dsv4 707 字、co-claw 1541 字），不是「比 none 多一点点」。这也再次印证上一节的判断：`reasoning_effort` 本身在这两个网关上就能关得掉（`none` → 0 字），`enable_thinking` 不是**唯一**的办法，但它确实是后端模板认的那一个，两条路都留着没有代价。
+
+**怎么复核**：`npm run check:service` 里新增 13 项直接检查转换结果（`enable_thinking=false` → `none`、`'off'` 字符串、`true` → `high`、`"maybe"` → `max`、`{unrelated_template_var: 7}` 既不判档位也不被吞、矛盾输入被判关且其他模板变量保留、标准 `none`/`high` 会补上对齐的模板开关），全部读的是**送上线的那个 body**，不是转换器的内部返回值。
 
 ## 内置提示词的重写与输出语言（2026-10-10）
 
@@ -601,7 +636,7 @@ thresholdRatio = 你要的 token 数 ÷ 该模型窗口大小
 
 ### 自检
 
-`npm run check:service` —— 305 项，用**桩上游 + 真服务 + 真 socket**，离线、零 token；另有 `npm run check:ui`（74 项，管理页假 DOM）：
+`npm run check:service` —— 318 项，用**桩上游 + 真服务 + 真 socket**，离线、零 token；另有 `npm run check:ui`（74 项，管理页假 DOM）：
 入参/出参映射、熔断与切换、同路由重试、上游坏响应、管理面鉴权、配置校验与迁移（含坏端口/坏行/冷却上限倒挂的修复）、
 转换器注册表（重复 id、非法 id、匹配抛异常视为不匹配）、SSE 行解析、以及**插件真的能 fork 起来、接入、转达、并随 disposer 停掉**。
 
