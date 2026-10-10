@@ -797,6 +797,32 @@ check('已知 role（system）不受影响、原样透传', plainSent.status ===
   JSON.stringify(stub.calls[0]?.body?.messages))
 await configure({ order: DEFAULT_ORDER, router: { retries: 0, failureThreshold: 2 } })
 
+/* ───────────────────────── 5f. 透传路由的 model 名归一 ───────────────────────── */
+
+section('5f. 透传路由不把 provider 前缀的 model 名原样发出去')
+
+// DSH 以北向全名（`provider/model`）点名，例如 `deepseek-official/deepseek-flash`。
+// 无转换器的透传路由若原样转发，官方契约会因 model 名带 `provider/` 前缀而 400。
+// 这里验证透传路由把 wire model 归一成该行（candidate）的 model。
+await cleanSlate()
+await configure({ order: [{ provider: 'p-switch', model: 'm-switch' }], router: { retries: 0, failureThreshold: 2 } })
+stub.calls.length = 0
+const prefixed = await post(`${base}/v1/chat/completions`, {
+  model: 'p-switch/m-switch',
+  messages: [{ role: 'user', content: 'hi' }],
+})
+check('带 provider 前缀 model 的透传请求仍返回 200', prefixed.status === 200, `${prefixed.status} ${prefixed.text.slice(0, 160)}`)
+check('打到上游的 wire model 是该行的 model，而不是前缀全名',
+  stub.calls[0]?.body?.model === 'm-switch', JSON.stringify(stub.calls[0]?.body?.model))
+stub.calls.length = 0
+const bareModelSent = await post(`${base}/v1/chat/completions`, {
+  model: 'm-switch',
+  messages: [{ role: 'user', content: 'hi' }],
+})
+check('本就裸写的 model 不受影响', bareModelSent.status === 200 && stub.calls[0]?.body?.model === 'm-switch',
+  JSON.stringify(stub.calls[0]?.body?.model))
+await configure({ order: DEFAULT_ORDER, router: { retries: 0, failureThreshold: 2 } })
+
 /* ───────────────────────── 6. multi-key config (live) ───────────────────────── */
 
 section('6. 多密钥配置语义（经管理接口）')
