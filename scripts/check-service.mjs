@@ -769,6 +769,34 @@ check('指向未注册供应商的行被接受但如实标记',
   unknown.json?.ok === true && unknown.json.value.rows[0].registered === false, JSON.stringify(unknown.json?.value?.rows?.[0]))
 await configure({ order: DEFAULT_ORDER, router: { retries: 0, failureThreshold: 2 } })
 
+/* ───────────────────────── 5e. 透传路由的消息 role 归一 ───────────────────────── */
+
+section('5e. 发往官方契约的 developer role 被归一成 system')
+
+// `p-switch` 的 baseURL 是本地 stub，不匹配 maas 转换器（那只认 ZTE host 与 maas-*
+// 名），所以它是「无转换器原样透传」的那条路——正是 `deepseek-official` 的形态。
+// DSH 的思考路由会把系统提示词以 `developer` role 发来，官方 api.deepseek.com
+// 只认 system/user/assistant/tool，不归一就会 422。这里验证这条路 emit 前被改写。
+await cleanSlate()
+await configure({ order: [{ provider: 'p-switch', model: 'm-switch' }], router: { retries: 0, failureThreshold: 2 } })
+stub.calls.length = 0
+const developerSent = await post(`${base}/v1/chat/completions`, {
+  model: 'm-switch',
+  messages: [{ role: 'developer', content: 'be terse' }, { role: 'user', content: 'hi' }],
+})
+check('带 developer 消息的透传请求仍返回 200', developerSent.status === 200, `${developerSent.status} ${developerSent.text.slice(0, 160)}`)
+check('打到上游时 developer 已被归一成 system', stub.calls[0]?.body?.messages?.[0]?.role === 'system'
+  && stub.calls[0]?.body?.messages?.[1]?.role === 'user', JSON.stringify(stub.calls[0]?.body?.messages))
+check('归一后消息内容原样保留', stub.calls[0]?.body?.messages?.[0]?.content === 'be terse', JSON.stringify(stub.calls[0]?.body?.messages?.[0]))
+stub.calls.length = 0
+const plainSent = await post(`${base}/v1/chat/completions`, {
+  model: 'm-switch',
+  messages: [{ role: 'system', content: 's' }, { role: 'user', content: 'hi' }],
+})
+check('已知 role（system）不受影响、原样透传', plainSent.status === 200 && stub.calls[0]?.body?.messages?.[0]?.role === 'system',
+  JSON.stringify(stub.calls[0]?.body?.messages))
+await configure({ order: DEFAULT_ORDER, router: { retries: 0, failureThreshold: 2 } })
+
 /* ───────────────────────── 6. multi-key config (live) ───────────────────────── */
 
 section('6. 多密钥配置语义（经管理接口）')
@@ -1404,6 +1432,40 @@ check('maas 转换器按 host 认领路由，改名也认',
   service.registry.get('maas').match({ provider: { id: 'whatever', baseURL: 'https://maas-apigateway.dt.zte.com.cn/model-cop/co-claw/v1' }, model: 'co-claw' }) === true
   && service.registry.get('maas').match({ provider: { id: 'maas-dsv4', baseURL: '' }, model: 'm' }) === true
   && service.registry.get('maas').match({ provider: { id: 'other', baseURL: 'https://api.deepseek.com/v1' }, model: 'm' }) === false)
+
+/* ───────────────────────── 16a. 参照契约的 role 归一 ───────────────────────── */
+
+section('16a. 发往上游的消息 role 归一（developer → system）')
+
+const { normalizeReferenceBody } = await import('../lib/service/proxy.js')
+check('参照契约不认识 developer：被归一成 system', (() => {
+  const out = normalizeReferenceBody({ model: 'm', messages: [{ role: 'developer', content: 'be terse' }, { role: 'user', content: 'hi' }] })
+  return out.messages[0].role === 'system' && out.messages[1].role === 'user'
+})())
+check('已知 role 一律不动', (() => {
+  const body = { messages: [{ role: 'system', content: 's' }, { role: 'user', content: 'u' }, { role: 'assistant', content: 'a' }, { role: 'tool', tool_call_id: 't', content: 'r' }] }
+  return normalizeReferenceBody(body) === body
+})())
+check('没有 messages 的 body 原样返回', (() => {
+  const body = { model: 'm' }
+  return normalizeReferenceBody(body) === body
+})())
+check('非对象 body 原样返回', (() => {
+  const empty = []
+  return normalizeReferenceBody(null) === null && normalizeReferenceBody(empty) === empty
+})())
+check('多个 developer 全部归一、其余字段保留', (() => {
+  const out = normalizeReferenceBody({ model: 'm', x: 1, messages: [{ role: 'developer', content: 'a' }, { role: 'developer', content: 'b' }, { role: 'user', content: 'c' }] })
+  return out.messages.every((entry) => entry.role !== 'developer')
+    && out.messages[0].role === 'system' && out.messages[0].content === 'a'
+    && out.messages[1].role === 'system'
+    && out.messages[2].role === 'user'
+    && out.x === 1 && out.model === 'm'
+})())
+check('归一不吞掉原始 body 的形状（顶层仍是对象）', (() => {
+  const out = normalizeReferenceBody({ messages: [{ role: 'developer', content: 'x' }] })
+  return typeof out === 'object' && out !== null && typeof out.messages.push === 'function'
+})())
 
 /* ───────────────────────── 17. SSE parsing ───────────────────────── */
 
