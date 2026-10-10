@@ -576,6 +576,38 @@ await post(`${base}/v1/chat/completions`, { model: 'deepseek-v4-flash', messages
 check('调用方什么都没说时不自作主张加档位', stub.calls[2]?.body?.reasoning_effort === undefined, stub.calls[2]?.body?.reasoning_effort)
 
 stub.calls.length = 0
+// An expressed-but-unreadable thinking value must never reach the gateway
+// verbatim: both gateways deserialize the field into an enum and reject the
+// whole request on an unknown word (measured 422), and on a route whose default
+// is *off* a dropped value would silently mean "do not think" instead. The
+// converter answers with the loudest level instead of forwarding or dropping it.
+const unreadable = [
+  ['reasoning_effort', { reasoning_effort: 'bogus' }, 'max', '不认识的档位归一成 max，不原样丢给网关'],
+  ['reasoning_effort', { reasoning_effort: 'ultra' }, 'max', '另一个不认识的档位同样归一成 max'],
+  ['reasoning_effort', { reasoning_effort: 3 }, 'max', '非字符串档位归一成 max'],
+  ['effort', { effort: 'nonsense' }, 'max', 'effort 拼写读不出来时归一成 max'],
+  ['thinking.type', { thinking: { type: 'whatever' } }, 'max', 'thinking 里读不出来的写法归一成 max'],
+  ['thinking.extra', { thinking: { weird: 1 } }, 'max', 'thinking 带了认不出含义的键也归一成 max'],
+  ['thinking.empty', { thinking: {} }, undefined, '空的 thinking 不算表态，不发档位'],
+  ['reasoning_effort', { reasoning_effort: null }, undefined, 'null 等同于没表态'],
+  ['reasoning_effort', { reasoning_effort: '' }, undefined, '空串等同于没表态'],
+  ['both', { effort: 'bogus', reasoning_effort: 'high' }, 'high', '能读出来的写法优先于读不出来的'],
+  ['reasoning_effort', { reasoning_effort: 'off' }, 'none', 'off 仍然是真的关（归一成 none）'],
+  ['thinking', { thinking: { type: 'disabled' }, reasoning_effort: 'bogus' }, 'none', 'thinking 胜过 reasoning_effort'],
+]
+for (let i = 0; i < unreadable.length; i += 1) {
+  const [, extra, expected, label] = unreadable[i]
+  await post(`${base}/v1/chat/completions`, { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'x' }], ...extra })
+  const got = stub.calls[i]?.body?.reasoning_effort
+  check(label, got === expected, `期望 ${JSON.stringify(expected)}，实到 ${JSON.stringify(got)}`)
+}
+// The rule is "normalize", not "rewrite everything": a level the gateway accepts
+// still travels under one of the words the converter's own level table allows.
+stub.calls.length = 0
+await post(`${base}/v1/chat/completions`, { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'x' }], reasoning_effort: 'xhigh' })
+check('xhigh 归一到 max 档（不落在网关不认的拼写上）', stub.calls[0]?.body?.reasoning_effort === 'max', stub.calls[0]?.body?.reasoning_effort)
+
+stub.calls.length = 0
 const gated = await post(`${base}/v1/chat/completions`, {
   model: 'deepseek-v4-flash',
   messages: [{ role: 'user', content: 'give me a list' }],
