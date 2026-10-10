@@ -1435,10 +1435,42 @@ const {
   createRouter,
   normalizeRouterConfig,
   retryWaitMs,
+  splitUnitKey,
   switchBudget,
+  unitKey,
 } = await import('../lib/service/router.js')
 
-section('3c. 路由：熔断状态机')
+const {
+  FAILURE_CLASSES,
+  blacklistVerdict,
+  classifyFailure,
+  isBreakerRelevant,
+  opensImmediately,
+} = await import('../lib/service/failure.js')
+
+const {
+  DEFAULT_KEY_ID,
+  MAX_KEYS_PER_PROVIDER,
+  applyConfigPatch,
+  availableModels,
+  keyUnitsOf,
+  normalizeKeys,
+  reconcileOrder,
+} = await import('../lib/service/config.js')
+
+const { buildCandidates, buildChain, parseRouteName } = await import('../lib/service/proxy.js')
+
+section('3c-1. 熔断单位：provider 与 provider#key')
+
+{
+  check('没有 key 的单位就是 provider 本身（单密钥行为不变）', unitKey('p', null) === 'p' && unitKey('p', '') === 'p')
+  check('有 key 时单位是 provider#keyId', unitKey('p', 'k1') === 'p#k1')
+  const parts = splitUnitKey('p#k1')
+  check('单位键可以拆回两半', parts.provider === 'p' && parts.keyId === 'k1'
+    && splitUnitKey('p').keyId === null)
+}
+
+section('3c-2. 熔断状态机（key 级）')
 
 {
   // A three-row ring with a 1s cooldown and a 5s counting window, on a clock the
@@ -1451,47 +1483,63 @@ section('3c. 路由：熔断状态机')
     ],
     cooldownMs: 1_000,
     windowMs: 5_000,
+    failureThreshold: 1,
   })
   let t = 1_000
   const router = createRouter(cfg, () => t)
   const failure = { code: 'RATE_LIMIT', status: 429, message: '429 Too Many Requests' }
 
   check('初始每个候选都是 closed', router.snapshot().every((row) => row.state === CLOSED))
-  check('默认阈值 1：第一次失败就熔断', router.recordFailure('a', failure, t) === OPEN)
+  check('阈值 1 时第一次失败就熔断', router.recordFailure('a', failure, t) === OPEN)
   check('熔断中的 provider 不可用', router.available('a', t) === false)
-  check('切换目标按顺序取下一个可用候选', router.selectAlternative('a', t)?.provider === 'b')
-  check('顺序表是环形的：绕过的候选在尾部仍然可选', (() => {
-    // a and b are down, so the ring from a must wrap past b to c and then to b's
-    // own successor — the point is that "before the requested row" is not dead.
-    router.recordFailure('b', failure, t)
-    return router.selectAlternative('b', t)?.provider === 'c'
-  })())
-  check('全部候选熔断时没有可切换目标', (() => {
-    router.recordFailure('c', failure, t)
-    return router.selectAlternative('a', t) === null
-  })())
 
-  t = 2_000
-  check('冷却到期后进入 half-open', router.stateOf('a', t) === HALF_OPEN)
-  check('half-open 先放行一次探测', router.available('a', t) === true)
-  router.noteSelected('a', t)
-  check('探测期间不再放行第二个请求', router.available('a', t) === false)
-  t += 1_001
-  check('探测长时间没有结果时不会把候选卡死', router.available('a', t) === true)
+  // The same provider, two credentials: one unit tripping must not take the
+  // other down. That is the whole point of the unit key.
+  const keyCfg = normalizeRouterConfig({ order: [{ provider: 'a', model: 'a1' }], cooldownMs: 1_000, failureThreshold: 1 })
+  const keyed = createRouter(keyCfg, () => t)
+  keyed.recordFailure(unitKey('a', 'k1'), failure, t)
+  check('同一 provider 的另一个 key 不受影响',
+    keyed.stateOf(unitKey('a', 'k1'), t) === OPEN
+      && keyed.stateOf(unitKey('a', 'k2'), t) === CLOSED
+      && keyed.available(unitKey('a', 'k2'), t) === true)
+  check('snapshot 按 provider × key 展开', (() => {
+    const rows = keyed.snapshot(() => [{ id: 'k1' }, { id: 'k2' }])
+    return rows.length === 2
+      && rows[0].unit === 'a#k1' && rows[0].keyId === 'k1' && rows[0].state === OPEN
+      && rows[1].unit === 'a#k2' && rows[1].state === CLOSED
+  })())
+  check('snapshot 默认给一个无 key 单位（旧调用行为不变）', keyed.snapshot().length === 1
+    && keyed.snapshot()[0].keyId === null && keyed.snapshot()[0].unit === 'a')
 
-  const probeCfg = normalizeRouterConfig({ order: [{ provider: 'a', model: 'a1' }], cooldownMs: 1_000, cooldownFactor: 1 })
+  const probeCfg = normalizeRouterConfig({ order: [{ provider: 'a', model: 'a1' }], cooldownMs: 1_000, cooldownFactor: 1, failureThreshold: 1 })
   const probeRouter = createRouter(probeCfg, () => t)
   probeRouter.recordFailure('a', failure, t)
   t += 1_000
+  check('冷却到期后进入 half-open', probeRouter.stateOf('a', t) === HALF_OPEN)
+  check('half-open 先放行一次探测', probeRouter.available('a', t) === true)
+  probeRouter.noteSelected('a', t)
+  check('探测期间不再放行第二个请求', probeRouter.available('a', t) === false)
   probeRouter.recordFailure('a', failure, t)
   check('探测失败则重新熔断一个完整冷却期', probeRouter.stateOf('a', t) === OPEN && probeRouter.snapshot()[0].openUntil === t + 1_000)
   t += 1_000
-  probeRouter.recordSuccess('a')
+  probeRouter.recordSuccess('a', t)
   check('探测成功后回到 closed 并清空计数', probeRouter.stateOf('a', t) === CLOSED
-    && probeRouter.snapshot()[0].failures === 0)
+    && probeRouter.snapshot()[0].failures === 0 && probeRouter.snapshot()[0].consecutive === 0)
+
+  check('探测长时间没有结果时不会把候选卡死', (() => {
+    const stuckCfg = normalizeRouterConfig({ order: [{ provider: 'a', model: 'a1' }], cooldownMs: 1_000, failureThreshold: 1 })
+    let st = 0
+    const stuck = createRouter(stuckCfg, () => st)
+    stuck.recordFailure('a', failure, st)
+    st += 1_000
+    stuck.available('a', st)
+    stuck.noteSelected('a', st)
+    st += 1_001
+    return stuck.available('a', st) === true
+  })())
 
   // recoveryMode immediate: the clock alone is the proof.
-  const immediateCfg = normalizeRouterConfig({ order: [{ provider: 'a', model: 'a1' }], cooldownMs: 500, recoveryMode: 'immediate' })
+  const immediateCfg = normalizeRouterConfig({ order: [{ provider: 'a', model: 'a1' }], cooldownMs: 500, recoveryMode: 'immediate', failureThreshold: 1 })
   let it = 0
   const immediate = createRouter(immediateCfg, () => it)
   immediate.recordFailure('a', failure, it)
@@ -1500,54 +1548,130 @@ section('3c. 路由：熔断状态机')
   check('immediate 模式冷却一到就直接 closed（不经过探测）', immediate.stateOf('a', it) === CLOSED && immediate.available('a', it) === true)
 }
 
+section('3c-3. 双阈值：连续次数 或 失败率×最小样本')
+
 {
-  // Threshold + window: N failures inside the window open the breaker, and
-  // failures that fall out of the window stop counting.
+  // Consecutive failures: the signal that works when a route is used rarely.
   const cfg = normalizeRouterConfig({ order: [{ provider: 'a', model: 'a1' }], failureThreshold: 3, windowMs: 1_000 })
   let t = 0
   const router = createRouter(cfg, () => t)
-  const failure = { code: 'RATE_LIMIT' }
+  const failure = { code: 'SERVER', status: 500 }
   check('阈值 3 时前两次失败仍保持 closed', router.recordFailure('a', failure, t) === CLOSED
     && router.recordFailure('a', failure, (t += 10)) === CLOSED)
   check('第三次落入窗口内即熔断', router.recordFailure('a', failure, (t += 10)) === OPEN)
-  const slot = normalizeRouterConfig({ order: [{ provider: 'a', model: 'a1' }], failureThreshold: 2, windowMs: 1_000 })
-  let wt = 0
-  const windowed = createRouter(slot, () => wt)
-  windowed.recordFailure('a', failure, wt)
-  check('窗口外的失败不再计数', windowed.recordFailure('a', failure, (wt += 2_000)) === CLOSED)
-  check('窗口内紧邻的失败仍然计数', windowed.recordFailure('a', failure, (wt += 10)) === OPEN)
+
+  check('窗口外的失败不再计数', (() => {
+    const slot = normalizeRouterConfig({ order: [{ provider: 'a', model: 'a1' }], failureThreshold: 2, windowMs: 1_000 })
+    let wt = 0
+    const windowed = createRouter(slot, () => wt)
+    windowed.recordFailure('a', failure, wt)
+    return windowed.recordFailure('a', failure, (wt += 2_000)) === CLOSED
+      && windowed.recordFailure('a', failure, (wt += 10)) === OPEN
+  })())
+
+  // The rate path: a route that fails half the time and succeeds in between is
+  // forgiven by consecutive counting and caught here — but only once there are
+  // enough outcomes for a ratio to mean anything.
+  check('失败率路径：样本不足时不因比例熔断', (() => {
+    const rateCfg = normalizeRouterConfig({
+      order: [{ provider: 'a', model: 'a1' }],
+      failureThreshold: 99,
+      failureRateThreshold: 0.5,
+      minSamples: 4,
+      windowMs: 60_000,
+    })
+    let rt = 0
+    const rate = createRouter(rateCfg, () => rt)
+    rate.recordFailure('a', failure, rt)
+    rate.recordSuccess('a', rt)
+    rate.recordFailure('a', failure, rt)
+    return rate.stateOf('a', rt) === CLOSED
+  })())
+  check('失败率路径：样本够了就按比例熔断', (() => {
+    const rateCfg = normalizeRouterConfig({
+      order: [{ provider: 'a', model: 'a1' }],
+      failureThreshold: 99,
+      failureRateThreshold: 0.5,
+      minSamples: 4,
+      windowMs: 60_000,
+    })
+    let rt = 0
+    const rate = createRouter(rateCfg, () => rt)
+    rate.recordFailure('a', failure, rt)
+    rate.recordSuccess('a', rt)
+    rate.recordFailure('a', failure, (rt += 1))
+    const open = rate.recordFailure('a', failure, (rt += 1))
+    return open === OPEN && rate.snapshot()[0].samples === 4
+  })())
+  check('成功会把连续失败清零（但保留在窗口样本里）', (() => {
+    const c = normalizeRouterConfig({ order: [{ provider: 'a', model: 'a1' }], failureThreshold: 2, windowMs: 60_000 })
+    let ct = 0
+    const r = createRouter(c, () => ct)
+    r.recordFailure('a', failure, ct)
+    r.recordSuccess('a', ct)
+    return r.recordFailure('a', failure, ct) === CLOSED && r.snapshot()[0].samples === 3
+  })())
+  check('窗口样本数受 windowSize 限制', (() => {
+    const c = normalizeRouterConfig({ order: [{ provider: 'a', model: 'a1' }], failureThreshold: 99, windowSize: 3, windowMs: 60_000 })
+    let ct = 0
+    const r = createRouter(c, () => ct)
+    for (let i = 0; i < 10; i += 1) r.recordSuccess('a', ct)
+    return r.snapshot()[0].samples === 3
+  })())
 }
 
+section('3c-4. half-open 需要连续 N 次成功')
+
 {
-  // Repeated trips widen the cooldown; one success resets the count.
+  const cfg = normalizeRouterConfig({
+    order: [{ provider: 'a', model: 'a1' }],
+    cooldownMs: 100,
+    failureThreshold: 1,
+    halfOpenSuccesses: 2,
+  })
+  let t = 0
+  const router = createRouter(cfg, () => t)
+  router.recordFailure('a', { code: 'SERVER', status: 500 }, t)
+  t += 100
+  check('冷却到期后是 half-open', router.stateOf('a', t) === HALF_OPEN)
+  router.noteSelected('a', t)
+  router.recordSuccess('a', t)
+  check('第一次探测成功仍在 half-open（还没攒够）', router.stateOf('a', t) === HALF_OPEN
+    && router.snapshot()[0].halfOpenSuccesses === 1)
+  router.noteSelected('a', t)
+  check('第二次探测成功后闭合', router.recordSuccess('a', t) === CLOSED && router.stateOf('a', t) === CLOSED)
+  check('默认只要求一次成功', normalizeRouterConfig({}).halfOpenSuccesses === 1)
+}
+
+section('3c-5. 退避：升级、封顶、以及上游给的提示')
+
+{
   const cfg = normalizeRouterConfig({
     order: [{ provider: 'a', model: 'a1' }],
     cooldownMs: 1_000,
     cooldownFactor: 3,
     cooldownMaxMs: 10_000,
+    failureThreshold: 1,
   })
   let t = 0
   const router = createRouter(cfg, () => t)
   const tick = () => {
-    // Each trip is preceded by letting the previous cooldown expire, which is
-    // what makes the trips consecutive.
     t += 1_000_000
     const state = router.recordFailure('a', { code: 'SERVER' }, t)
     return { state, openUntil: router.snapshot()[0].openUntil - t, trips: router.snapshot()[0].trips }
   }
   const first = tick()
-  check('第一次熔断用基础时长', first.state === OPEN && first.openUntil === 1_000 && first.trips === 1,
-    JSON.stringify(first))
+  check('第一次熔断用基础时长', first.state === OPEN && first.openUntil === 1_000 && first.trips === 1, JSON.stringify(first))
   check('第二次熔断按倍数递增', tick().openUntil === 3_000)
   check('第三次继续递增', tick().openUntil === 9_000)
   check('递增在上限处封顶', tick().openUntil === 10_000)
   check('熔断次数一直计数', router.snapshot()[0].trips === 4)
   check('下一次冷却可以预告（设置页显示用）', router.snapshot()[0].nextCooldownMs === 10_000)
-  router.recordSuccess('a')
+  router.recordSuccess('a', t)
   check('成功一次后熔断次数归零、冷却回到基础时长',
     router.snapshot()[0].trips === 0 && router.snapshot()[0].nextCooldownMs === 1_000)
   check('倍数 1 表示不递增', (() => {
-    const flat = createRouter(normalizeRouterConfig({ order: [{ provider: 'a', model: 'a1' }], cooldownMs: 40, cooldownFactor: 1, cooldownMaxMs: 10_000 }), () => t)
+    const flat = createRouter(normalizeRouterConfig({ order: [{ provider: 'a', model: 'a1' }], cooldownMs: 40, cooldownFactor: 1, cooldownMaxMs: 10_000, failureThreshold: 1 }), () => t)
     flat.recordFailure('a', {}, t)
     const one = flat.snapshot()[0].openUntil - t
     flat.recordFailure('a', {}, t)
@@ -1557,24 +1681,288 @@ section('3c. 路由：熔断状态机')
     const capped = normalizeRouterConfig({ order: [], cooldownMs: 5_000, cooldownFactor: 2, cooldownMaxMs: 100 })
     return capped.cooldownMaxMs === 5_000
   })())
+  check('上游给的 retry-after 取代本次计算出的冷却', (() => {
+    const c = normalizeRouterConfig({ order: [{ provider: 'a', model: 'a1' }], cooldownMs: 1_000, cooldownMaxMs: 60_000, failureThreshold: 1 })
+    let ct = 0
+    const r = createRouter(c, () => ct)
+    r.recordFailure('a', { code: 'HTTP_429', status: 429, retryAfterMs: 5_000 }, ct)
+    return r.snapshot()[0].openUntil - ct === 5_000
+  })())
+  check('离谱的 retry-after 被冷却上限截断', (() => {
+    const c = normalizeRouterConfig({ order: [{ provider: 'a', model: 'a1' }], cooldownMs: 1_000, cooldownMaxMs: 60_000, failureThreshold: 1 })
+    let ct = 0
+    const r = createRouter(c, () => ct)
+    r.recordFailure('a', { code: 'HTTP_429', status: 429, retryAfterMs: 86_400_000 }, ct)
+    return r.snapshot()[0].openUntil - ct === 60_000
+  })())
 }
 
 {
   // The retry wait: an explicit provider hint wins, a long one means "switch".
   check('没有 retry-after 时从 0.5s 起翻倍',
     retryWaitMs(undefined, 1) === 500 && retryWaitMs(undefined, 2) === 1_000 && retryWaitMs(undefined, 3) === 2_000)
-  check('retry-after 在可接受范围内就照它等', retryWaitMs({ providerRetryAfterMs: 1_200 }, 1) === 1_200)
+  check('retry-after 在可接受范围内就照它等', retryWaitMs({ retryAfterMs: 1_200 }, 1) === 1_200)
   check('retry-after 超过上限时不再重试（直接切换）',
-    retryWaitMs({ providerRetryAfterMs: ROUTER_RETRY_MAX_WAIT_MS + 1 }, 1) === null)
+    retryWaitMs({ retryAfterMs: ROUTER_RETRY_MAX_WAIT_MS + 1 }, 1) === null)
   check('退避等待有上限', retryWaitMs(undefined, 40) === ROUTER_RETRY_MAX_WAIT_MS)
   check('异常 retry-after（0/负数/非数字）回落到退避',
-    retryWaitMs({ providerRetryAfterMs: 0 }, 1) === 500
-      && retryWaitMs({ providerRetryAfterMs: -5 }, 1) === 500
-      && retryWaitMs({ providerRetryAfterMs: Number.NaN }, 1) === 500)
+    retryWaitMs({ retryAfterMs: 0 }, 1) === 500
+      && retryWaitMs({ retryAfterMs: -5 }, 1) === 500
+      && retryWaitMs({ retryAfterMs: Number.NaN }, 1) === 500)
+  check('旧的 providerRetryAfterMs 写法仍然认（历史契约）',
+    retryWaitMs({ providerRetryAfterMs: 1_200 }, 1) === 1_200)
 }
 
+section('3c-6. 失败分类：谁该被记账')
+
 {
-  // Repair-on-read: a hand-edited file must never be able to break activation.
+  check('分类枚举是固定的五种', FAILURE_CLASSES.join(',') === 'retryable,overloaded,non_retryable,quota,client_cancel')
+
+  check('只有 retryable 与 overloaded 计入熔断',
+    isBreakerRelevant('retryable') === true && isBreakerRelevant('overloaded') === true
+      && isBreakerRelevant('non_retryable') === false && isBreakerRelevant('quota') === false
+      && isBreakerRelevant('client_cancel') === false)
+  check('只有 overloaded 当次即熔断', opensImmediately('overloaded') === true && opensImmediately('retryable') === false)
+
+  check('调用方中止不是供应商的错', classifyFailure({ code: 'ABORTED' }).cls === 'client_cancel'
+    && classifyFailure({ status: 499 }).cls === 'client_cancel')
+  check('超时与传输错误是 retryable', classifyFailure({ code: 'TIMEOUT' }).cls === 'retryable'
+    && classifyFailure({ code: 'TRANSPORT' }).cls === 'retryable'
+    && classifyFailure({ code: 'MALFORMED' }).cls === 'retryable')
+  check('5xx 是 retryable', classifyFailure({ status: 500, code: 'HTTP_500' }).cls === 'retryable'
+    && classifyFailure({ status: 502, code: 'HTTP_502' }).cls === 'retryable')
+  check('429/503/529 是 overloaded', classifyFailure({ status: 429, code: 'HTTP_429' }).cls === 'overloaded'
+    && classifyFailure({ status: 503, code: 'HTTP_503' }).cls === 'overloaded'
+    && classifyFailure({ status: 529, code: 'HTTP_529' }).cls === 'overloaded')
+  check('4xx 里的「请求本身错」是 non_retryable', classifyFailure({ status: 400, code: 'HTTP_400' }).cls === 'non_retryable'
+    && classifyFailure({ status: 404, code: 'HTTP_404' }).cls === 'non_retryable'
+    && classifyFailure({ status: 422, code: 'HTTP_422' }).cls === 'non_retryable')
+  check('401/403 是 non_retryable（不该计入熔断）',
+    classifyFailure({ status: 401, code: 'HTTP_401' }).cls === 'non_retryable'
+      && classifyFailure({ status: 403, code: 'HTTP_403' }).cls === 'non_retryable')
+
+  // Prose beats the outer status: gateways really do wrap a dead credential in a
+  // 400, and a code that says "no balance" must not be short-circuited.
+  check('文案优先于外层状态码：400 包着 invalid api key 仍算凭据问题',
+    classifyFailure({ status: 400, code: 'HTTP_400', body: { error: { message: 'Invalid API key provided' } } }).cls === 'non_retryable')
+  check('文案优先：429 包着余额不足算 quota',
+    classifyFailure({ status: 429, code: 'HTTP_429', body: { error: { message: 'Insufficient balance, please recharge' } } }).cls === 'quota')
+  check('错误码优先：insufficient_quota 算 quota',
+    classifyFailure({ status: 400, code: 'HTTP_400', body: { error: { code: 'insufficient_quota', message: 'x' } } }).cls === 'quota')
+  check('中文余额文案也认', classifyFailure({ status: 400, code: 'HTTP_400', message: '账户余额不足' }).cls === 'quota')
+
+  check('空失败（没有任何线索）按 retryable 处理', classifyFailure(undefined).cls === 'retryable')
+}
+
+section('3c-7. 拉黑判定：凭据死了而不是抽风')
+
+{
+  check('401 是 authentication_error', blacklistVerdict({ status: 401, code: 'HTTP_401' }).reason === 'authentication_error')
+  check('402 是 insufficient_balance', blacklistVerdict({ status: 402, code: 'HTTP_402' }).reason === 'insufficient_balance')
+  check('403 是 permission_error', blacklistVerdict({ status: 403, code: 'HTTP_403' }).reason === 'permission_error')
+  check('invalid_api_key 码算鉴权问题', blacklistVerdict({ status: 400, body: { error: { code: 'invalid_api_key' } } }).reason === 'authentication_error')
+  check('余额文案算额度问题', blacklistVerdict({ status: 400, message: 'insufficient balance' }).reason === 'insufficient_balance')
+  check('用量耗尽文案也算', blacklistVerdict({ status: 429, message: 'You exceeded your current quota' }).reason === 'insufficient_balance')
+  check('拉黑判定带回上游原话（便于页面解释）', blacklistVerdict({ status: 401, message: 'Invalid API key' }).message.includes('Invalid API key'))
+  check('retry-after 变成恢复时间', (() => {
+    const v = blacklistVerdict({ status: 429, message: 'insufficient balance', retryAfterMs: 3_600_000 }, { now: 1_000_000 })
+    return typeof v.recoverAt === 'string' && Date.parse(v.recoverAt) === 1_000_000 + 3_600_000
+  })())
+  check('没有恢复时间时留空（等人工恢复）', blacklistVerdict({ status: 401 }).recoverAt === null)
+  check('5xx / 超时 / 429 不拉黑（那是瞬时的）',
+    blacklistVerdict({ status: 500, code: 'HTTP_500' }).should === false
+      && blacklistVerdict({ code: 'TIMEOUT' }).should === false
+      && blacklistVerdict({ status: 429, code: 'HTTP_429', message: 'rate limit exceeded, slow down' }).should === false)
+  check('400 请求错误不拉黑', blacklistVerdict({ status: 400, message: 'messages is required' }).should === false)
+}
+
+section('3c-8. 候选展开：顺序表 × key')
+
+{
+  const order = [
+    { provider: 'p1', model: 'm1' },
+    { provider: 'p2', model: 'm2' },
+  ]
+  check('命中的行排在前面，其余按配置顺序环形跟随',
+    buildChain(order, 'm2').map((r) => r.provider).join(',') === 'p2,p1'
+      && buildChain(order, 'p1/m1').map((r) => r.provider).join(',') === 'p1,p2'
+      && buildChain(order, 'unknown').map((r) => r.provider).join(',') === 'p1,p2')
+  check('路由名可以是 model 或 provider/model', parseRouteName('m1').provider === null
+    && parseRouteName('p1/m1').provider === 'p1'
+    && parseRouteName('m1').model === 'm1')
+  check('空顺序表没有候选', buildChain([], 'm1').length === 0)
+
+  const unitsFor = (row) => (row.provider === 'p1'
+    ? [{ id: 'k1', label: 'a', key: 's1' }, { id: 'k2', label: 'b', key: 's2' }]
+    : [{ id: null, label: '', key: '' }])
+  const candidates = buildCandidates(buildChain(order, 'm1'), unitsFor)
+  check('每个候选 = 一行 × 一把 key', candidates.length === 3, JSON.stringify(candidates.map((c) => `${c.provider}#${c.keyId}`)))
+  check('同一 provider 的 key 相邻（先在本供应商内换 key）',
+    candidates.map((c) => `${c.provider}#${c.keyId ?? '-'}`).join(',') === 'p1#k1,p1#k2,p2#-',
+    candidates.map((c) => `${c.provider}#${c.keyId ?? '-'}`).join(','))
+  check('候选带着要用的密钥', candidates[0].key === 's1' && candidates[2].key === '')
+  check('unitsForRow 抛异常时退化为一个无 key 单位', (() => {
+    const safe = buildCandidates([{ provider: 'p', model: 'm' }], () => { throw new Error('boom') })
+    return safe.length === 1 && safe[0].keyId === null
+  })())
+  check('unitsForRow 返回空数组时同样退化', buildCandidates([{ provider: 'p', model: 'm' }], () => []).length === 1)
+}
+
+section('3c-9. 切换预算按候选数算，不只按行数')
+
+{
+  check('switchBudget 0 = 自动（等于行数）', switchBudget({ order: [{}, {}, {}], maxSwitches: 0 }) === 3
+    && switchBudget({ order: [{}, {}], maxSwitches: 1 }) === 1)
+  check('给了候选数就按候选数算（多 key 要够用）',
+    switchBudget({ order: [{}, {}], maxSwitches: 0 }, 5) === 5
+      && switchBudget({ order: [{}, {}], maxSwitches: 0 }, 0) === 0)
+  check('显式 maxSwitches 优先于候选数', switchBudget({ order: [{}, {}], maxSwitches: 2 }, 9) === 2)
+  check('未配置 order 时 maxSwitches=0 的预算为 0（不会切换）', switchBudget({ order: [], maxSwitches: 0 }) === 0)
+}
+
+section('3c-10. 配置：apiKey → keys 的迁移与密钥语义')
+
+{
+  check('旧的 apiKey 被读成一条 keys（id 稳定为默认值）', (() => {
+    const keys = normalizeKeys(undefined, 'sk-old')
+    return keys.length === 1 && keys[0].key === 'sk-old' && keys[0].id === DEFAULT_KEY_ID
+  })())
+  check('空 apiKey 不产生密钥条目', normalizeKeys(undefined, '').length === 0 && normalizeKeys(undefined, undefined).length === 0)
+  check('显式 keys 优先于旧字段', (() => {
+    const keys = normalizeKeys([{ id: 'x', key: 'sk-new' }], 'sk-old')
+    return keys.length === 1 && keys[0].id === 'x' && keys[0].key === 'sk-new'
+  })())
+  check('没有 id 的密钥按位置得到稳定 id', (() => {
+    const first = normalizeKeys([{ key: 'a' }, { key: 'b' }])
+    const again = normalizeKeys([{ key: 'a' }, { key: 'b' }])
+    return first.map((k) => k.id).join(',') === 'k1,k2' && first.map((k) => k.id).join(',') === again.map((k) => k.id).join(',')
+  })())
+  check('非法或重复的 id 被换掉', (() => {
+    const keys = normalizeKeys([{ id: 'bad id!', key: 'a' }, { id: 'k1', key: 'b' }, { id: 'k1', key: 'c' }])
+    return keys.length === 3 && new Set(keys.map((k) => k.id)).size === 3
+      && keys.every((k) => /^[A-Za-z0-9._-]+$/.test(k.id))
+  })())
+  check('密钥条数有上限', normalizeKeys(Array.from({ length: MAX_KEYS_PER_PROVIDER + 10 }, (_, i) => ({ key: `s${i}` }))).length === MAX_KEYS_PER_PROVIDER)
+
+  check('无密钥供应商仍有一个可路由单位', (() => {
+    const units = keyUnitsOf({ keys: [] })
+    return units.length === 1 && units[0].id === null && units[0].key === ''
+  })())
+  check('有密钥时每个密钥一个单位', keyUnitsOf({ keys: [{ id: 'a', key: 's' }] }).length === 1
+    && keyUnitsOf({ keys: [{ id: 'a', key: 's' }, { id: 'b', key: 't' }] }).map((u) => u.id).join(',') === 'a,b')
+
+  check('可用模型 = 手工 ∪ 已发现（手工在前、去重）', (() => {
+    const models = availableModels({ models: ['m1', 'm2'] }, ['m2', 'm3'])
+    return models.join(',') === 'm1,m2,m3'
+  })())
+  check('没有手工模型时只有已发现的', availableModels({ models: [] }, ['x']).join(',') === 'x')
+}
+
+section('3c-11. 配置补丁：密钥保留、轮换、删除')
+
+{
+  const base = () => ({
+    version: 1,
+    server: { host: '127.0.0.1', port: 8790, token: 't' },
+    providers: {
+      p1: { id: 'p1', label: 'p1', baseURL: 'https://a.example/v1', keys: [{ id: 'k1', label: 'one', key: 'sk-one' }], models: ['m1'], headers: {}, timeoutMs: 120_000 },
+    },
+    router: { enabled: true, order: [{ provider: 'p1', model: 'm1' }] },
+    converters: ['maas'],
+  })
+  const patch = (entry) => applyConfigPatch(base(), { providers: { p1: entry } }, {}).config.providers.p1
+
+  check('留空密钥保留已存的那把', patch({ label: 'p1', baseURL: 'https://a.example/v1', keys: [{ id: 'k1', label: 'renamed', key: '' }], models: ['m1'] }).keys[0].key === 'sk-one')
+  check('填入新值即轮换', patch({ label: 'p1', baseURL: 'https://a.example/v1', keys: [{ id: 'k1', key: 'sk-new' }], models: ['m1'] }).keys[0].key === 'sk-new')
+  check('从数组删掉即删除该密钥', patch({ label: 'p1', baseURL: 'https://a.example/v1', keys: [], models: ['m1'] }).keys.length === 0)
+  check('完全不提 keys 时密钥列表不变', patch({ label: 'p1', baseURL: 'https://a.example/v1', models: ['m1'] }).keys[0].key === 'sk-one')
+  check('新增无 id 的密钥会被分配一个', (() => {
+    const keys = patch({ label: 'p1', baseURL: 'https://a.example/v1', keys: [{ id: 'k1', key: '' }, { key: 'sk-two' }], models: ['m1'] }).keys
+    return keys.length === 2 && keys[1].key === 'sk-two' && keys[1].id !== 'k1' && keys[1].id !== ''
+  })())
+  check('新增密钥可以没有密钥（无凭据的路由）', (() => {
+    const keys = patch({ label: 'p1', baseURL: 'https://a.example/v1', keys: [{ key: '' }], models: ['m1'] }).keys
+    return keys.length === 1 && keys[0].key === ''
+  })())
+  check('没提到的 timeoutMs 不会被重置', patch({ label: 'p1', baseURL: 'https://a.example/v1', models: ['m1'] }).timeoutMs === 120_000)
+  check('头是字符串值扁平对象', patch({ label: 'p1', baseURL: 'https://a.example/v1', models: ['m1'], headers: { 'x-a': 'b' } }).headers['x-a'] === 'b')
+  check('请求头不是字符串值时被拒', (() => {
+    try { patch({ label: 'p1', baseURL: 'https://a.example/v1', models: ['m1'], headers: { 'x-a': 1 } }); return false } catch { return true }
+  })())
+  check('超过密钥上限被拒', (() => {
+    try {
+      patch({ label: 'p1', baseURL: 'https://a.example/v1', models: ['m1'], keys: Array.from({ length: MAX_KEYS_PER_PROVIDER + 1 }, () => ({ key: 's' })) })
+      return false
+    } catch { return true }
+  })())
+  check('重复的密钥 id 被拒', (() => {
+    try {
+      patch({ label: 'p1', baseURL: 'https://a.example/v1', models: ['m1'], keys: [{ id: 'k1', key: 'a' }, { id: 'k1', key: 'b' }] })
+      return false
+    } catch { return true }
+  })())
+  check('旧客户端用 apiKey 也能改密钥（留空则保留）', (() => {
+    const kept = patch({ label: 'p1', baseURL: 'https://a.example/v1', models: ['m1'], apiKey: '' })
+    const rotated = patch({ label: 'p1', baseURL: 'https://a.example/v1', models: ['m1'], apiKey: 'sk-via-legacy' })
+    return kept.keys[0].key === 'sk-one' && kept.keys[0].id === DEFAULT_KEY_ID
+      && rotated.keys[0].key === 'sk-via-legacy'
+  })())
+}
+
+section('3c-12. 路由表对账：供应商变了表就跟着变')
+
+{
+  const providers = {
+    p1: { id: 'p1', models: ['m1', 'm2'] },
+    p2: { id: 'p2', models: ['x'] },
+  }
+  const result = reconcileOrder([
+    { provider: 'p1', model: 'm1' },
+    { provider: 'p1', model: 'gone' },
+    { provider: 'deleted', model: 'y' },
+    { provider: 'p2', model: 'x' },
+  ], providers, (id) => providers[id]?.models ?? [])
+  check('provider 不存在的行被移除', result.removed.some((row) => row.provider === 'deleted' && row.reason === 'provider_not_configured'))
+  check('模型不再可用的行被移除', result.removed.some((row) => row.provider === 'p1' && row.model === 'gone' && row.reason === 'model_not_available'))
+  check('可用行被保留且顺序不变', result.order.map((r) => `${r.provider}/${r.model}`).join(',') === 'p1/m1,p2/x')
+  check('被移除的行会被报告出来（不静默）', result.removed.length === 2)
+
+  const empty = reconcileOrder([{ provider: 'p1', model: 'anything' }], { p1: { models: [] } }, () => [])
+  check('供应商没声明任何模型时不删行（空=未知，不是没有）', empty.order.length === 1 && empty.removed.length === 0)
+
+  const patchResult = applyConfigPatch({
+    version: 1,
+    server: { host: '127.0.0.1', port: 8790, token: 't' },
+    providers: {
+      p1: { id: 'p1', label: 'p1', baseURL: 'https://a.example/v1', keys: [], models: ['m1'], headers: {}, timeoutMs: 120_000 },
+      p2: { id: 'p2', label: 'p2', baseURL: 'https://b.example/v1', keys: [], models: ['x'], headers: {}, timeoutMs: 120_000 },
+    },
+    router: { enabled: true, order: [{ provider: 'p1', model: 'm1' }, { provider: 'p2', model: 'x' }] },
+    converters: ['maas'],
+  }, {
+    providers: {
+      p1: { label: 'p1', baseURL: 'https://a.example/v1', keys: [], models: ['m1'] },
+    },
+  }, {})
+  check('删掉一个供应商后它的行确实消失了',
+    patchResult.config.router.order.map((r) => r.provider).join(',') === 'p1'
+      && patchResult.removedOrderRows.some((row) => row.provider === 'p2'),
+  JSON.stringify(patchResult.removedOrderRows))
+  check('只改 router 时不动顺序表', (() => {
+    const only = applyConfigPatch({
+      version: 1,
+      server: { host: '127.0.0.1', port: 8790, token: 't' },
+      providers: { p1: { id: 'p1', label: 'p1', baseURL: 'https://a.example/v1', keys: [], models: ['m1'], headers: {}, timeoutMs: 120_000 } },
+      router: { enabled: true, order: [{ provider: 'ghost', model: 'z' }] },
+      converters: ['maas'],
+    }, { router: { failureThreshold: 4 } }, {})
+    return only.config.router.order.length === 1 && only.removedOrderRows.length === 0
+  })())
+}
+
+section('3c-13. 读时修复：新字段的夹取与回落')
+
+{
   const repaired = normalizeRouterConfig({
     order: [
       { provider: 'a', model: 'a1' },
@@ -1586,10 +1974,14 @@ section('3c. 路由：熔断状态机')
     ],
     retries: -3,
     failureThreshold: 0,
+    failureRateThreshold: 7,
+    minSamples: -1,
+    windowSize: 0,
     windowMs: -5,
     cooldownMs: 99_999_999,
     cooldownFactor: 99,
     cooldownMaxMs: 1,
+    halfOpenSuccesses: 0,
     recoveryMode: 'nonsense',
     maxSwitches: 999,
     logLevel: 'loud',
@@ -1605,13 +1997,158 @@ section('3c. 路由：熔断状态机')
       && repaired.cooldownMaxMs === ROUTER_LIMITS.maxCooldownMs)
   check('未知恢复方式回落 probe、未知日志级别回落 info',
     repaired.recoveryMode === 'probe' && repaired.logLevel === 'info')
+  check('失败率夹到 0–1、样本与窗口大小夹到下限、half-open 目标至少 1',
+    repaired.failureRateThreshold === 1 && repaired.minSamples === 1
+      && repaired.windowSize === 1 && repaired.halfOpenSuccesses === 1)
   check('空 order 是合法配置（装着但无处可切）', normalizeRouterConfig({}).order.length === 0)
   check('默认重试次数是 3 次', normalizeRouterConfig({}).retries === 3)
+  check('默认阈值是连续 2 次、失败率 0.7、最小样本 5',
+    normalizeRouterConfig({}).failureThreshold === 2
+      && normalizeRouterConfig({}).failureRateThreshold === 0.7
+      && normalizeRouterConfig({}).minSamples === 5)
   check('行数上限是 {n}'.replace('{n}', String(ROUTER_LIMITS.orderRows)),
     normalizeRouterConfig({ order: Array.from({ length: ROUTER_LIMITS.orderRows + 5 }, (_, i) => ({ provider: `p${i}`, model: `m${i}` })) }).order.length === ROUTER_LIMITS.orderRows)
-  check('switchBudget 0 = 自动（等于行数）', switchBudget({ order: [{}, {}, {}], maxSwitches: 0 }) === 3
-    && switchBudget({ order: [{}, {}], maxSwitches: 1 }) === 1)
-  check('未配置 order 时 maxSwitches=0 的预算为 0（不会切换）', switchBudget({ order: [], maxSwitches: 0 }) === 0)
+}
+
+section('3c-14. 运行态：拉黑表的生命周期与去重')
+
+{
+  const { createStateStore } = await import('../lib/service/state.js')
+  const { mkdtempSync, rmSync, readFileSync, statSync, existsSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+
+  const home = mkdtempSync(join(tmpdir(), 'dspo-state-'))
+  const file = join(home, 'router-service.state.json')
+  let clock = 1_000_000
+  const store = createStateStore({ file, now: () => clock })
+
+  check('开始时不拦任何单位', store.blocked('p1#a') === null && store.entries().length === 0)
+  store.mark('p1#a', { provider: 'p1', keyId: 'a', reason: 'authentication_error', message: 'Invalid API key' })
+  check('记下之后就被拦住，并带原因与原话',
+    store.blocked('p1#a')?.reason === 'authentication_error' && store.blocked('p1#a').message === 'Invalid API key')
+  check('拦的是单位，不是供应商', store.blocked('p1#b') === null && store.blocked('p1') === null)
+
+  store.mark('p1#b', { provider: 'p1', keyId: 'b', reason: 'insufficient_balance', message: 'no funds', recoverAt: new Date(clock + 60_000).toISOString() })
+  check('带恢复时间的条目在到期前拦住', store.blocked('p1#b') !== null)
+  clock += 60_001
+  check('恢复时间一到就自动放行（不需要调度器）', store.blocked('p1#b') === null && store.entries().length === 1)
+  store.mark('p1#b', { provider: 'p1', keyId: 'b', reason: 'insufficient_balance', message: 'no funds' })
+
+  check('clearProvider 只清指定 key', store.clearProvider('p1', 'a') === 1
+    && store.blocked('p1#a') === null && store.blocked('p1#b') !== null)
+  check('clearProvider 不带 key 时清该供应商全部', store.clearProvider('p1') === 1 && store.entries().length === 0)
+
+  // Persistence: what the service learned must outlive the process.
+  store.mark('p2#x', { provider: 'p2', keyId: 'x', reason: 'permission_error', message: 'no permission' })
+  store.setDiscovered('p2', ['m1', 'm2', 'm1'])
+  check('setDiscovered 去重', store.discovered('p2').join(',') === 'm1,m2')
+  check('空列表不覆盖已有列表（上游说"没有"不等于"忘掉"）', store.setDiscovered('p2', []).join(',') === 'm1,m2')
+  check('flush 之后文件存在', store.flush() === true && existsSync(file))
+  check('运行态文件是 0600（它含的是原因与原话，不是密钥）', (statSync(file).mode & 0o777) === 0o600, (statSync(file).mode & 0o777).toString(8))
+
+  const reopened = createStateStore({ file, now: () => clock })
+  check('新实例读回拉黑与已发现模型',
+    reopened.blocked('p2#x')?.reason === 'permission_error' && reopened.discovered('p2').join(',') === 'm1,m2')
+  check('三个月的陈旧条目会被回收（不会长成历史坟场）', (() => {
+    const old = createStateStore({ file, now: () => clock + 100 * 24 * 3600 * 1000 })
+    return old.blocked('p2#x') === null
+  })())
+
+  const broken = join(home, 'broken.json')
+  writeFileSync(broken, '{ this is not json')
+  const recovered = createStateStore({ file: broken, now: () => clock })
+  check('坏掉的运行态不会让服务起不来（读成空状态）', recovered.entries().length === 0 && recovered.discovered('p2').length === 0)
+
+  rmSync(home, { recursive: true, force: true })
+}
+
+section('3c-15. 配置文档：种子、旧文件迁移、坏文件不让服务起不来')
+
+{
+  const home = mkdtempSync(join(tmpdir(), 'dspo-config-'))
+  const previousHome = process.env.DSH_HOME
+  const previousConfig = process.env.ROUTER_SERVICE_CONFIG
+  const previousState = process.env.ROUTER_SERVICE_STATE
+  process.env.DSH_HOME = home
+  process.env.ROUTER_SERVICE_CONFIG = join(home, 'router-service.json')
+  process.env.ROUTER_SERVICE_STATE = join(home, 'router-service.state.json')
+  // The module resolves its file paths when it loads, so this section gets its
+  // own copy of the module rather than sharing the one the rest of the suite uses.
+  const cfg = await import(`../lib/service/config.js?home=${encodeURIComponent(home)}`)
+  const { writeFileSync: write, readFileSync: read, rmSync: rm, statSync } = await import('node:fs')
+
+  const seeded = cfg.seedConfig()
+  check('种子预置两条 MaaS 路由的地址', Object.keys(seeded.providers).join(',') === 'maas-coclaw,maas-dsv4')
+  check('种子不预置任何密钥', Object.values(seeded.providers).every((provider) => provider.keys.length === 0))
+
+  const created = cfg.readConfig()
+  check('首次运行会写出配置文件', created.created === true && existsSync(process.env.ROUTER_SERVICE_CONFIG))
+  check('写出的文件是 0600', (statSync(process.env.ROUTER_SERVICE_CONFIG).mode & 0o777) === 0o600)
+
+  // An old file: one provider with the single-apiKey spelling.
+  write(process.env.ROUTER_SERVICE_CONFIG, JSON.stringify({
+    server: { host: '127.0.0.1', port: 8790, token: 'tok' },
+    providers: {
+      legacy: { label: 'legacy', baseURL: 'https://legacy.example/v1', apiKey: 'sk-legacy', models: ['m1'] },
+      bare: { label: 'bare', baseURL: 'https://bare.example/v1', models: ['m2', 'm2', '  '] },
+    },
+    router: { enabled: true, order: [{ provider: 'legacy', model: 'm1' }, { provider: 'bare', model: 'm2' }] },
+    converters: ['maas'],
+  }, null, 2))
+  const migrated = cfg.readConfig({ seed: false })
+  check('旧 apiKey 读成一条 key，并拿到稳定 id',
+    migrated.config.providers.legacy.keys.length === 1
+      && migrated.config.providers.legacy.keys[0].id === cfg.DEFAULT_KEY_ID
+      && migrated.config.providers.legacy.keys[0].key === 'sk-legacy')
+  check('没有密钥的供应商读成空列表（仍然可路由）',
+    migrated.config.providers.bare.keys.length === 0
+      && cfg.keyUnitsOf(migrated.config.providers.bare).length === 1)
+  check('模型列表去重且丢掉空白项', migrated.config.providers.bare.models.join(',') === 'm2')
+  check('读完不会顺手改写文件（读时修复只在内存里）',
+    JSON.parse(read(process.env.ROUTER_SERVICE_CONFIG, 'utf8')).providers.legacy.apiKey === 'sk-legacy')
+
+  // A file a human broke: the service must still boot.
+  write(process.env.ROUTER_SERVICE_CONFIG, '{ not json at all')
+  const repaired = cfg.readConfig({ seed: false })
+  check('坏文件让服务带着修复后的配置启动，而不是拒绝启动',
+    repaired.repaired === true && Object.keys(repaired.config.providers).length >= 2)
+  check('坏文件不会被自动覆盖（可能正在被手改）',
+    read(process.env.ROUTER_SERVICE_CONFIG, 'utf8') === '{ not json at all')
+
+  // A valid but wrong file: fields are clamped, not rejected.
+  write(process.env.ROUTER_SERVICE_CONFIG, JSON.stringify({
+    server: { host: '127.0.0.1', port: 99999, token: 'tok' },
+    providers: { p: { baseURL: 'https://p.example/v1', keys: [{ id: 'bad id', key: 'x' }, { id: 'ok', key: 'y' }], models: ['m'] } },
+    router: { order: [{ provider: 'p', model: 'm' }], failureRateThreshold: 9, minSamples: -4 },
+    converters: [],
+  }, null, 2))
+  const clamped = cfg.readConfig({ seed: false })
+  check('坏端口夹到合法上限（默认值只用于非数字）', clamped.config.server.port === 65_535)
+  check('非法 key id 被换成合法 id 而不是丢掉整条 key',
+    clamped.config.providers.p.keys.length === 2 && /^[A-Za-z0-9._-]+$/.test(clamped.config.providers.p.keys[0].id))
+  check('越界的失败率与样本数被夹住',
+    clamped.config.router.failureRateThreshold === 1 && clamped.config.router.minSamples === 1)
+  check('写进文件的新参数真的会生效（不是被默认值悄悄顶掉）', (() => {
+    write(process.env.ROUTER_SERVICE_CONFIG, JSON.stringify({
+      server: { host: '127.0.0.1', port: 8790, token: 'tok' },
+      providers: { p: { baseURL: 'https://p.example/v1', keys: [], models: ['m'] } },
+      router: { order: [{ provider: 'p', model: 'm' }], failureRateThreshold: 0.25, minSamples: 9, windowSize: 7, halfOpenSuccesses: 3, failureThreshold: 4 },
+      converters: ['maas'],
+    }, null, 2))
+    const saved = cfg.readConfig({ seed: false }).config.router
+    return saved.failureRateThreshold === 0.25 && saved.minSamples === 9
+      && saved.windowSize === 7 && saved.halfOpenSuccesses === 3 && saved.failureThreshold === 4
+  })())
+  check('空的 converters 回落成默认转换器', clamped.config.converters.join(',') === 'maas')
+
+  rm(home, { recursive: true, force: true })
+  if (previousHome === undefined) delete process.env.DSH_HOME
+  else process.env.DSH_HOME = previousHome
+  if (previousConfig === undefined) delete process.env.ROUTER_SERVICE_CONFIG
+  else process.env.ROUTER_SERVICE_CONFIG = previousConfig
+  if (previousState === undefined) delete process.env.ROUTER_SERVICE_STATE
+  else process.env.ROUTER_SERVICE_STATE = previousState
 }
 
 section('3c. 路由：宿主路由只负责转达')

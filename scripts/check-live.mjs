@@ -74,13 +74,13 @@ writeFileSync(process.env.ROUTER_SERVICE_CONFIG, `${JSON.stringify({
     'maas-dsv4': {
       label: 'ZTE MaaS deepseek-v4-flash',
       baseURL: 'https://maas-apigateway.dt.zte.com.cn/model/deepseek-v4-flash/v1',
-      apiKey: dsv4Key,
+      keys: [{ id: 'k1', label: 'primary', key: dsv4Key }],
       models: ['deepseek-v4-flash'],
     },
     'maas-coclaw': {
       label: 'ZTE MaaS co-claw',
       baseURL: 'https://maas-apigateway.dt.zte.com.cn/model-cop/co-claw/v1',
-      apiKey: clawKey,
+      keys: [{ id: 'k1', label: 'primary', key: clawKey }],
       models: ['co-claw'],
     },
   },
@@ -186,7 +186,7 @@ const record = (name, ok, detail) => {
     body: JSON.stringify({
       providers: {
         'maas-dead': { label: 'dead', baseURL: 'http://127.0.0.1:9/v1', apiKey: 'x', models: ['dead-model'] },
-        'maas-dsv4': { label: 'dsv4', baseURL: 'https://maas-apigateway.dt.zte.com.cn/model/deepseek-v4-flash/v1', apiKey: '', models: ['deepseek-v4-flash'] },
+        'maas-dsv4': { label: 'dsv4', baseURL: 'https://maas-apigateway.dt.zte.com.cn/model/deepseek-v4-flash/v1', keys: [{ id: 'k1', key: '' }], models: ['deepseek-v4-flash'] },
       },
       router: { order: [{ provider: 'maas-dead', model: 'dead-model' }, { provider: 'maas-dsv4', model: 'deepseek-v4-flash' }], retries: 0 },
     }),
@@ -203,7 +203,64 @@ const record = (name, ok, detail) => {
   const state = await (await fetch(`${base}/admin/api/state`, { headers: { 'x-router-token': token } })).json()
   const dead = state.value.rows.find((row) => row.provider === 'maas-dead')
   record('连续失败到阈值后熔断器打开', dead?.state === 'open', JSON.stringify({ state: dead?.state, failures: dead?.failures, lastFailure: dead?.lastFailure }))
-  record('密钥留空时沿用了已存的密钥', state.value.providers.find((p) => p.id === 'maas-dsv4')?.apiKeySet === true)
+  const dsv4Keys = state.value.providers.find((p) => p.id === 'maas-dsv4')?.keys ?? []
+  record('密钥留空时沿用了已存的密钥（按 id 认领，不是按位置）',
+    dsv4Keys.length === 1 && dsv4Keys[0].id === 'k1' && dsv4Keys[0].set === true,
+    JSON.stringify(dsv4Keys.map((k) => ({ id: k.id, set: k.set, masked: k.masked }))))
+}
+
+// 7b. key-level failover against the real gateway: a bogus key in front of the
+//     real one, on the same provider. This is the one piece of evidence that
+//     cannot be produced with a stub: the gateway really does answer the bogus
+//     credential with an error, and the service really does step over it.
+{
+  const bogus = 'sk-live-bogus-000000000000000000'
+  const saved = await (await fetch(`${base}/admin/api/state`, { headers: { 'x-router-token': token } })).json()
+  const real = saved.value.providers.find((p) => p.id === 'maas-dsv4')?.keys?.[0]
+  const restored = await fetch(`${base}/admin/api/config`, {
+    method: 'POST',
+    headers: { ...H, 'x-router-token': token },
+    body: JSON.stringify({
+      providers: {
+        'maas-dsv4': {
+          label: 'dsv4 (two keys)',
+          baseURL: 'https://maas-apigateway.dt.zte.com.cn/model/deepseek-v4-flash/v1',
+          // The bogus one is first, so the only way this request can succeed is
+          // by stepping over it to the second credential of the same provider.
+          keys: [{ id: 'bad', label: 'bogus', key: bogus }, { id: real?.id ?? 'k1', label: 'real', key: '' }],
+          models: ['deepseek-v4-flash'],
+        },
+      },
+      router: { order: [{ provider: 'maas-dsv4', model: 'deepseek-v4-flash' }], retries: 0 },
+    }),
+  })
+  const restoredDoc = await restored.json()
+  record('两把 key 的配置保存成功（第二把留空保住真密钥）',
+    restoredDoc.value?.providers?.[0]?.keys?.length === 2
+      && restoredDoc.value.providers[0].keys[1].set === true,
+    JSON.stringify(restoredDoc.value?.providers?.[0]?.keys?.map((k) => ({ id: k.id, set: k.set }))))
+
+  const body = { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'Reply with exactly: OK' }], thinking: { type: 'disabled' }, max_tokens: 24 }
+  const r = await fetch(`${base}/v1/chat/completions`, { method: 'POST', headers: H, body: JSON.stringify(body) })
+  const j = await r.json()
+  record('坏 key 在前时仍然 200（在同一供应商内切到第二把）',
+    r.status === 200 && typeof j.choices?.[0]?.message?.content === 'string',
+    `${r.status} ${JSON.stringify(j).slice(0, 200)}`)
+
+  const after = await (await fetch(`${base}/admin/api/state`, { headers: { 'x-router-token': token } })).json()
+  const keys = after.value.providers.find((p) => p.id === 'maas-dsv4')?.keys ?? []
+  const bad = keys.find((k) => k.id === 'bad')
+  const good = keys.find((k) => k.id !== 'bad')
+  const badRow = after.value.rows.find((row) => row.keyId === 'bad')
+  record('坏 key 被记账（拉黑或累计失败），好 key 不受影响',
+    bad !== undefined && (bad.blacklisted === true || badRow?.failures >= 1) && good?.blacklisted === false,
+    JSON.stringify({ bad: { blacklisted: bad?.blacklisted, reason: bad?.blacklist?.reason, failures: badRow?.failures }, good: { blacklisted: good?.blacklisted } }))
+  record('坏 key 的处理方式在事件流里可见',
+    (after.value.recent ?? []).some((event) => event.keyId === 'bad' && ['blacklist', 'failure', 'ignored'].includes(event.kind)),
+    JSON.stringify((after.value.recent ?? []).slice(0, 3).map((e) => `${e.kind}:${e.provider}#${e.keyId}`)))
+  record('拉黑（如果是拉黑）带的是凭据类原因',
+    bad?.blacklisted !== true || ['authentication_error', 'permission_error', 'insufficient_balance'].includes(bad?.blacklist?.reason),
+    bad?.blacklist?.reason ?? '(未拉黑)')
 }
 
 // 8. probe against the real gateway
