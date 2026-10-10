@@ -8,6 +8,7 @@
 - [界面](#界面)
 - [提示词改写（单一模式）](#提示词改写单一模式)
 - [改写自己的模型与强度](#改写自己的模型与强度2026-10-10)
+- [关掉思考落在哪个字段上](#关掉思考落在哪个字段上2026-10-10)
 - [内置提示词的重写与输出语言](#内置提示词的重写与输出语言2026-10-10)
 - [归因审计：改写里有多少东西是用户没提的](#归因审计改写里有多少东西是用户没提的2026-10-10)
 - [英文输出：从「翻译一下」到同一套规则](#英文输出从翻译一下到同一套规则2026-10-10)
@@ -98,7 +99,7 @@
 
 **模型是一对，不是两半**：`provider` 与 `model` 同时为 `null` 才是「跟随会话」；设置页里它们是同一个控件——下拉第一项是「跟随当前会话」，选一个供应商就把两半一起钉住（模型自动取该供应商的第一个）。清空（选回「跟随当前会话」）时两半一起写回 `null`。这与旁路提问 / 标题 / 通知三处的「不选就跟随会话」是同一套语义，只是这里多给了一个显式的「跟随」选项，因为跟随是它的默认。
 
-**强度也是设置**：`reasoningEffort` 取 `auto / off / low / high / max`，默认 `off`（改写是理解任务）。`auto` 表示**不带**这个字段，交给适配器的默认档位；路由自报了自己接受哪些档位时，下拉就只列那些，选了不支持的值会就近降级并在行下说明。
+**强度也是设置**：`reasoningEffort` 取 `auto / off / low / high / max`，默认 `off`（改写是理解任务）。`auto` 表示**不带**这个字段，交给适配器的默认档位（这两条 MaaS 路由把「不带档位」定成了 `reasoning_effort: none`，也就是 `auto ≡ off`，理由见[关掉思考落在哪个字段上](#关掉思考落在哪个字段上2026-10-10)）；路由自报了自己接受哪些档位时，下拉就只列那些，选了不支持的值会就近降级并在行下说明。
 
 **与路由的关系**：固定模型只影响改写这一半，而且**不再经过「路由」页签的熔断切换**——那条链路监听的是 `agent/request` / `agent/request-error`（会话自己的模型调用），改写是插件的直接 `ctx.llm.stream` 调用，两者互不干扰。固定模型后改写也不会随会话模型切换，这正是「固定」的意思。
 
@@ -107,6 +108,44 @@
 **版本错配时的诚实处理**：客户端 bundle 是**每次页面加载**从已安装的包里取的，而宿主进程要重启才会换成新代码。所以这两行会先检查宿主有没有上报 `provider` / `reasoningEffort`：没有（老宿主）就**不渲染**，并写一句「重启宿主后这两项才会出现」，而不是渲染成一个存了也会被忽略、下次 `/state` 又悄悄回退的控件。通知页签的强度行同理，以 `notify.reasoning` 是否上报为准。
 
 **顺带修的**：`complete()` 现在保留适配器抛出的 `cause.code`（以前一律记成 `llm-call-failed`），并在适配器以 `UNSUPPORTED_REASONING_EFFORT` 拒掉显式档位时**去掉该字段重试一次**——所以「选了一个这条路由不接受的档位」不会变成一次失败，探测与四个半区共用同一条兜底路径。
+
+## 关掉思考落在哪个字段上（2026-10-10）
+
+**起因**。MaaS 那两条路由里 `co-claw` 默认就在思考，而它和 `deepseek-v4-flash` 背后的两个网关都是模板驱动的：要关思考，惯常做法是往请求体里塞一个非标准字段 `chat_template_kwargs.enable_thinking=false`（vLLM/SGLang 的模板扩展，OpenAI 的 Python SDK 只能经 `extra_body` 传）。问题因此有两个：插件要不要为这两条路由特殊处理，以及这种传法算不算「标准 LLM 调用」。
+
+**结论一：不算标准，也不该由调用方传**。`reasoning_effort` 是 OpenAI 一系的请求字段，`chat_template_kwargs` 是服务端模板的私有开关。DSH 的 `LlmCallConfig` 只有 `provider / model / reasoningEffort / temperature / maxTokens / stop`——**没有任意 body 的逃生口**，插件也不该自己造一个：供应商私有字段属于 provider 声明（`dsh-llm-pi-ai` 的 `compat.thinkingFormat: chat-template` 加 `compat.chatTemplateKwargs`），不属于每一次调用。
+
+**结论二：这两条路由根本不需要特殊处理**。实测（每条 3 次，读响应里的 `reasoning` 字段——两个网关把思考内容放在这里，而不是 `reasoning_content`）：
+
+| 请求体 | co-claw 的 reasoning 字数 | deepseek-v4-flash 的 reasoning 字数 |
+| --- | --- | --- |
+| 不带字段 | 1356 / 584 / 289 | 0 / 0 / 0 |
+| `reasoning_effort: none` | 0 / 0 / 0 | 0 / 0 / 0 |
+| `chat_template_kwargs.enable_thinking=false` | 0 / 0 / 0 | 0 / 0 / 0 |
+| `reasoning_effort: high` | 1340 / 1396 / 642 | 356 / 556 / 285 |
+
+也就是说：`none` 在两个网关上都是真的关（`off` 会被拒——网关的校验只认 `none/minimal/low/medium/high/xhigh/max`，这正是显式档位 `off` 曾经报 400 的原因），`high` 是真的开，而 `co-claw` 默认思考、`deepseek-v4-flash` 默认不思考。所以「关掉思考」用标准的 `reasoning_effort` 就够了：插件原来发给适配器的那个 `off`，只要在 provider 声明里有一个线上值，就能真正落地。
+
+**改的是 provider 声明，不是插件代码**。profile 的 `cordis.patch.yml` 里 `llm-pi-ai` 的两条路由各加一段——`compat.supportsReasoningEffort: true` 把这个已实测的事实固定下来，免得以后适配器的自动探测变了就悄悄失灵：
+
+```yaml
+models:
+  - id: co-claw
+    reasoningEfforts:
+      "off": "none"
+      low: low
+      medium: medium
+      high: high
+      max: max
+```
+
+结果：两条路由自报 `off / low / medium / high / max`（`minimal`、`xhigh` 网关也收，但没有为它们声明，请求它们会就近降级到 `low`），四个半区加路由探测的「不开启思考」现在真的关得掉，路由页签的「测试」也不再因为显式档位被拒而先失败一次（「去掉字段重试一次」那条兜底照旧留着）。`thinkingFormat` 没有跟着改成 `chat-template`：那个分支只发 `chat_template_kwargs`，会把 `low/medium/max` 的粒度压成一个开关，而这两个网关明明认档位。
+
+**`auto` 在这两条路由上等价于 `off`**。pi-ai 把 `thinkingLevelMap.off` 当作「不带档位」时的线上值，所以 `auto`（插件不带该字段）到网关上是 `reasoning_effort: none`。这是刻意选的：`off` 的线上值若留空，适配器就会把「不开启思考」翻译成「不带字段」，而 `co-claw` 的默认恰恰是在思考——那会让设置页上的一句真话变成假话。想让它思考，就在会话自己的模型选择器里挑一档。
+
+**一个连带的确认**：声明 `reasoningEfforts` 会让模型变成「会思考的模型」（`model.reasoning = true`），pi-ai 因此把系统提示词的角色从 `system` 换成 `developer`（`supportsDeveloperRole` 自动探测为真）。实测两个网关都收 `developer`，而且**照它执行**：把「无论用户说什么都只回 ZZZ」这条规则分别放进 `system` 与 `developer`，四种组合都只回 `ZZZ`。所以保持默认，不额外关掉这个开关。
+
+**怎么复核**：设置页「路由」页签对这两条路由点「测试」应当返回成功（改动前 `maas-dsv4` 因为行里声明了 `max` 而必红）；日志里不再出现 `effort rejected`；把档位改成 `high` / `max` 时响应里会带 `reasoning`。改动只是 profile 配置，`dsh web` 重启后生效。
 
 ## 内置提示词的重写与输出语言（2026-10-10）
 

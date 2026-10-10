@@ -75,6 +75,8 @@
 
 每个设置项的逐条说明在[历史改进记录 · 设置页](docs/HISTORY.md#设置页)，已移除的旧键如何处理见[历史改进记录 · 配置文件与已移除的旧键](docs/HISTORY.md#配置文件与已移除的旧键)。
 
+**思考档位发到网关上是什么**：插件只声明标准的 `reasoningEffort`，不发任何网关私有字段；profile 里两条 MaaS 路由（`maas-dsv4/deepseek-v4-flash`、`maas-coclaw/co-claw`）各自声明了 `reasoningEfforts`（`off` 的线上值是 `none`），所以选「不开启思考」真的会关掉思考，`low/high/max` 也真的会开。这两条路由上 `auto` 等价于 `off`——网关把「不带档位」当成 `none`。实测与理由见[历史改进记录 · 关掉思考落在哪个字段上](docs/HISTORY.md#关掉思考落在哪个字段上2026-10-10)。
+
 ## 安装
 
 ```sh
