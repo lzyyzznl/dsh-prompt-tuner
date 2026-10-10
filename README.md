@@ -77,7 +77,7 @@ dsh plugin add github:lzyyzznl/dsh-prompt-tuner
 仓库根有 `cordis.patch.yml`（一条 `insert`），`package.json` 声明 `dsh.bundle.patch` 与 `dsh.client.platform=web`；不含构建步骤，`lib/` 即源码。
 
 ```sh
-npm run check        # 自检（783 项），不需要本机装 DSH
+npm run check        # 自检（790 项），不需要本机装 DSH
 npm run eval:prompt  # 三臂盲评：只打印计划，加 --live / --judge 才发真实请求
 npm run eval:attribution  # 归因审计：读已有运行记录，量「改写加了什么用户没提的东西」
 ```

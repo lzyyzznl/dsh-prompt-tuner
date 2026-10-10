@@ -1807,6 +1807,25 @@ section('3c. 路由：宿主 wiring')
   check('探测给的输出预算足够思考模型答完（不再是 8）',
     typeof probeCalls[0]?.maxTokens === 'number' && probeCalls[0].maxTokens >= 256,
     String(probeCalls[0]?.maxTokens))
+  check('探测要求关闭思考（一句话不值得花推理 token）',
+    probeCalls[0]?.reasoningEffort === 'off', String(probeCalls[0]?.reasoningEffort))
+  // The escape hatch the probe route uses for a route that cannot turn thinking
+  // off: hand it `null` and the field is omitted entirely.
+  const bareCalls = []
+  const bareCtx = makeRoutingCtx({
+    llm: {
+      stream(options) {
+        bareCalls.push(options)
+        return (async function* () {
+          yield { type: 'text-delta', text: 'pong' }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        })()
+      },
+    },
+  })
+  const bareProbe = await createRouting(bareCtx).probe('a', 'a1', null)
+  check('显式传 null 时不带 reasoningEffort（给不支持 off 的路由留出口）',
+    !('reasoningEffort' in bareCalls[0]) && bareProbe.effort === null, JSON.stringify(bareProbe))
 
   const reasoningLlm = {
     stream() {
@@ -1956,9 +1975,14 @@ section('3c. 路由：宿主路由')
 {
   // The probe route against a scripted adapter, through the real HTTP handler.
   store.writeSettings({ routerOrder: [{ provider: 'a', model: 'a1' }], routerRetries: 0, routerLogLevel: 'silent' })
+  const sent = []
   const ctx = makeRoutingCtx({
     llm: {
-      stream() {
+      // No reasoning metadata: the adapter does not answer, so nothing is known
+      // about what this route accepts and `off` is sent as asked.
+      resolveModelInfo: async () => ({ reasoning: { efforts: [] } }),
+      stream(options) {
+        sent.push(options)
         return (async function* ok() {
           yield { type: 'text-delta', text: 'pong' }
           yield { type: 'finish', reason: { kind: 'stop' } }
@@ -1972,8 +1996,41 @@ section('3c. 路由：宿主路由')
   check('/router.probe 回目标、结果与刷新后的实时状态',
     probed?.value?.target?.provider === 'a' && probed.value.outcome.ok === true
       && Array.isArray(probed.value.live.rows))
+  check('宿主路由把「关闭思考」传进真实调用', sent[0]?.reasoningEffort === 'off', JSON.stringify(sent[0]))
+  check('确认该路由支持 off 时不标记降级',
+    probed.value.outcome.effort === 'off' && probed.value.outcome.effortDegraded === false)
   const reset = (await call(ctx, '/router.reset', {})).json
   check('/router.reset 回清空后的实时状态', reset?.ok === true && reset.value.live.stats.failures === 0)
+}
+
+{
+  // A route that only offers thinking (like `ccx`, which declares `max` alone):
+  // `off` would be rejected before any I/O, so the probe degrades to a level the
+  // route accepts and says so.
+  store.writeSettings({ routerOrder: [{ provider: 'r', model: 'r1' }], routerRetries: 0, routerLogLevel: 'silent' })
+  const sent = []
+  const ctx = makeRoutingCtx({
+    llm: {
+      resolveModelInfo: async () => ({ reasoning: { efforts: [{ id: 'max' }], defaultEffort: 'max' } }),
+      stream(options) {
+        sent.push(options)
+        return (async function* ok() {
+          yield { type: 'reasoning-delta', text: 'thinking' }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        })()
+      },
+    },
+  })
+  const routing = createRouting(ctx)
+  registerRoutes(ctx, routing)
+  const probed = (await call(ctx, '/router.probe', { provider: 'r', model: 'r1' })).json
+  check('不支持关闭思考的路由退用它能接受的档位',
+    sent[0]?.reasoningEffort === 'max', JSON.stringify(sent[0]))
+  check('降级写在结果里，页面才能如实说明',
+    probed.value.outcome.effort === 'max' && probed.value.outcome.effortDegraded === true,
+    JSON.stringify(probed.value.outcome))
+  check('关不掉思考的路由只输出推理时仍算连通（预算足够）',
+    probed.value.outcome.ok === true && probed.value.outcome.code === 'no-text')
 }
 
 
