@@ -460,6 +460,7 @@ function makeTitleHarness(options = {}) {
   const events = options.events ?? []
   const calls = []
   const warnings = []
+  const infos = []
   const listeners = new Map()
   let releaseAsk = null
   const session = {
@@ -475,7 +476,7 @@ function makeTitleHarness(options = {}) {
     },
   }
   const ctx = {
-    logger: { warn: (message) => warnings.push(String(message)), info() {} },
+    logger: { warn: (message) => warnings.push(String(message)), info: (message) => infos.push(String(message)) },
     sessions: {
       get: (id) => (id === session.id ? session : undefined),
       list: () => (options.list === false ? [] : [session]),
@@ -507,6 +508,7 @@ function makeTitleHarness(options = {}) {
     installer,
     calls,
     warnings,
+    infos,
     events,
     settingsOf: () => settings,
     say: (text) => session.append('user/message', { content: [{ type: 'text', text }], source: { kind: 'user' } }),
@@ -536,12 +538,12 @@ function makeTitleHarness(options = {}) {
   h.say('第五条')
   h.say('第六条')
   await h.installer.whenIdle()
-  // The first revision itself occupies a seq, and so does the outcome line
-  // (`session/title-refresh`) this plugin writes right after it, so the three
-  // newest user messages after the second boundary are 5, 6 and 7 — not 4, 5
-  // and 6, and never 3, 4 and 5.
+  // The first revision itself occupies a seq, but the attempt envelope is NOT
+  // appended (a persisted `session/title-refresh` would be an unknown,
+  // non-ignorable event the harness refuses on read), so the three newest user
+  // messages after the second boundary are 4, 5 and 6.
   check('第二个边界读的是最近 3 条，而不是前 3 条',
-    JSON.stringify(h.autoTitles()[1].data.messageSeqs) === '[5,6,7]', JSON.stringify(h.autoTitles()[1].data.messageSeqs))
+    JSON.stringify(h.autoTitles()[1].data.messageSeqs) === '[4,5,6]', JSON.stringify(h.autoTitles()[1].data.messageSeqs))
 }
 
 {
@@ -630,7 +632,9 @@ function makeTitleHarness(options = {}) {
 {
   // The manual path is the cadence implementation with a different trigger: it
   // must not wait for a boundary, must return the outcome to the caller, and
-  // must write that outcome into the session log (`session/title-refresh`).
+  // must NOT write a `session/title-refresh` event into the durable session log
+  // (that would be an unknown, non-ignorable type the harness refuses on read) —
+  // the outcome is returned to the caller and mirrored through the module logger.
   const h = makeTitleHarness({ settings: { titleRerollTurns: 100, titleMaxChars: 12 } })
   h.say('第一条')
   h.say('第二条')
@@ -640,10 +644,12 @@ function makeTitleHarness(options = {}) {
   check('refreshNow 不理会轮数立刻重总结并返回新标题',
     outcome.ok === true && outcome.title === '模型给的标题' && h.calls.length === 1, JSON.stringify(outcome))
   const refreshEvents = h.session.snapshotEvents().filter((event) => event.type === 'session/title-refresh')
-  check('refreshNow 把成功结果写进会话日志（session/title-refresh）',
-    refreshEvents.length === 1 && refreshEvents[0].data.ok === true
-      && refreshEvents[0].data.trigger === 'manual' && refreshEvents[0].data.title === '模型给的标题',
-    JSON.stringify(refreshEvents))
+  check('refreshNow 不把尝试写进会话日志（避免未知不可忽略事件毒化日志）',
+    refreshEvents.length === 0, JSON.stringify(refreshEvents))
+  const infoLines = h.infos.filter((message) => message.includes('title refresh'))
+  check('refreshNow 把成功结果写进模块日志',
+    infoLines.length === 1 && infoLines[0].includes('"ok":true') && infoLines[0].includes('manual') && infoLines[0].includes('模型给的标题'),
+    infoLines.join('|'))
   const missing = await h.installer.refreshNow('不存在的会话 id')
   check('refreshNow 找不到会话时报 no-session', missing.ok === false && missing.code === 'no-session', JSON.stringify(missing))
   check('会话不存在时不会发起模型调用', h.calls.length === 1)
@@ -671,7 +677,11 @@ function makeTitleHarness(options = {}) {
     h.calls.length === 1 && h.autoTitles().length === 1 && h.autoTitles()[0].data.title === '模型给的标题',
     `${h.calls.length} call(s)`)
   const bootEvents = h.session.snapshotEvents().filter((event) => event.type === 'session/title-refresh')
-  check('补重总结记录 trigger=boot 的留痕', bootEvents.length === 1 && bootEvents[0].data.trigger === 'boot', JSON.stringify(bootEvents))
+  check('补重总结不把尝试写进会话日志（避免未知不可忽略事件毒化日志）',
+    bootEvents.length === 0, JSON.stringify(bootEvents))
+  const bootInfo = h.infos.filter((message) => message.includes('title refresh') && message.includes('"boot"'))
+  check('补重总结通过模块日志记录 trigger=boot 的留痕',
+    bootInfo.length === 1, bootInfo.join('|'))
 }
 
 {
