@@ -731,6 +731,8 @@ function makeCtx(script, options = {}) {
         return (async function* run() {
           for (const step of steps) {
             if (step === 'throw') throw new Error('adapter exploded')
+            // A real adapter throws its own error object, code included.
+            if (step instanceof Error) throw step
             yield step
           }
         })()
@@ -1209,6 +1211,42 @@ store.clearBtwTopics('session-a')
   check('清空旁路模型后回落行为与「优化提示词」不设置时一致',
     fallbackUsed.provider === 'deepseek-official' && fallbackUsed.model === 'deepseek-flash'
       && fallbackUsed.reasoningEffort === 'off' && backToDefault.json?.value?.effort === 'off')
+}
+
+{
+  // Every call here sends the configured effort even to a route that advertises
+  // nothing, and an adapter may refuse that before any I/O. The live MaaS gateway
+  // does exactly this for `off` (it knows `none`, `low` … `max`), which would fail
+  // every rewrite, side question, title and notification on that route. A rejected
+  // request is retried once with the field omitted; the rejection itself is not
+  // reported as the model's answer.
+  const rejected = Object.assign(
+    new Error('provider "maas-dsv4" model "deepseek-v4-flash" does not support reasoning effort "off"'),
+    { code: 'UNSUPPORTED_REASONING_EFFORT' },
+  )
+  const ctx = makeCtx(
+    (call) => (call.reasoningEffort === undefined ? btwStep('旁路答案') : [rejected]),
+    { sessionModel: { provider: 'maas-dsv4', model: 'deepseek-v4-flash' } },
+  )
+  registerRoutes(ctx)
+  const res = await call(ctx, '/btw', { question: '这条线路能用吗？', context: '' })
+  check('适配器拒绝显式强度时自动去掉该字段重试一次',
+    ctx.calls.length === 2 && ctx.calls[0].reasoningEffort === 'off' && ctx.calls[1].reasoningEffort === undefined,
+    JSON.stringify(ctx.calls.map((entry) => entry.reasoningEffort)))
+  check('重试成功即算成功，错误不冒到用户面前',
+    res.json?.ok === true && res.json?.value?.text === '旁路答案', JSON.stringify(res.json))
+  check('重试仍是同一条路由、同一份消息', ctx.calls[1].provider === ctx.calls[0].provider
+    && ctx.calls[1].model === ctx.calls[0].model
+    && JSON.stringify(ctx.calls[1].messages) === JSON.stringify(ctx.calls[0].messages))
+
+  const alwaysRejected = makeCtx(() => [rejected])
+  registerRoutes(alwaysRejected)
+  const twice = await call(alwaysRejected, '/btw', { question: '还是不行呢？', context: '' })
+  const attemptEfforts = alwaysRejected.calls.map((entry) => entry.reasoningEffort ?? null)
+  check('只降级重试一次，再失败就如实报错（不无限重试）',
+    attemptEfforts[0] === 'off' && attemptEfforts.slice(1).every((value) => value === null)
+      && twice.json?.ok === false && twice.json?.error?.code === 'UNSUPPORTED_REASONING_EFFORT',
+    JSON.stringify(attemptEfforts))
 }
 
 {
@@ -1890,6 +1928,59 @@ section('3c. 路由：宿主 wiring')
   const boomCtx = makeRoutingCtx({ llm: { stream() { throw new Error('adapter exploded') } } })
   const boomRouting = createRouting(boomCtx)
   check('探测抛异常也被收住，不把设置页打崩', (await boomRouting.probe('a', 'a1')).ok === false)
+
+  // The case this was written for, seen live on `maas-dsv4`: an adapter that
+  // advertises no efforts at all and rejects the explicit knob before any I/O.
+  // The rejection is a statement about the request, not about the route, so the
+  // probe asks again with the field omitted instead of reporting a working route
+  // as unreachable.
+  const noisyCalls = []
+  const noisyRouting = createRouting(makeRoutingCtx({
+    llm: {
+      stream(options) {
+        noisyCalls.push(options)
+        if (options.reasoningEffort !== undefined) {
+          return (async function* rejected() {
+            const error = new Error('provider "a" model "a1" does not support reasoning effort "off"')
+            error.code = 'UNSUPPORTED_REASONING_EFFORT'
+            throw error
+          })()
+        }
+        return (async function* fine() {
+          yield { type: 'text-delta', text: 'pong' }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        })()
+      },
+    },
+  }))
+  const noisyProbe = await noisyRouting.probe('a', 'a1')
+  check('适配器拒绝显式强度时自动去掉该字段重试一次',
+    noisyCalls.length === 2 && noisyCalls[0].reasoningEffort === 'off' && !('reasoningEffort' in noisyCalls[1]),
+    JSON.stringify(noisyCalls.map((call) => call.reasoningEffort)))
+  check('去掉字段后成功即算连通，并标出这次探测降级了',
+    noisyProbe.ok === true && noisyProbe.effort === null && noisyProbe.effortOmitted === true, JSON.stringify(noisyProbe))
+  check('被适配器拒绝的那次不记成供应商故障',
+    noisyRouting.view().rows[0].state === CLOSED && noisyRouting.view().stats.failures === 0
+      && noisyRouting.view().stats.probeOk === 1)
+
+  const stillBadRouting = createRouting(makeRoutingCtx({
+    llm: {
+      stream(options) {
+        return (async function* bad() {
+          if (options.reasoningEffort !== undefined) {
+            const error = new Error('provider "a" model "a1" does not support reasoning effort "off"')
+            error.code = 'UNSUPPORTED_REASONING_EFFORT'
+            throw error
+          }
+          yield { type: 'finish', reason: { kind: 'error', failure: { code: 'SERVER', status: 503, message: 'down' } } }
+        })()
+      },
+    },
+  }))
+  const stillBadProbe = await stillBadRouting.probe('a', 'a1')
+  check('降级重试也失败时按重试后的那次记账',
+    stillBadProbe.code === 'SERVER' && stillBadRouting.view().rows[0].state === OPEN,
+    JSON.stringify(stillBadProbe))
 }
 
 {
@@ -3061,6 +3152,19 @@ function makeFetch(options = {}) {
         const value = { ...STATE.value, router: { ...STATE.value.router, config: null, live: null } }
         return new Response(JSON.stringify({ ok: true, value }), { status: 200 })
       }
+      if (options.routerGone === true) {
+        // The user deleted a provider the order table still names: the catalog no
+        // longer offers it, the order row is still stored, and the host reports it.
+        // The side-question pair is pinned to it too, which is the other half of
+        // the bug (the 「旁路提问」 picker fell back to the first provider).
+        const value = {
+          ...STATE.value,
+          settings: { ...STATE.value.settings, btwProvider: 'ccx', btwModel: 'deepseek-v4-flash' },
+          models: STATE.value.models.filter((group) => group.id !== 'ccx'),
+          router: { ...STATE.value.router, missingProviders: ['ccx'] },
+        }
+        return new Response(JSON.stringify({ ok: true, value }), { status: 200 })
+      }
       return new Response(JSON.stringify(STATE), { status: 200 })
     }
     if (action === 'optimize.stream') {
@@ -4052,6 +4156,79 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
     lastRequest('router.reset') !== undefined
       && findAll(panelOf(tree), (node) => node.props?.className === 'dspo-state').every((node) => node.props['data-state'] === 'closed')
       && textOf(panelOf(tree)).includes(Z.routerLiveResetDone))
+  bundle.__restore()
+}
+
+{
+  // A provider the user deleted while its order row stayed behind. This is the
+  // regression the settings page showed live: a `<select>` whose `value` matches
+  // no `<option>` silently displays the *first* option, so a stale `ccx` row
+  // rendered as the provider next to it with a blank model column — the table
+  // looked like it had rewritten itself.
+  const fetchImpl = makeFetch({ saveOk: true, routerGone: true, routerMissing: ['ccx'] })
+  const bundle = loadClientBundle(fetchImpl)
+  await bundle.settingsStore.load(true)
+  const render = mountClient(bundle, bundle.SettingsPanel)
+  const page = () => render({ close() {} })
+  const panelOf = (tree) => findAll(tree, (node) => node.props?.role === 'tabpanel' && node.props.id === 'dspo-panel-router')[0]
+  findAll(page(), (node) => node.props?.id === 'dspo-tab-router')[0].props.onClick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  let tree = page()
+  const Z = bundle.DICT.zh
+  const at = (tree2, id) => findAll(panelOf(tree2), (node) => node.props?.id === id)[0]
+  const valuesOf = (select) => (select?.children ?? []).map((option) => option.props.value)
+  const labelsOf = (select) => (select?.children ?? []).map(textOf)
+
+  const provider1 = at(tree, 'dspo-router-provider-1')
+  check('已注销供应商的那一行仍然选中它自己（不再回落到第一个选项）',
+    provider1?.props?.value === 'ccx' && valuesOf(provider1)[0] === 'ccx',
+    `${provider1?.props?.value} / ${valuesOf(provider1).join(',')}`)
+  check('该行标出「未注册」，并且仍可改选一个已注册的供应商',
+    labelsOf(provider1)[0].includes(Z.providerUnregistered) && valuesOf(provider1).includes('deepseek-official'),
+    labelsOf(provider1).join(' | '))
+  check('该行的模型下拉显示存储的模型（不再是空白）',
+    at(tree, 'dspo-router-model-1')?.props?.value === 'deepseek-v4-flash'
+      && labelsOf(at(tree, 'dspo-router-model-1'))[0].includes('deepseek-v4-flash'),
+    labelsOf(at(tree, 'dspo-router-model-1')).join(' | '))
+  check('注册过的行不受影响',
+    at(tree, 'dspo-router-provider-0')?.props?.value === 'deepseek-official')
+  check('页面仍然明说哪个供应商没有注册',
+    textOf(panelOf(tree)).includes(Z.routerOrderMissing.replace('{list}', 'ccx')))
+
+  const prune = buttonsOf(panelOf(tree)).find((button) => labelOf(button).trim() === Z.routerOrderPrune)
+  check('提供「移除未注册的行」，且未注册时可用', prune !== undefined && prune.props.disabled === false)
+  prune.props.onClick()
+  tree = page()
+  check('一键移除只去掉未注册的那一行，并且仍要保存才写盘',
+    findAll(panelOf(tree), (node) => node.props?.className === 'dspo-order-row').length === 1
+      && at(tree, 'dspo-router-provider-0').props.value === 'deepseek-official'
+      && textOf(panelOf(tree)).includes(Z.routerOrderDirty))
+  check('没有未注册的行时按钮置灰（不会误删）',
+    buttonsOf(panelOf(tree)).find((button) => labelOf(button).trim() === Z.routerOrderPrune).props.disabled === true)
+
+  const probeButtons = buttonsOf(panelOf(tree)).filter((button) => labelOf(button).trim() === Z.routerProbe)
+  check('实时区里未注册行的测试按钮给出理由，而不是必然失败',
+    probeButtons.length === 2 && probeButtons[1].props.disabled === true && probeButtons[1].props.title === Z.routerProbeUnknown,
+    JSON.stringify(probeButtons.map((button) => [button.props.disabled, button.props.title])))
+  check('实时区里注册过的行仍可测试', probeButtons[0].props.disabled === false)
+  check('实时区标注了未注册的行', textOf(panelOf(tree)).includes(Z.routerLiveUnknown))
+
+  // The same stale provider pinned on the side-question tab: its picker used to
+  // fall back to the first provider in the catalog, so the page showed a model
+  // the user never chose. (Their live settings pin exactly this pair.)
+  findAll(page(), (node) => node.props?.id === 'dspo-tab-btw')[0].props.onClick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  const btwPanel = findAll(page(), (node) => node.props?.role === 'tabpanel' && node.props.id === 'dspo-panel-btw')[0]
+  const btwProvider = findAll(btwPanel, (node) => node.props?.id === 'dspo-btw-provider')[0]
+  const btwModel = findAll(btwPanel, (node) => node.props?.id === 'dspo-btw-model-pick')[0]
+  check('旁路提问页签也如实显示已注销的供应商（不再回落到第一个）',
+    btwProvider?.props?.value === 'ccx' && (btwProvider.children ?? []).map((option) => option.props.value)[0] === 'ccx'
+      && textOf(btwProvider.children[0]).includes(Z.providerUnregistered),
+    `${btwProvider?.props?.value} / ${(btwProvider?.children ?? []).map(textOf).join(' | ')}`)
+  check('该页签的模型仍是存储的那个，并标出未注册',
+    btwModel?.props?.value === 'deepseek-v4-flash' && btwModel.props.disabled === true
+      && textOf(btwModel.children[0]).includes(Z.providerUnregistered),
+    textOf(btwModel))
   bundle.__restore()
 }
 
