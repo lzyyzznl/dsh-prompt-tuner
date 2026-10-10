@@ -686,6 +686,39 @@ stub.calls.length = 0
 const second = await chat('co-claw')
 check('第二次请求直接跳过已熔断的路由', second.status === 200 && stub.calls.length === 1, `${second.status} calls=${stub.calls.length}`)
 
+section('5a-2. 表里没有的模型不会被别的模型顶包')
+// 这一段防的是最坏的一类错：请求一个模型、拿到 200、名字还回显成你请求的那个，
+// 而背后答话的是另一个网关。上面 5a 里 `co-claw` 命中的是表里的行（正常切换），
+// 这里把 maas-coclaw 从表里拿掉——它仍然是**配置好的**供应商，所以全名应当只打它自己。
+stub.keyStatus = {}
+await cleanSlate()
+await configure({ order: [{ provider: 'maas-dsv4', model: 'deepseek-v4-flash' }], router: { retries: 0, failureThreshold: 2 } })
+stub.calls.length = 0
+const qualified = await chat('maas-coclaw/co-claw')
+check('没列进表的全名由它自己的供应商作答（HTTP 200）', qualified.status === 200, `${qualified.status} ${qualified.text.slice(0, 160)}`)
+check('而且真的打在 co-claw 的密钥上，不是表头那条', stub.calls.length === 1 && stub.calls[0]?.key === 'gw-broken', `${stub.calls.length} calls key=${stub.calls[0]?.key}`)
+check('回显的仍是调用方请求的名字', qualified.json?.model === 'maas-coclaw/co-claw', qualified.json?.model)
+
+stub.calls.length = 0
+stub.keyStatus = { 'gw-broken': 503 }
+const stranded = await chat('maas-coclaw/co-claw')
+check('它自己挂了就如实失败，不切到别的模型去', stranded.status >= 400, `${stranded.status}`)
+check('失败时也只打了它自己一次', stub.calls.length === 1 && stub.calls[0]?.key === 'gw-broken', `${stub.calls.length} calls key=${stub.calls[0]?.key}`)
+stub.keyStatus = {}
+await cleanSlate()
+
+stub.calls.length = 0
+const ghost = await chat('totally-bogus/not-configured')
+check('瞎写的供应商/模型返回 404，而不是 200', ghost.status === 404, `${ghost.status} ${ghost.text.slice(0, 160)}`)
+check('404 的错误体仍是参照契约形状', ghost.json?.error?.type === 'invalid_request_error' && ghost.json?.error?.param === null, JSON.stringify(ghost.json).slice(0, 140))
+check('被拒的请求一个上游包都没发', stub.calls.length === 0, String(stub.calls.length))
+
+stub.calls.length = 0
+const bare = await chat('co-claw')
+check('只有模型名、表里又没有：无从判断供应商，也 404', bare.status === 404, `${bare.status}`)
+check('这条同样没有打上游', stub.calls.length === 0, String(stub.calls.length))
+await configure({ order: DEFAULT_ORDER, router: { retries: 0, failureThreshold: 2 } })
+
 section('5b. 同一条路由先重试，重试用完才切换')
 stub.keyStatus = {}
 stub.mode = 'failOnce'
