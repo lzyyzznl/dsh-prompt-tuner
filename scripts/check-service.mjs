@@ -536,8 +536,9 @@ section('4. /v1/models 与入参语义')
 const models = await get(`${base}/v1/models`)
 check('/v1/models 返回 list 形状', models.json?.object === 'list' && Array.isArray(models.json.data))
 const modelIds = (models.json?.data ?? []).map((entry) => entry.id)
-check('列出两种拼写（模型名与 provider/model）',
-  modelIds.includes('deepseek-v4-flash') && modelIds.includes('maas-dsv4/deepseek-v4-flash'), modelIds.join(','))
+check('只列 provider/model 带前缀拼写，不再列有歧义的裸名',
+  modelIds.includes('maas-dsv4/deepseek-v4-flash') && modelIds.includes('maas-coclaw/co-claw')
+  && !modelIds.includes('deepseek-v4-flash') && !modelIds.includes('co-claw'), modelIds.join(','))
 check('每条模型都是 OpenAI 形状',
   (models.json?.data ?? []).every((entry) => entry.object === 'model' && typeof entry.owned_by === 'string' && Number.isFinite(entry.created)))
 

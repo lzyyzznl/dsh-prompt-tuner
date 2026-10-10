@@ -541,7 +541,7 @@ thresholdRatio = 你要的 token 数 ÷ 该模型窗口大小
 | `system_fingerprint` | 有 | 有（`vllm-0.26.0-tp8-ep-b67fe5ed`） | 原样透传，缺失时合成 | 原样透传 |
 | 顶层噪声 | — | `service_tier`/`prompt_token_ids`/`prompt_text`/`kv_transfer_params`/`metrics`… | 摘掉 | 响应顶层只剩 `id/object/created/model/choices/system_fingerprint/usage` |
 | choice 噪声 | — | `stop_reason`/`token_ids`/`routed_experts` | 摘掉 | 同上 |
-| `/v1/models` | 有 | **404** | 由配置合成（模型名与 `provider/model` 两种拼写） | `["deepseek-v4-flash","maas-dsv4/deepseek-v4-flash","co-claw","maas-coclaw/co-claw"]` |
+| `/v1/models` | 有 | **404** | 由顺序表合成，每行只列 `provider/model`（裸模型名有歧义——`deepseek-v4-flash` 同时被两家承载，不列入目录） | `["maas-dsv4/deepseek-v4-flash","maas-coclaw/co-claw"]` |
 | 错误体 | `{error:{message,type,param,code}}` | vLLM 自己的形状 | 按状态码重写 | 429 → `rate_limit_error` / `rate_limit_exceeded` |
 
 ### 两个刻意的「不做」
