@@ -1040,23 +1040,23 @@ check('未注册供应商的行留着一个 registered:false 的说明',
   onlyRouter.rows[0]?.registered === false, JSON.stringify(onlyRouter.rows[0]))
 await configure({ order: DEFAULT_ORDER, router: { retries: 0, failureThreshold: 2 } })
 
-/* ───────────────────────── 12. custom headers ───────────────────────── */
+/* ───────────────────────── 12. custom headers (removed) ───────────────────────── */
 
-section('12. 自定义请求头')
+section('12. 自定义请求头（已整条移除）')
 
 await cleanSlate()
 await configure({ order: [{ provider: 'p-head', model: 'm-head' }], router: { retries: 0 } })
 stub.keyStatus = {}
 stub.calls.length = 0
-const headed = await chat('m-head')
-check('provider.headers 合并进上游请求',
-  stub.calls[0]?.headers?.['x-stub-token'] === 'hdr-value', JSON.stringify(stub.calls[0]?.headers?.['x-stub-token']))
-check('自定义 authorization 覆盖 key 的 Authorization（headers 在 callUpstream 里最后展开）',
-  headed.status === 200 && stub.calls[0]?.authorization === 'Bearer header-token', JSON.stringify(stub.calls[0]?.authorization))
+await chat('m-head')
+check('配置里的 headers 不再合并进上游请求（字段已移除）',
+  stub.calls[0]?.headers?.['x-stub-token'] === undefined, JSON.stringify(stub.calls[0]?.headers))
+check('上游只带所选 key 的 Bearer 凭据，自定义 authorization 不再覆盖',
+  stub.calls[0]?.authorization === 'Bearer hd-a', JSON.stringify(stub.calls[0]?.authorization))
 await saveProvider('p-head', { headers: {} })
 stub.calls.length = 0
 await chat('m-head')
-check('没有自定义 authorization 时用所选 key 的凭据',
+check('再次保存后仍是 key 自己的凭据',
   stub.calls[0]?.authorization === 'Bearer hd-a', JSON.stringify(stub.calls[0]?.authorization))
 
 /* ───────────────────────── 13. state payload & /v1 surface ───────────────────────── */

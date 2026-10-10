@@ -1885,9 +1885,10 @@ section('3c-11. 配置补丁：密钥保留、轮换、删除')
     return keys.length === 1 && keys[0].key === ''
   })())
   check('没提到的 timeoutMs 不会被重置', patch({ label: 'p1', baseURL: 'https://a.example/v1', models: ['m1'] }).timeoutMs === 120_000)
-  check('头是字符串值扁平对象', patch({ label: 'p1', baseURL: 'https://a.example/v1', models: ['m1'], headers: { 'x-a': 'b' } }).headers['x-a'] === 'b')
-  check('请求头不是字符串值时被拒', (() => {
-    try { patch({ label: 'p1', baseURL: 'https://a.example/v1', models: ['m1'], headers: { 'x-a': 1 } }); return false } catch { return true }
+  check('headers 已被整条移除：提交里带 headers 也会被丢弃', patch({ label: 'p1', baseURL: 'https://a.example/v1', models: ['m1'], headers: { 'x-a': 'b' } }).headers === undefined)
+  check('headers 非字符串值不再校验（字段已移除，旧请求体原样忽略）', (() => {
+    const out = patch({ label: 'p1', baseURL: 'https://a.example/v1', models: ['m1'], headers: { 'x-a': 1 } })
+    return out.headers === undefined
   })())
   check('超过密钥上限被拒', (() => {
     try {

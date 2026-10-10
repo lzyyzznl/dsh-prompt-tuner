@@ -579,7 +579,6 @@ function fixtureState() {
         models: ['alpha-small'],
         discoveredModels: ['alpha-large'],
         allModels: ['alpha-small', 'alpha-large'],
-        headers: { 'X-Tenant': 'acme' },
         timeoutMs: 120000
       },
       {
@@ -593,7 +592,6 @@ function fixtureState() {
         models: ['beta-1'],
         discoveredModels: ['beta-2'],
         allModels: ['beta-1', 'beta-2'],
-        headers: {},
         timeoutMs: 120000
       }
     ],
@@ -750,7 +748,7 @@ function bootPage(options = {}) {
 /** Every key the previous revision of this page shipped. */
 const BASELINE_KEYS = [
   'serviceName', 'refresh', 'lastUpdated', 'up', 'down', 'loading', 'providers', 'providersHint',
-  'addProvider', 'saveProviders', 'thId', 'thLabel', 'thBaseURL', 'thApiKey', 'thModels', 'thHeaders',
+  'addProvider', 'saveProviders', 'thId', 'thLabel', 'thBaseURL', 'thApiKey', 'thModels',
   'thActions', 'apiKeySet', 'apiKeyUnset', 'deleteRow', 'routing', 'routingHint', 'saveRouting',
   'thProvider', 'thModel', 'thRouteLabel', 'moveUp', 'moveDown', 'removeUnregistered', 'notRegistered',
   'enabled', 'retries', 'failureThreshold', 'windowMs', 'cooldownMs', 'cooldownFactor', 'cooldownMaxMs',
@@ -760,7 +758,7 @@ const BASELINE_KEYS = [
   'stats', 'statRequests', 'statFailures', 'statOpens', 'statSwitches', 'statRetries', 'statExhausted',
   'statProbes', 'statProbeOk', 'rawTitle', 'rawHint', 'rawBase', 'rawChat', 'rawModels', 'copy', 'copied',
   'copyFailed', 'serverPort', 'serverHost', 'savePort', 'restartNotice', 'none', 'saved', 'fixErrors',
-  'badResponse', 'netError', 'pollFailed', 'invalidId', 'invalidBaseURL', 'modelsEmptyWarn', 'invalidHeaders',
+  'badResponse', 'netError', 'pollFailed', 'invalidId', 'invalidBaseURL', 'modelsEmptyWarn',
   'invalidNumber', 'duplicateId', 'rowIncomplete', 'reasoningChars', 'attemptLabel', 'attemptUnit',
   'waitLabel', 'probeOk', 'probeFail', 'kindRetry', 'kindFailure', 'kindSwitch', 'kindSuccess',
   'kindExhausted', 'kindNoAlternative', 'kindProbe', 'evRetry', 'evFailure', 'evSwitch', 'evSuccess',
@@ -870,8 +868,9 @@ check('留空的密钥提交为空字符串（服务端据此保留已存值）'
 check('密钥标签原样提交', !!body1 && body1.providers.alpha.keys[0].label === 'main' && body1.providers.alpha.keys[1].label === 'backup')
 check('供应商其它字段随行提交', !!body1 && body1.providers.alpha.baseURL === 'https://alpha.example/v1'
   && body1.providers.alpha.models.join(',') === 'alpha-small'
-  && body1.providers.alpha.headers['X-Tenant'] === 'acme'
   && body1.providers.alpha.timeoutMs === 120000)
+check('headers 已从提交体里消失（字段被整条移除）',
+  !!body1 && body1.providers.alpha.headers === undefined, JSON.stringify(body1?.providers?.alpha))
 check('请求带上内嵌 token 头',
   save1.posts().every((record) => record.options.headers['X-Router-Token'] === TOKEN))
 
@@ -902,33 +901,16 @@ check('新增密钥行后提交的 keys 多一项', !!body3 && body3.providers.a
 check('新增的密钥不带 id（由服务端分配 k1/k2/…）', !!body3 && body3.providers.alpha.keys[2].id === undefined)
 check('新增密钥的新值被提交', !!body3 && body3.providers.alpha.keys[2].key === 'sk-new')
 
-/* ───────────────────────── 6. headers + percent ───────────────────────── */
+/* ───────────────────────── 6. percent ───────────────────────── */
 
-section('6. headers 扁平 JSON 校验与 failureRateThreshold 百分比换算')
+section('6. failureRateThreshold 百分比换算')
 
-const bad = bootPage()
-await bad.settle()
-const alphaBad = bad.all('[data-role="provider"]').find((node) => node.getAttribute('data-id') === 'alpha')
-const headersBox = alphaBad.querySelector('textarea[data-field="headers"]')
-for (const [label, text] of [['坏 JSON', '{oops'], ['数组', '["a"]'], ['非字符串值', '{"X-A":1}']]) {
-  bad.type(headersBox, text)
-  const before = bad.posts().length
-  bad.click(bad.all('button[data-act="save-providers"]')[0])
-  await bad.settle()
-  const message = alphaBad.querySelector('[data-role="row-error"]').textContent
-  check(`headers ${label} 被拦下并显示行内错误`,
-    bad.posts().length === before && message.includes(strings.zh.invalidHeaders), message)
-}
-
-const good = bootPage()
-await good.settle()
-const alphaGood = good.all('[data-role="provider"]').find((node) => node.getAttribute('data-id') === 'alpha')
-good.type(alphaGood.querySelector('textarea[data-field="headers"]'), '{"X-A":"1","X-B":"2"}')
-good.click(good.all('button[data-act="save-providers"]')[0])
-await good.settle()
-const bodyGood = good.lastBody('config')
-check('合法的扁平 JSON 对象通过并原样提交',
-  bodyGood !== null && bodyGood.providers.alpha.headers['X-A'] === '1' && bodyGood.providers.alpha.headers['X-B'] === '2')
+const noHeaders = bootPage()
+await noHeaders.settle()
+check('供应商表单里不再有 headers 输入框与标签',
+  noHeaders.all('textarea[data-field="headers"]').length === 0
+  && !noHeaders.document.body.textContent.includes('headers (JSON)'),
+  `剩 ${noHeaders.all('textarea[data-field="headers"]').length} 个 headers 框`)
 
 const percent = bootPage()
 await percent.settle()
@@ -1181,7 +1163,7 @@ linkedState.providers.push({
   id: 'gamma', label: 'Gamma', baseURL: 'https://gamma.example/v1',
   keys: [], apiKey: '', apiKeySet: false, keyCount: 0,
   models: ['gamma-1'], discoveredModels: [], allModels: ['gamma-1'],
-  headers: {}, timeoutMs: 120000
+  timeoutMs: 120000
 })
 relink.setAnswer('config', { ...linkedState, removedOrderRows: [] })
 relink.click(relink.all('button[data-act="save-providers"]')[0])
