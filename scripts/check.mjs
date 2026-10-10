@@ -2317,19 +2317,31 @@ function cordisLikeContext(services) {
     nearFull.ok === true && nearFull.policy.thresholdRatio <= compaction.MAX_THRESHOLD_RATIO && nearFull.capped === true)
 
   const plan = compaction.planCompactionPolicies(
-    { 'a/x': 250_000, 'a/y': 250_000, 'a/z': 999, 'bad-key': 250_000, 'a/w': 200_000 },
-    (provider, model) => (model === 'x' || model === 'w' ? 1_000_000 : null),
+    { 'a/x': 250_000, 'a/y': 250_000, 'a/z': 999, 'bad-key': 250_000, 'a/w': 200_000, 'custom/maas-dsv4/deepseek-v4-flash': 200_000 },
+    (key) => {
+      // A route resolver backed by the live catalog: key → exact {provider, model, window}.
+      if (key === 'a/x') return { provider: 'a', model: 'x', contextWindow: 1_000_000 }
+      if (key === 'a/z') return { provider: 'a', model: 'z', contextWindow: 1_000_000 }
+      if (key === 'a/w') return { provider: 'a', model: 'w', contextWindow: 1_000_000 }
+      if (key === 'custom/maas-dsv4/deepseek-v4-flash') return { provider: 'custom', model: 'maas-dsv4/deepseek-v4-flash', contextWindow: 1_000_000 }
+      return null
+    },
   )
   check('批量计划只保留能换算的行，并逐行报告未生效原因',
-    plan.policies.length === 2
+    plan.policies.length === 3
       && plan.skipped.length === 3
-      && plan.skipped.some((row) => row.target === 'a/y' && row.reason === 'context')
+      && plan.skipped.some((row) => row.target === 'a/y' && row.reason === 'unknown-route')
       && plan.skipped.some((row) => row.target === 'a/z' && row.reason === 'tokens')
-      && plan.skipped.some((row) => row.target === 'bad-key' && row.reason === 'route'),
+      && plan.skipped.some((row) => row.target === 'bad-key' && row.reason === 'unknown-route'),
     JSON.stringify(plan.skipped))
   check('批量计划保留索引顺序（同一份设置得到同一份策略）',
-    plan.policies[0].model === 'x' && plan.policies[1].model === 'w',
+    plan.policies[0].model === 'x' && plan.policies[1].model === 'w' && plan.policies[2].model === 'maas-dsv4/deepseek-v4-flash',
     JSON.stringify(plan.policies.map((row) => row.model)))
+  check('model 自身带斜杠的 key 按目录解析出真实的 provider/model，不再错拆',
+    plan.policies[2].provider === 'custom' && plan.policies[2].model === 'maas-dsv4/deepseek-v4-flash'
+      && plan.policies[2].thresholdRatio === 0.2
+      && !plan.policies.some((row) => row.provider === 'custom/maas-dsv4'),
+    JSON.stringify(plan.policies))
 
   const existing = [{ provider: 'a', model: 'x', thresholdRatio: 0.1 }, { provider: 'hand', model: 'made', thresholdRatio: 0.5 }]
   const merged = compaction.mergeModelPolicies(existing, [compaction.compactionPolicy('a', 'x', 250_000, 1_000_000).policy])
@@ -2688,6 +2700,62 @@ function cordisLikeContext(services) {
   check('/compaction.apply 在这种宿主上仍能写入（不再假报 unavailable）',
     strictApply.json?.value?.applied?.ok === true && strictApply.json.value.applied.count === 1,
     JSON.stringify(strictApply.json?.value?.applied ?? null))
+}
+
+/* ── 压缩：model 自身带斜杠的路由（provider=custom + model=maas-dsv4/deepseek-v4-flash）── */
+{
+  // This is the regression the whole fix exists for: a single provider whose
+  // model ids themselves contain a `/`. The stored key
+  // `custom/maas-dsv4/deepseek-v4-flash` must round-trip to the exact live route
+  // {provider:"custom", model:"maas-dsv4/deepseek-v4-flash"} — never be split
+  // into {provider:"custom/maas-dsv4", model:"deepseek-v4-flash"}. Otherwise the
+  // policy written to compaction-basic matches nothing and compaction never fires.
+  let edited = null
+  const slashCtx = makeCtx([], {
+    contextWindow: 1_000_000,
+    configEditor: {
+      entries: () => [{ options: { id: 'compaction-basic', name: '@deepseek-ai/dsh-compaction-basic' } }],
+      edit: async (_entry, change) => {
+        edited = change({ modelPolicies: [] })
+      },
+    },
+  })
+  slashCtx.llm.listProviders = () => [{ id: 'custom', name: 'Custom' }]
+  slashCtx.llm.listModels = async (id) => (id === 'custom'
+    ? [
+        { id: 'maas-dsv4/deepseek-v4-flash', name: 'maas-dsv4/deepseek-v4-flash' },
+        { id: 'maas-coclaw/co-claw', name: 'maas-coclaw/co-claw' },
+        { id: 'deepseek-official/deepseek-v4-flash', name: 'deepseek-official/deepseek-v4-flash' },
+      ]
+    : [])
+  registerRoutes(slashCtx)
+
+  const saved = await call(slashCtx, '/save', {
+    compactionTokens: { 'custom/maas-dsv4/deepseek-v4-flash': 200_000, 'custom/maas-coclaw/co-claw': 200_000 },
+  })
+  check('带斜杠 model 的阈值能被 /save 收下（不再被 lastIndexOf 拆错而拒掉）',
+    saved.json?.ok === true
+      && saved.json.value.settings.compactionTokens['custom/maas-dsv4/deepseek-v4-flash'] === 200_000,
+    JSON.stringify(saved.json?.value?.settings?.compactionTokens ?? null))
+
+  const windowsView = await call(slashCtx, '/compaction.windows', {})
+  check('/compaction.windows 对这些路由仍报出真实 model id（含斜杠）与窗口',
+    windowsView.json?.value?.models?.length === 3
+      && windowsView.json.value.models.some((row) => row.provider === 'custom' && row.model === 'maas-dsv4/deepseek-v4-flash' && row.contextWindow === 1_000_000),
+    JSON.stringify(windowsView.json?.value?.models ?? null))
+
+  const applied = await call(slashCtx, '/compaction.apply', {})
+  check('带斜杠 model 的压缩计划解析出真实 provider/model（custom + maas-dsv4/...，不再错拆）',
+    applied.json?.value?.applied?.ok === true
+      && applied.json.value.applied.count === 2
+      && !applied.json.value.plan.skipped.some((row) => row.target.includes('custom/maas-dsv4')),
+    JSON.stringify(applied.json?.value?.plan ?? null))
+  check('写入 compaction-basic 的策略用的是真实 route，能精确命中 DSH 路由',
+    edited?.modelPolicies?.length === 2
+      && edited.modelPolicies.some((row) => row.provider === 'custom' && row.model === 'maas-dsv4/deepseek-v4-flash')
+      && edited.modelPolicies.some((row) => row.provider === 'custom' && row.model === 'maas-coclaw/co-claw')
+      && !edited.modelPolicies.some((row) => String(row.provider).includes('maas-dsv4')),
+    JSON.stringify(edited))
 }
 
 

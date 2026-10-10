@@ -245,6 +245,12 @@ thresholdRatio = 你要的 token 数 ÷ 该模型窗口大小
 
 > 老实说清楚边界：DSH 的压缩从机制上就是「窗口占比」，没有一个「绝对 token 阈值」的原生字段。这个功能能做到的是**用每个模型自己的窗口把固定 token 数还原回去**，所以在设置页里你看到的是绝对数、在 DSH 配置里落地的是占比——两者等价。另外 DSH 还会按「窗口 − 预留输出 − headroom」再压一道，所以填得比窗口还大时以窗口为准（页面会在这种情况下标出「已按窗口上限截断」）。
 
+### 路由 key 不再猜着拆：model 自身带斜杠也能精确命中（2026-10-10）
+
+> 修掉过一个会让压缩**整条失效**的 bug。插件的阈值 key 是 `"provider/model"` 字符串，早期实现用 `lastIndexOf('/')` 把它拆回 provider 和 model。当 DSH 的 provider 是 `custom`、而 model id **自己就带斜杠**（`maas-dsv4/deepseek-v4-flash`）时，`custom/maas-dsv4/deepseek-v4-flash` 会被错拆成 `{provider:"custom/maas-dsv4", model:"deepseek-v4-flash"}`——跟 DSH 真正匹配的 `{provider:"custom", model:"maas-dsv4/deepseek-v4-flash"}` 永远对不上，于是写进 `compaction-basic` 的策略全部落空，DSH 只能退回全局默认（窗口 80%），你填的固定阈值完全没生效。
+>
+> 现在 provider/model 的边界**从实时模型目录解析**，而不是拆字符串：每个存好的 key 与目录里每个真实路由做「provider + '/' + model」的精确相等匹配，匹配到的策略就带那个真实 route。对不上目录的 key 报 `unknown-route` 被跳过并在页面上标明。**旧设置文件无需迁移**——你存的 `custom/maas-dsv4/deepseek-v4-flash` 本来就是真实 route 的规范拼接，修复后直接就能命中；唯一要做的是一次「写入 DSH 配置」+ 重启 DSH，让 `compaction-basic` 真正带上这条规则。
+
 ## 任务完成通知
 
 每个对话任务结束时弹一条**系统级桌面通知**：**标题取该会话的标题**（从宿主会话列表现读，没标题就回落成 `DSH`），**正文是把本轮回答压缩成的一句话**。宿主按平台分发，插件**不**使用浏览器的 Web Notification——它要的是操作系统自己的通知，能在你切到别的窗口时也看到。
@@ -586,7 +592,7 @@ thresholdRatio = 你要的 token 数 ÷ 该模型窗口大小
 
 ### 自检
 
-`npm run check:service` —— 292 项，用**桩上游 + 真服务 + 真 socket**，离线、零 token；另有 `npm run check:ui`（76 项，管理页假 DOM）：
+`npm run check:service` —— 292 项，用**桩上游 + 真服务 + 真 socket**，离线、零 token；另有 `npm run check:ui`（74 项，管理页假 DOM）：
 入参/出参映射、熔断与切换、同路由重试、上游坏响应、管理面鉴权、配置校验与迁移（含坏端口/坏行/冷却上限倒挂的修复）、
 转换器注册表（重复 id、非法 id、匹配抛异常视为不匹配）、SSE 行解析、以及**插件真的能 fork 起来、接入、转达、并随 disposer 停掉**。
 
@@ -731,7 +737,9 @@ thresholdRatio = 你要的 token 数 ÷ 该模型窗口大小
 
 `npm run check` 从 735 项涨到 843 项，新增的是分类器、拉黑判定、单位键、候选展开、密钥迁移与轮换语义、路由表对账、
 以及双阈值/半开/退避的时间线断言；`npm run check:service` 重写后 292 项，覆盖 key 级切换、拉黑生命周期、
-`/admin/api/models`、对账端到端与运行态落盘重启；`npm run check:ui`（76 项）用假 DOM 跑真页面脚本。
+`/admin/api/models`、对账端到端与运行态落盘重启；`npm run check:ui`（74 项）用假 DOM 跑真页面脚本。
+
+随后 `npm run check` 从 843 项涨到 848 项：新增「model 自身带斜杠的路由（provider=custom + model=maas-dsv4/...）也能在 /save、/compaction.windows 与 /compaction.apply 里精确命中，不再错拆」的回归守卫（见「上下文压缩阈值」一节的修复记录）。
 
 ## 设置页
 
@@ -862,7 +870,7 @@ thresholdRatio = 你要的 token 数 ÷ 该模型窗口大小
 | `lib/service/converters/maas.js` | ZTE MaaS → `api.deepseek.com` 契约的字典：入参翻译、出参归一、错误重写、`/v1/models` 合成 |
 | `lib/service/ui.js` | 服务自带的管理页：供应商/密钥/顺序表/熔断参数可编辑，实时熔断表与最近事件可看 |
 | `scripts/check-service.mjs` | 服务自检：桩上游 + 真服务 + 真 socket，292 项，离线零 token |
-| `scripts/check-ui.mjs` | 管理页自检：假 DOM 跑真页面脚本，76 项，离线零 token |
+| `scripts/check-ui.mjs` | 管理页自检：假 DOM 跑真页面脚本，74 项，离线零 token |
 | `scripts/check-live.mjs` | 真实网关端到端实测，28 项，需网络与凭据，**不**随 `npm run check` 跑 |
 | `lib/store.js` | 配置读写（原子写、容错读）+ 旁路历史存储（每会话分片、裁剪） |
 | `lib/http.js` | JSON 信封、有上限的 body 读取、回环信任围栏 |
@@ -874,9 +882,9 @@ thresholdRatio = 你要的 token 数 ÷ 该模型窗口大小
 ## 自检与基准
 
 ```sh
-npm run check                 # 843 项，含宿主压缩/通知/标题与路由服务提取契约
+npm run check                 # 848 项，含宿主压缩/通知/标题与路由服务提取契约
 npm run check:service         # 292 项，路由服务本体（桩上游，离线）
-npm run check:ui              # 76 项，管理页脚本（假 DOM）
+npm run check:ui              # 74 项，管理页脚本（假 DOM）
 npm run check:shape           # 对**已安装**的 DSH 复核旁路提问的消息形状（需要本机有 DSH）
 npm run check:title           # 对**已安装**的 DSH 复核标题重总结（真会话、真投影，不调模型）
 node scripts/bench.mjs --runs 3
