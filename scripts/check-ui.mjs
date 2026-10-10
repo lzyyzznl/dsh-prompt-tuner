@@ -615,7 +615,11 @@ function fixtureState() {
       recoveryMode: 'probe',
       maxSwitches: 0,
       logLevel: 'info',
-      budget: 4
+      budget: 4,
+      timeSlots: [
+        { start: '09:00', end: '12:00', priority: { alpha: 1, beta: 0 } },
+        { start: '22:00', end: '02:00', priority: { ghost: 3 } }
+      ]
     },
     rows: [
       {
@@ -646,11 +650,18 @@ function fixtureState() {
       probes: 1, probeOk: 1, rejected: 0, ignored: 1, blacklisted: 1
     },
     blacklist: [blocked],
+    timeSlot: {
+      at: '10:00',
+      label: '09:00-12:00',
+      rule: { start: '09:00', end: '12:00', priority: { alpha: 1, beta: 0 } },
+      effective: { alpha: 1, beta: 0, ghost: null }
+    },
     limits: {
       orderRows: 12, maxRetries: 20, failureThreshold: 100, minFailureRate: 0, maxFailureRate: 1,
       minSamples: 1, maxSamples: 100, minWindowSize: 1, maxWindowSize: 100, minWindowMs: 0,
       maxWindowMs: 3600000, minCooldownMs: 0, maxCooldownMs: 3600000, minCooldownFactor: 1,
-      maxCooldownFactor: 10, minHalfOpenSuccesses: 1, maxHalfOpenSuccesses: 10, minSwitches: 0, maxSwitches: 20
+      maxCooldownFactor: 10, minHalfOpenSuccesses: 1, maxHalfOpenSuccesses: 10, minSwitches: 0, maxSwitches: 20,
+      timeSlots: 24
     },
     recoveryModes: ['probe', 'immediate'],
     logLevels: ['silent', 'error', 'warn', 'info', 'debug']

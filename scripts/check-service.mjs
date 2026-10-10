@@ -1805,6 +1805,173 @@ section('22. readConfig：缺失时 seed、坏文件只在内存里修复')
   }
 }
 
+/* ───────────────────────── 24. time slots ───────────────────────── */
+
+section('24. 时段优先级：只在选路时刻改变候选顺序')
+
+const TS = await import('../lib/service/time-slots.js')
+
+// -- pure parser ---------------------------------------------------------
+check('parseClock 只接受合法 HH:mm', TS.parseClock('09:05') === 545 && TS.parseClock('9:05') === 545
+  && TS.parseClock('23:59') === 1439 && TS.parseClock('24:00') === null
+  && TS.parseClock('12:60') === null && TS.parseClock('noon') === null && TS.parseClock('') === null)
+check('formatClock 归一化补零', TS.formatClock(545) === '09:05' && TS.formatClock(0) === '00:00')
+
+check('clockInside：普通区间含起点不含终点', TS.clockInside(600, 540, 660) === true
+  && TS.clockInside(540, 540, 660) === true && TS.clockInside(660, 540, 660) === false
+  && TS.clockInside(539, 540, 660) === false)
+check('clockInside：跨午夜区间', TS.clockInside(1380, 1320, 120) === true
+  && TS.clockInside(60, 1320, 120) === true && TS.clockInside(600, 1320, 120) === false
+  && TS.clockInside(120, 1320, 120) === false)
+check('clockInside：起止相同 = 全天', TS.clockInside(0, 480, 480) === true
+  && TS.clockInside(479, 480, 480) === true && TS.clockInside(1439, 480, 480) === true)
+
+const overlapRules = [
+  { start: '22:00', end: '02:00', priority: { a: 1 } },
+  { start: '23:00', end: '23:30', priority: { b: 2 } },
+]
+check('activeRuleAt：命中多条时最具体的窗口胜出',
+  TS.activeRuleAt(overlapRules, 23 * 60 + 10)?.rule?.priority?.b === 2,
+  JSON.stringify(TS.activeRuleAt(overlapRules, 23 * 60 + 10)))
+check('activeRuleAt：窗口外只剩跨界那条',
+  TS.activeRuleAt(overlapRules, 23 * 60 + 45)?.rule?.priority?.a === 1)
+check('activeRuleAt：都没命中时为 null', TS.activeRuleAt(overlapRules, 12 * 60) === null)
+check('activeRuleAt：同起点的两条第一条优先',
+  TS.activeRuleAt([
+    { start: '08:00', end: '09:00', priority: { a: 1 } },
+    { start: '08:00', end: '09:00', priority: { b: 2 } },
+  ], 8 * 60 + 30)?.rule?.priority?.a === 1)
+check('activeRuleAt：同起点不同长度时按窗口取更具体者（整点不翻回宽规则）',
+  TS.activeRuleAt([
+    { start: '08:00', end: '17:00', priority: { wide: 1 } },
+    { start: '08:00', end: '09:00', priority: { narrow: 2 } },
+  ], 8 * 60)?.rule?.priority?.narrow === 2
+  && TS.activeRuleAt([
+    { start: '08:00', end: '17:00', priority: { wide: 1 } },
+    { start: '08:00', end: '09:00', priority: { narrow: 2 } },
+  ], 8 * 60 + 1)?.rule?.priority?.narrow === 2)
+
+const orderRows = [
+  { provider: 'p1', model: 'm1' }, { provider: 'p2', model: 'm2' },
+  { provider: 'p3', model: 'm3' }, { provider: 'p4', model: 'm4' },
+]
+const oneHit = TS.applyTimeOrder(orderRows, [{ start: '00:00', end: '23:59', priority: { p3: 1 } }], 600)
+check('applyTimeOrder：命中项整体前移，其余保持静态相对序',
+  oneHit.rows.map((row) => row.provider).join(',') === 'p3,p1,p2,p4', oneHit.rows.map((r) => r.provider).join(','))
+const twoHits = TS.applyTimeOrder(orderRows, [{ start: '00:00', end: '23:59', priority: { p3: 2, p1: 5 } }], 600)
+check('applyTimeOrder：命中项之间不按档位排序，仍是静态序（稳定分区）',
+  twoHits.rows.map((row) => row.provider).join(',') === 'p1,p3,p2,p4', twoHits.rows.map((r) => r.provider).join(','))
+const disabled = TS.applyTimeOrder(orderRows, [{ start: '00:00', end: '23:59', priority: { p2: 0 } }], 600)
+check('applyTimeOrder：档位 0 的供应商本轮被剔除',
+  disabled.rows.map((row) => row.provider).join(',') === 'p1,p3,p4'
+  && disabled.disabled.map((row) => row.provider).join(',') === 'p2')
+const noRules = TS.applyTimeOrder(orderRows, [], 600)
+check('applyTimeOrder：没配时段时是恒等变换',
+  noRules.rows.map((row) => row.provider).join(',') === 'p1,p2,p3,p4' && noRules.active === null)
+const pinned = TS.applyTimeOrder(orderRows, [{ start: '00:00', end: '23:59', priority: { p3: 1 } }], 600, { pin: 1 })
+check('applyTimeOrder：pin=1 时首行不被时段撬动（调用方指定优先于时钟）',
+  pinned.rows.map((row) => row.provider).join(',') === 'p1,p3,p2,p4', pinned.rows.map((r) => r.provider).join(','))
+check('providerPriorityAt：未点名的供应商为 null（走静态顺序）',
+  TS.providerPriorityAt(overlapRules, 'a', 23 * 60 + 45) === 1
+  && TS.providerPriorityAt(overlapRules, 'zzz', 23 * 60 + 45) === null)
+
+// -- validation / repair -------------------------------------------------
+check('validateTimeSlots：合法规则原样通过',
+  TS.validateTimeSlots([{ start: '22:00', end: '02:00', priority: { a: 1, b: 0 } }])[0].priority.b === 0)
+check('validateTimeSlots：坏 HH:mm 被拒', throws(() => TS.validateTimeSlots([{ start: '25:00', end: '02:00', priority: { a: 1 } }])))
+check('validateTimeSlots：起止相同被拒', throws(() => TS.validateTimeSlots([{ start: '08:00', end: '08:00', priority: { a: 1 } }])))
+check('validateTimeSlots：档位越界被拒',
+  throws(() => TS.validateTimeSlots([{ start: '08:00', end: '09:00', priority: { a: 10 } }]))
+  && throws(() => TS.validateTimeSlots([{ start: '08:00', end: '09:00', priority: { a: -1 } }]))
+  && throws(() => TS.validateTimeSlots([{ start: '08:00', end: '09:00', priority: { a: 1.5 } }])))
+check('validateTimeSlots：空的供应商表被拒',
+  throws(() => TS.validateTimeSlots([{ start: '08:00', end: '09:00', priority: {} }])))
+check('validateTimeSlots：不是数组被拒', throws(() => TS.validateTimeSlots({})))
+check('validateTimeSlots：超过上限被拒',
+  throws(() => TS.validateTimeSlots(Array.from({ length: TS.TIME_SLOT_LIMIT + 1 }, (_, i) => ({ start: '00:00', end: '23:59', priority: { [`p${i}`]: 1 } })))))
+check('normalizeTimeSlots：读时修复，丢坏留好并封顶',
+  TS.normalizeTimeSlots([
+    { start: '08:00', end: '09:00', priority: { a: 1 } },
+    { start: 'bogus', end: '09:00', priority: { a: 1 } },
+    { start: '08:00', end: '08:00', priority: { a: 1 } },
+    { start: '10:00', end: '11:00', priority: { a: 99 } },
+    { start: '12:00', end: '13:00', priority: {} },
+  ]).length === 1)
+check('normalizeTimeSlots：非数组退化为空表', TS.normalizeTimeSlots('nope').length === 0 && TS.normalizeTimeSlots(undefined).length === 0)
+
+// -- config wiring -------------------------------------------------------
+const cfgWithSlots = C.normalizeConfig({
+  providers: { x: { baseURL: 'https://host/v1', apiKey: 'k', models: ['m'] } },
+  router: { order: [{ provider: 'x', model: 'm' }], timeSlots: [{ start: '22:00', end: '02:00', priority: { x: 1 } }] },
+})
+check('normalizeConfig：timeSlots 不会被白名单丢掉（读时保留）',
+  cfgWithSlots.router.timeSlots.length === 1 && cfgWithSlots.router.timeSlots[0].priority.x === 1)
+const patchedSlots = C.applyConfigPatch(cfgWithSlots, { router: { timeSlots: [{ start: '08:00', end: '09:00', priority: { x: 0 } }] } })
+check('applyConfigPatch：合法 timeSlots 写入生效',
+  patchedSlots.config.router.timeSlots[0].start === '08:00' && patchedSlots.config.router.timeSlots[0].priority.x === 0)
+check('applyConfigPatch：坏 timeSlots 拒绝写入',
+  throws(() => C.applyConfigPatch(cfgWithSlots, { router: { timeSlots: [{ start: '08:00', end: '08:00', priority: { x: 1 } }] } })))
+
+// -- live selection ------------------------------------------------------
+/** A slot window that certainly contains "now", in the service's local clock. */
+function slotNow(priority) {
+  const at = (offset) => {
+    const date = new Date(Date.now() + offset * 60_000)
+    return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`
+  }
+  return { start: at(-2), end: at(2), priority }
+}
+const fullOrder = () => DEFAULT_ORDER.map((row) => ({ ...row }))
+
+await cleanSlate()
+await configure({ order: fullOrder() })
+stub.keyStatus = { 'gw-good': 503 }
+stub.calls.length = 0
+await chat('deepseek-v4-flash')
+check('基线（无时段）：第一条失败后按静态顺序落到第二家',
+  stub.calls.map((call) => call.key).join(',') === 'gw-good,gw-broken',
+  stub.calls.map((call) => call.key).join(','))
+
+await cleanSlate()
+await configure({ order: fullOrder(), router: { timeSlots: [slotNow({ 'p-switch': 1 })] } })
+stub.keyStatus = { 'gw-good': 503 }
+stub.calls.length = 0
+await chat('deepseek-v4-flash')
+check('时段命中：被点名的供应商越过静态顺序先被尝试（匹配行仍第一）',
+  stub.calls.map((call) => call.key).join(',') === 'gw-good,sw-a',
+  stub.calls.map((call) => call.key).join(','))
+
+await cleanSlate()
+await configure({ order: fullOrder(), router: { timeSlots: [slotNow({ 'maas-coclaw': 0 })] } })
+stub.keyStatus = { 'gw-good': 503 }
+stub.calls.length = 0
+await chat('deepseek-v4-flash')
+check('档位 0：被停用的供应商本轮完全不发请求',
+  stub.calls.every((call) => call.key !== 'gw-broken'),
+  stub.calls.map((call) => call.key).join(','))
+check('档位 0：/state 如实上报生效档位为 0',
+  service.admin.state().timeSlot?.effective?.['maas-coclaw'] === 0,
+  JSON.stringify(service.admin.state().timeSlot))
+check('档位 0：这件事在事件流里看得见（kind=timeslot）',
+  (service.admin.state().recent ?? []).some((event) => event.kind === 'timeslot' && event.provider === 'maas-coclaw'),
+  JSON.stringify((service.admin.state().recent ?? []).filter((event) => event.kind === 'timeslot')))
+
+const liveSlot = service.admin.state().timeSlot
+check('/state 上报当前命中时段：label 为规则窗口，at 为 HH:mm，未点名者为静态',
+  typeof liveSlot?.label === 'string' && /^\d{2}:\d{2}-\d{2}:\d{2}$/.test(liveSlot.label)
+  && /^\d{2}:\d{2}$/.test(liveSlot.at)
+  && liveSlot.effective['maas-coclaw'] === 0
+  && liveSlot.effective['p-switch'] === null,
+  JSON.stringify(liveSlot))
+
+await cleanSlate()
+await configure({ order: fullOrder(), router: { timeSlots: [] } })
+check('清空时段后 /state 不再报命中，选路回到静态顺序',
+  service.admin.state().timeSlot?.label === null
+  && Array.isArray(service.admin.state().router.timeSlots)
+  && service.admin.state().router.timeSlots.length === 0,
+  JSON.stringify(service.admin.state().timeSlot))
+
 /* ───────────────────────── 23. stop ───────────────────────── */
 
 section('23. 停得下来')
