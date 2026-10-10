@@ -2449,6 +2449,61 @@ function cordisLikeContext(services) {
     yaml.split('\n').slice(0, 6).join(' | '))
 }
 
+/* ── ContextWindowIndex：窗口来源的优先级（配置 > 路由服务 /v1/models > 适配器声明 > 1M 默认）── */
+{
+  const fetchImpl = globalThis.fetch
+  const advertised = { 'maas-dsv4/deepseek-v4-flash': 2_000_000, 'maas-coclaw/co-claw': 2_000_000 }
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('/v1/models')) {
+      return {
+        ok: true,
+        json: async () => ({
+          data: Object.entries(advertised).map(([id, context_window]) => ({ id, object: 'model', created: 1, owned_by: 'x', context_window })),
+        }),
+      }
+    }
+    throw new Error(`unexpected fetch: ${url}`)
+  }
+  try {
+    const service = { url: () => 'http://127.0.0.1:8790' }
+    const adapter = (window) => ({ llm: { resolveModelInfo: async () => ({ context: { contextWindow: window } }) } })
+
+    const noSources = new compaction.ContextWindowIndex({}, {})
+    check('窗口解析：连适配器都没有时落到 1M 默认',
+      (await noSources.resolve('p', 'm')) === compaction.DEFAULT_CONTEXT_WINDOW,
+      String(await noSources.resolve('p', 'm')))
+    const adapterOnly = new compaction.ContextWindowIndex(adapter(262_144), {})
+    check('窗口解析：没有路由服务时用适配器声明的窗口（不再硬塞默认）',
+      (await adapterOnly.resolve('p', 'm')) === 262_144,
+      String(await adapterOnly.resolve('p', 'm')))
+
+    const configuredFirst = new compaction.ContextWindowIndex(adapter(262_144), {
+      configuredWindows: { 'p/m': 300_000 },
+    })
+    check('窗口解析：设置页填写的窗口优先于适配器声明',
+      (await configuredFirst.resolve('p', 'm')) === 300_000,
+      String(await configuredFirst.resolve('p', 'm')))
+
+    const routerOverAdapter = new compaction.ContextWindowIndex(adapter(128_000), { service })
+    check('窗口解析：路由服务 /v1/models 上报的窗口优先于适配器声明',
+      (await routerOverAdapter.resolve('p', 'maas-dsv4/deepseek-v4-flash')) === 2_000_000,
+      String(await routerOverAdapter.resolve('p', 'maas-dsv4/deepseek-v4-flash')))
+    check('窗口解析：路由服务没列出的模型回落适配器声明',
+      (await routerOverAdapter.resolve('p', 'other-model')) === 128_000,
+      String(await routerOverAdapter.resolve('p', 'other-model')))
+
+    const configuredOverRouter = new compaction.ContextWindowIndex(adapter(128_000), {
+      service,
+      configuredWindows: { 'p/maas-dsv4/deepseek-v4-flash': 300_000 },
+    })
+    check('窗口解析：设置页填写的窗口还优先于路由服务上报',
+      (await configuredOverRouter.resolve('p', 'maas-dsv4/deepseek-v4-flash')) === 300_000,
+      String(await configuredOverRouter.resolve('p', 'maas-dsv4/deepseek-v4-flash')))
+  } finally {
+    globalThis.fetch = fetchImpl
+  }
+}
+
 /* ── the config-editor write ── */
 {
   const entry = { options: { id: 'compaction-basic', name: '@deepseek-ai/dsh-compaction-basic', config: {} } }
@@ -2846,6 +2901,60 @@ function cordisLikeContext(services) {
       && edited.modelPolicies.some((row) => row.provider === 'custom' && row.model === 'maas-coclaw/co-claw')
       && !edited.modelPolicies.some((row) => String(row.provider).includes('maas-dsv4')),
     JSON.stringify(edited))
+}
+
+/* ── 压缩：上下文窗口的可配置性与窗口契约 ── */
+{
+  // The regression the whole feature exists for: the custom provider's models
+  // showed 262144 (the pi-ai adapter's fallback), so a 300k threshold was
+  // "exceeds-window" and never effective. The settings page now owns a window
+  // per model; a typed window must round-trip through /save, show up in
+  // /compaction.windows as the effective/configured value, and override the
+  // adapter-declared fallback when the plan is computed.
+  const winCtx = makeCtx([], { contextWindow: 262_144 })
+  registerRoutes(winCtx)
+
+  check('/save 拒绝非对象 / 坏键 / 非法范围的窗口表',
+    (await call(winCtx, '/save', { compactionWindows: [300_000] })).json?.ok === false
+      && (await call(winCtx, '/save', { compactionWindows: { nope: 300_000 } })).json?.ok === false
+      && (await call(winCtx, '/save', { compactionWindows: { 'a/b': 100 } })).json?.ok === false
+      && (await call(winCtx, '/save', { compactionWindows: { 'a/b': 9_000_000 } })).json?.ok === false)
+
+  const savedWin = await call(winCtx, '/save', {
+    compactionTokens: { 'deepseek-official/deepseek-flash': 300_000 },
+    compactionWindows: { 'deepseek-official/deepseek-flash': 300_000 },
+  })
+  check('/save 收下合法的阈值+窗口并回读（/state 的压缩契约与设置都带上窗口）',
+    savedWin.json?.ok === true
+      && savedWin.json.value.settings.compactionWindows['deepseek-official/deepseek-flash'] === 300_000
+      && savedWin.json.value.compaction.windows['deepseek-official/deepseek-flash'] === 300_000,
+    JSON.stringify(savedWin.json?.value?.settings?.compactionWindows ?? null))
+
+  const windowsView = await call(winCtx, '/compaction.windows', {})
+  check('/compaction.windows 上报默认窗口与窗口可写范围，且配置的窗口优先于适配器声明',
+    windowsView.json?.ok === true
+      && windowsView.json.value.defaultWindow === compaction.DEFAULT_CONTEXT_WINDOW
+      && windowsView.json.value.windowLimits.min === compaction.MIN_CONTEXT_WINDOW
+      && windowsView.json.value.windowLimits.max === compaction.MAX_CONTEXT_WINDOW
+      && windowsView.json.value.models.every((row) => Number.isSafeInteger(row.contextWindow)),
+    JSON.stringify(windowsView.json?.value ?? null))
+  check('/compaction.windows 对配置过窗口的模型报 configuredWindow（其余为 null）',
+    windowsView.json.value.models.find((row) => row.model === 'deepseek-flash')?.configuredWindow === 300_000
+      && windowsView.json.value.models.every((row) => row.model !== 'deepseek-flash' || row.contextWindow === 300_000)
+      && windowsView.json.value.models.filter((row) => row.model !== 'deepseek-flash').every((row) => row.configuredWindow === null),
+    JSON.stringify(windowsView.json?.value?.models ?? null))
+
+  // The plan's window lookup goes through the same index: a typed window must
+  // move the 300k threshold from "exceeds-window" (adapter said 262144) to a
+  // valid policy — the exact scenario that used to be impossible.
+  const applied = await call(winCtx, '/compaction.apply', {})
+  check('配置了窗口后，同一阈值不再超窗，能换算成策略（自定义 provider 的场景正是这样修好的）',
+    applied.json?.ok === true
+      && applied.json.value.plan.policies.some(
+        (row) => row.provider === 'deepseek-official' && row.model === 'deepseek-flash',
+      )
+      && !applied.json.value.plan.skipped.some((row) => row.target === 'deepseek-official/deepseek-flash' && row.reason === 'exceeds-window'),
+    JSON.stringify(applied.json?.value?.plan ?? null))
 }
 
 
@@ -5323,13 +5432,15 @@ section('4b. 压缩与通知的浏览器半区')
   await new Promise((resolve) => setTimeout(resolve, 0))
   page = renderPage({ close() {} })
   const compactionPanel = findAll(page, (node) => node.props?.id === 'dspo-panel-compaction')[0]
-  const thresholdInputs = findAll(compactionPanel, (node) => node.type === 'input' && node.props.type === 'number')
-  check('压缩页签渲染出每个模型的阈值输入与两个动作按钮',
-    thresholdInputs.length === 1
-      && thresholdInputs[0].props.value === '250000'
+  const numberInputs = findAll(compactionPanel, (node) => node.type === 'input' && node.props.type === 'number')
+  const thresholdInput = numberInputs.find((input) => input.props.id?.startsWith('dspo-compact-'))
+  const windowInput = numberInputs.find((input) => input.props.id?.startsWith('dspo-window-'))
+  check('压缩页签渲染出每个模型的阈值输入、默认窗口输入与两个动作按钮',
+    thresholdInput?.props.value === '250000'
+      && windowInput?.props.value === '1000000'
       && buttonsOf(compactionPanel).some((button) => labelOf(button).includes('保存阈值'))
       && buttonsOf(compactionPanel).some((button) => labelOf(button).includes('写入 DSH 配置')),
-    `${thresholdInputs.length} input(s), ${buttonsOf(compactionPanel).map(labelOf).join('|')}`)
+    `${numberInputs.length} input(s), ${buttonsOf(compactionPanel).map(labelOf).join('|')}`)
   check('无 configEditor 时写入按钮禁用并说明原因',
     buttonsOf(compactionPanel).find((button) => labelOf(button).includes('写入 DSH 配置')).props.disabled === true
       && textOf(compactionPanel).includes('配置编辑器'))

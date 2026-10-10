@@ -348,6 +348,7 @@ const C = await import('../lib/service/config.js')
 const R = await import('../lib/service/router.js')
 const F = await import('../lib/service/failure.js')
 const S = await import('../lib/service/state.js')
+const U = await import('../lib/service/upstream.js')
 
 check('旧字段 apiKey 迁移成 id 为 k1 的单条密钥',
   JSON.stringify(C.normalizeKeys(undefined, 'legacy-secret')) === JSON.stringify([{ id: 'k1', label: '', key: 'legacy-secret' }]),
@@ -541,6 +542,10 @@ check('只列 provider/model 带前缀拼写，不再列有歧义的裸名',
   && !modelIds.includes('deepseek-v4-flash') && !modelIds.includes('co-claw'), modelIds.join(','))
 check('每条模型都是 OpenAI 形状',
   (models.json?.data ?? []).every((entry) => entry.object === 'model' && typeof entry.owned_by === 'string' && Number.isFinite(entry.created)))
+check('每条模型带官方名字段与可选窗口字段（ZTE 网关不报 context_window → 落到 1M 默认）',
+  (models.json?.data ?? []).every((entry) => typeof entry.name === 'string' && Number.isSafeInteger(entry.context_window))
+    && (models.json?.data ?? []).every((entry) => entry.context_window === U.DEFAULT_CONTEXT_WINDOW),
+  JSON.stringify((models.json?.data ?? []).slice(0, 2)))
 
 stub.mode = 'ok'
 stub.keyStatus = {}
@@ -1111,6 +1116,22 @@ check('成功写入 discoveredModels',
   discoveredProvider.discoveredModels.join(',') === 'stub-alpha,stub-beta,m-manual', JSON.stringify(discoveredProvider.discoveredModels))
 check('allModels = 手工在前 ∪ 已发现，按序去重',
   discoveredProvider.allModels.join(',') === 'm-manual,stub-alpha,stub-beta', JSON.stringify(discoveredProvider.allModels))
+
+// The whole point of this feature: an upstream that DOES advertise a window
+// (the official DeepSeek list does) feeds it through discovery into /v1/models,
+// overriding the 1M default that a windowless gateway would get.
+stub.modelsMode = 'ok'
+stub.modelsBody = [{ id: 'm-manual', context_window: 3_000_000 }, { id: 'stub-alpha', context_window: 2_000_000 }]
+const discoveredWin = await post(`${base}/admin/api/models`, { provider: 'p-models' }, adminHeaders)
+const winProvider = providerState('p-models', discoveredWin.json.value.state)
+check('发现 context_window 后写入 discoveredWindows',
+  winProvider.discoveredWindows['m-manual'] === 3_000_000 && winProvider.discoveredWindows['stub-alpha'] === 2_000_000,
+  JSON.stringify(winProvider.discoveredWindows))
+const modelsWithWin = await get(`${base}/v1/models`)
+check('/v1/models 用上游上报的窗口，而不是 1M 默认',
+  modelsWithWin.json?.data?.find((row) => row.id === 'p-models/m-manual')?.context_window === 3_000_000,
+  JSON.stringify(modelsWithWin.json?.data?.find((row) => row.id === 'p-models/m-manual') ?? null))
+stub.modelsBody = null
 
 stub.calls.length = 0
 const pickedKey = await post(`${base}/admin/api/models`, { provider: 'p-models', keyId: 'k2' }, adminHeaders)
