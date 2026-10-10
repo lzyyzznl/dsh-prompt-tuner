@@ -166,7 +166,6 @@ const readmeSample = (readmeSource.match(/```json\n([\s\S]*?)```/) ?? [])[1]
 check('README 的设置样例就是 DEFAULT_SETTINGS（键与顺序完全一致）',
   typeof readmeSample === 'string'
     && JSON.stringify(JSON.parse(readmeSample)) === JSON.stringify({ ...store.DEFAULT_SETTINGS }))
-const compaction = await import('../lib/compaction.js')
 const notify = await import('../lib/notify.js')
 const notifySummary = await import('../lib/notify-summary.js')
 
@@ -803,8 +802,7 @@ function makeCtx(script, options = {}) {
           : options.reasoning
         return {
           ...(base ?? {}),
-          // Real adapters advertise `context.contextWindow`; the compaction half
-          // reads it to turn a fixed token count into that model's ratio.
+          // Real adapters advertise `context.contextWindow` in the model info.
           ...(options.contextWindow === undefined ? {} : { context: { contextWindow: options.contextWindow } }),
         }
       },
@@ -2335,212 +2333,7 @@ function makeService(view, answers = {}) {
     (await call(ctx, '/save', { routerEnabled: true, routerLogLevel: 'debug' })).json?.ok === true)
 }
 
-section('3b. 压缩阈值与桌面通知')
-
-/**
- * A context that behaves like cordis does for a service this plugin did NOT
- * declare: reading `ctx.<name>` throws, while `ctx.get(name)` answers.
- *
- * That is the exact shape that made the completion watcher a silent no-op —
- * `ctx.remote` threw, the throw was read as "no remote service", and the
- * subscription was never installed. Both halves' guards are driven through it.
- */
-function cordisLikeContext(services) {
-  const ctx = { get: (name) => services[name] }
-  return new Proxy(ctx, {
-    get(target, prop, receiver) {
-      if (typeof prop === 'string' && prop in services && prop !== 'get') {
-        throw new Error(`cannot get property "${prop}" without inject`)
-      }
-      return Reflect.get(target, prop, receiver)
-    },
-  })
-}
-
-{
-  const remote = { $on: () => () => {} }
-  const ctx = cordisLikeContext({ remote })
-  let bareThrew = false
-  try {
-    void ctx.remote
-  } catch {
-    bareThrew = true
-  }
-  check('守卫的对照：裸读 ctx.remote 抛错，ctx.get("remote") 才拿得到（cordis 语义）',
-    bareThrew === true && ctx.get('remote') === remote)
-  check('host 侧 configEditorOf 优先 ctx.get，裸读抛错时仍拿得到服务',
-    compaction.configEditorOf(cordisLikeContext({
-      configEditor: { entries: () => [], edit: async () => {} },
-    })) !== null)
-  check('host 侧 configEditorOf 对真正缺席的服务返回 null（不抛）',
-    compaction.configEditorOf(cordisLikeContext({})) === null)
-  check('host 侧 serviceOf 在 ctx.get 不可用时回落到属性读',
-    compaction.serviceOf({ plain: true }, 'plain') === true
-      && compaction.serviceOf({ get: () => undefined, plain: true }, 'plain') === true)
-}
-
-/* ── the fixed-token → ratio conversion ── */
-{
-  const exact = compaction.compactionPolicy('deepseek-official', 'deepseek-pro', 250_000, 1_000_000)
-  check('固定 token 数换算成该模型窗口占比后仍是同一个绝对数（窗口约掉）',
-    exact.ok === true && Math.abs(exact.policy.thresholdRatio - 0.25) < 1e-12 && exact.effectiveTokens === 250_000,
-    JSON.stringify(exact))
-  check('每个模型各自成一条策略：同一阈值在不同窗口下换算不同',
-    compaction.compactionPolicy('p', 'big', 250_000, 1_000_000).policy.thresholdRatio
-      !== compaction.compactionPolicy('p', 'small', 250_000, 500_000).policy.thresholdRatio)
-  check('retainRatio 严格小于 thresholdRatio（DSH 加载时的硬约束）',
-    exact.ok === true
-      && exact.policy.retainRatio < exact.policy.thresholdRatio
-      && exact.policy.retainRatio <= compaction.DEFAULT_RETAIN_RATIO,
-    JSON.stringify(exact.policy))
-  check('阈值超过模型窗口时拒绝并说明原因',
-    compaction.compactionPolicy('p', 'm', 300_000, 128_000).ok === false
-      && compaction.compactionPolicy('p', 'm', 300_000, 128_000).reason === 'exceeds-window')
-  check('阈值超出可写范围时拒绝',
-    compaction.compactionPolicy('p', 'm', 16, 1_000_000).reason === 'tokens'
-      && compaction.compactionPolicy('p', 'm', 5_000_000, 1_000_000).reason === 'tokens')
-  check('窗口未知（适配器没声明）时不生成策略',
-    compaction.compactionPolicy('p', 'm', 250_000, null).ok === false
-      && compaction.compactionPolicy('p', 'm', 250_000, null).reason === 'context')
-  const nearFull = compaction.compactionPolicy('p', 'm', 990_000, 1_000_000)
-  check('贴着窗口上限的阈值被压到 0.95 以内并如实标记 capped',
-    nearFull.ok === true && nearFull.policy.thresholdRatio <= compaction.MAX_THRESHOLD_RATIO && nearFull.capped === true)
-
-  const plan = compaction.planCompactionPolicies(
-    { 'a/x': 250_000, 'a/y': 250_000, 'a/z': 999, 'bad-key': 250_000, 'a/w': 200_000, 'custom/maas-dsv4/deepseek-v4-flash': 200_000 },
-    (key) => {
-      // A route resolver backed by the live catalog: key → exact {provider, model, window}.
-      if (key === 'a/x') return { provider: 'a', model: 'x', contextWindow: 1_000_000 }
-      if (key === 'a/z') return { provider: 'a', model: 'z', contextWindow: 1_000_000 }
-      if (key === 'a/w') return { provider: 'a', model: 'w', contextWindow: 1_000_000 }
-      if (key === 'custom/maas-dsv4/deepseek-v4-flash') return { provider: 'custom', model: 'maas-dsv4/deepseek-v4-flash', contextWindow: 1_000_000 }
-      return null
-    },
-  )
-  check('批量计划只保留能换算的行，并逐行报告未生效原因',
-    plan.policies.length === 3
-      && plan.skipped.length === 3
-      && plan.skipped.some((row) => row.target === 'a/y' && row.reason === 'unknown-route')
-      && plan.skipped.some((row) => row.target === 'a/z' && row.reason === 'tokens')
-      && plan.skipped.some((row) => row.target === 'bad-key' && row.reason === 'unknown-route'),
-    JSON.stringify(plan.skipped))
-  check('批量计划保留索引顺序（同一份设置得到同一份策略）',
-    plan.policies[0].model === 'x' && plan.policies[1].model === 'w' && plan.policies[2].model === 'maas-dsv4/deepseek-v4-flash',
-    JSON.stringify(plan.policies.map((row) => row.model)))
-  check('model 自身带斜杠的 key 按目录解析出真实的 provider/model，不再错拆',
-    plan.policies[2].provider === 'custom' && plan.policies[2].model === 'maas-dsv4/deepseek-v4-flash'
-      && plan.policies[2].thresholdRatio === 0.2
-      && !plan.policies.some((row) => row.provider === 'custom/maas-dsv4'),
-    JSON.stringify(plan.policies))
-
-  const existing = [{ provider: 'a', model: 'x', thresholdRatio: 0.1 }, { provider: 'hand', model: 'made', thresholdRatio: 0.5 }]
-  const merged = compaction.mergeModelPolicies(existing, [compaction.compactionPolicy('a', 'x', 250_000, 1_000_000).policy])
-  check('合并策略：同 route 被替换，手写的其它 route 原样保留',
-    merged.length === 2
-      && merged.find((row) => row.provider === 'a' && row.model === 'x').thresholdRatio === 0.25
-      && merged.some((row) => row.provider === 'hand'),
-    JSON.stringify(merged))
-  check('合并时非数组的既有值被当作空表', compaction.mergeModelPolicies(null, []).length === 0)
-
-  const yaml = compaction.renderCompactionYaml([compaction.compactionPolicy('a', 'x', 250_000, 1_000_000).policy])
-  check('等效补丁片段带 entry id、provider/model 与两个 ratio',
-    yaml.includes('id: compaction-basic') && yaml.includes('provider: "a"') && yaml.includes('model: "x"')
-      && yaml.includes('thresholdRatio: 0.25') && /retainRatio: 0\.1[0-9]*/.test(yaml),
-    yaml.split('\n').slice(0, 6).join(' | '))
-}
-
-/* ── ContextWindowIndex：窗口来源的优先级（配置 > 路由服务 /v1/models > 适配器声明 > 1M 默认）── */
-{
-  const fetchImpl = globalThis.fetch
-  const advertised = { 'maas-dsv4/deepseek-v4-flash': 2_000_000, 'maas-coclaw/co-claw': 2_000_000 }
-  globalThis.fetch = async (url) => {
-    if (String(url).includes('/v1/models')) {
-      return {
-        ok: true,
-        json: async () => ({
-          data: Object.entries(advertised).map(([id, context_window]) => ({ id, object: 'model', created: 1, owned_by: 'x', context_window })),
-        }),
-      }
-    }
-    throw new Error(`unexpected fetch: ${url}`)
-  }
-  try {
-    const service = { url: () => 'http://127.0.0.1:8790' }
-    const adapter = (window) => ({ llm: { resolveModelInfo: async () => ({ context: { contextWindow: window } }) } })
-
-    const noSources = new compaction.ContextWindowIndex({}, {})
-    check('窗口解析：连适配器都没有时落到 1M 默认',
-      (await noSources.resolve('p', 'm')) === compaction.DEFAULT_CONTEXT_WINDOW,
-      String(await noSources.resolve('p', 'm')))
-    const adapterOnly = new compaction.ContextWindowIndex(adapter(262_144), {})
-    check('窗口解析：没有路由服务时用适配器声明的窗口（不再硬塞默认）',
-      (await adapterOnly.resolve('p', 'm')) === 262_144,
-      String(await adapterOnly.resolve('p', 'm')))
-
-    const configuredFirst = new compaction.ContextWindowIndex(adapter(262_144), {
-      configuredWindows: { 'p/m': 300_000 },
-    })
-    check('窗口解析：设置页填写的窗口优先于适配器声明',
-      (await configuredFirst.resolve('p', 'm')) === 300_000,
-      String(await configuredFirst.resolve('p', 'm')))
-
-    const routerOverAdapter = new compaction.ContextWindowIndex(adapter(128_000), { service })
-    check('窗口解析：路由服务 /v1/models 上报的窗口优先于适配器声明',
-      (await routerOverAdapter.resolve('p', 'maas-dsv4/deepseek-v4-flash')) === 2_000_000,
-      String(await routerOverAdapter.resolve('p', 'maas-dsv4/deepseek-v4-flash')))
-    check('窗口解析：路由服务没列出的模型回落适配器声明',
-      (await routerOverAdapter.resolve('p', 'other-model')) === 128_000,
-      String(await routerOverAdapter.resolve('p', 'other-model')))
-
-    const configuredOverRouter = new compaction.ContextWindowIndex(adapter(128_000), {
-      service,
-      configuredWindows: { 'p/maas-dsv4/deepseek-v4-flash': 300_000 },
-    })
-    check('窗口解析：设置页填写的窗口还优先于路由服务上报',
-      (await configuredOverRouter.resolve('p', 'maas-dsv4/deepseek-v4-flash')) === 300_000,
-      String(await configuredOverRouter.resolve('p', 'maas-dsv4/deepseek-v4-flash')))
-  } finally {
-    globalThis.fetch = fetchImpl
-  }
-}
-
-/* ── the config-editor write ── */
-{
-  const entry = { options: { id: 'compaction-basic', name: '@deepseek-ai/dsh-compaction-basic', config: {} } }
-  const policy = compaction.compactionPolicy('a', 'x', 250_000, 1_000_000).policy
-  let written = null
-  const editor = {
-    entries: () => [entry],
-    edit: async (_entry, change) => {
-      written = change({ modelPolicies: [{ provider: 'hand', model: 'made' }] })
-    },
-  }
-  const applied = await compaction.applyCompactionPolicies(editor, [policy])
-  check('写入走 configEditor.edit，合并后落进 compaction-basic 的 config',
-    applied.ok === true && applied.entry === 'compaction-basic' && applied.count === 1
-      && written.modelPolicies.length === 2,
-    JSON.stringify(applied))
-  check('写入保留该 entry 的其它配置字段',
-    (await (async () => {
-      let next = null
-      const withName = { entries: () => [entry], edit: async (_e, change) => { next = change({ auto: true, modelPolicies: [] }) } }
-      await compaction.applyCompactionPolicies(withName, [policy])
-      return next.auto === true
-    })()) === true)
-  check('配置编辑器缺席时如实报告 unavailable、不抛异常',
-    (await compaction.applyCompactionPolicies(null, [policy])).code === 'unavailable')
-  check('地址表中没有 compaction-basic 时报 entry-missing',
-    (await compaction.applyCompactionPolicies({ entries: () => [], edit: async () => {} }, [policy])).code === 'entry-missing')
-  check('reconcile 抛错时把错误交回调用方、不吞掉',
-    (await compaction.applyCompactionPolicies({
-      entries: () => [entry],
-      edit: async () => {
-        throw new Error('loader rejected the change')
-      },
-    }, [policy])).message === 'loader rejected the change')
-  check('按包名也能找到被改过 id 的 entry',
-    compaction.findCompactionEntry([{ options: { id: 'renamed', name: '@deepseek-ai/dsh-compaction-basic' } }]) !== null)
-}
+section('3b. 桌面通知')
 
 /* ── platform dispatch ── */
 {
@@ -2720,13 +2513,6 @@ function cordisLikeContext(services) {
   registerRoutes(ctx)
 
   const state = await call(ctx, '/state', {})
-  check('/state 上报压缩契约（entry id、范围、配置编辑器可见性、计划）',
-    state.json?.ok === true
-      && state.json.value.compaction?.entryId === 'compaction-basic'
-      && state.json.value.compaction.configEditor === false
-      && state.json.value.compaction.limits.minTokens === compaction.MIN_COMPACTION_TOKENS
-      && Array.isArray(state.json.value.compaction.plan.policies),
-    JSON.stringify(state.json?.value?.compaction ?? null))
   check('/state 上报通知契约（开关、平台、标题与正文上限及其可填范围）',
     state.json?.value?.notify?.onComplete === true
       && 'platform' in state.json.value.notify
@@ -2738,21 +2524,11 @@ function cordisLikeContext(services) {
       && state.json.value.notify.limits.ellipsis === notify.ELLIPSIS,
     JSON.stringify(state.json?.value?.notify ?? null))
 
-  const saved = await call(ctx, '/save', { compactionTokens: { 'deepseek-official/deepseek-flash': 250_000 } })
-  check('/save 收下合法的 per-model 阈值并回读',
-    saved.json?.ok === true
-      && saved.json.value.settings.compactionTokens['deepseek-official/deepseek-flash'] === 250_000,
-    JSON.stringify(saved.json?.value?.settings?.compactionTokens ?? null))
-  check('/save 拒绝不是 provider/model 的键',
-    (await call(ctx, '/save', { compactionTokens: { nope: 250_000 } })).json?.ok === false)
-  check('/save 拒绝超出可写范围的阈值',
-    (await call(ctx, '/save', { compactionTokens: { 'a/b': 9_000_000 } })).json?.ok === false)
-  check('/save 拒绝非对象的阈值表',
-    (await call(ctx, '/save', { compactionTokens: [250_000] })).json?.ok === false)
+  const saved = await call(ctx, '/save', { notifyOnComplete: false })
+  check('/save 存下通知开关并回读',
+    saved.json?.value?.settings?.notifyOnComplete === false)
   check('/save 拒绝非布尔的通知开关',
     (await call(ctx, '/save', { notifyOnComplete: 'yes' })).json?.ok === false)
-  check('/save 存下通知开关并回读',
-    (await call(ctx, '/save', { notifyOnComplete: false })).json?.value?.settings?.notifyOnComplete === false)
   check('/save 拒绝非整数或超出范围的字符上限',
     (await call(ctx, '/save', { notifyMaxChars: '120' })).json?.ok === false
       && (await call(ctx, '/save', { notifyMaxChars: 12 })).json?.ok === false
@@ -2764,45 +2540,6 @@ function cordisLikeContext(services) {
       && savedChars.json?.value?.notify?.limits?.bodyChars === 200
       && savedChars.json?.value?.notify?.limits?.titleChars === notify.NOTIFY_TITLE_CHARS,
     JSON.stringify(savedChars.json?.value?.settings?.notifyMaxChars ?? null))
-
-  const windowsView = await call(ctx, '/compaction.windows', {})
-  check('/compaction.windows 列出目录里的每个模型与其宿主解析出的窗口',
-    windowsView.json?.ok === true
-      && windowsView.json.value.models.length === 3
-      && windowsView.json.value.models.every((row) => row.contextWindow === 1_000_000),
-    JSON.stringify(windowsView.json?.value?.models ?? null))
-  check('/compaction.windows 带出已存阈值',
-    windowsView.json.value.models.find((row) => row.model === 'deepseek-flash')?.tokens === 250_000)
-
-  const noEditor = await call(ctx, '/compaction.apply', {})
-  check('/compaction.apply 无 configEditor 时报 unavailable、不写任何东西',
-    noEditor.json?.ok === true
-      && noEditor.json.value.applied.ok === false
-      && noEditor.json.value.applied.code === 'unavailable'
-      && noEditor.json.value.plan.policies.length === 1,
-    JSON.stringify(noEditor.json?.value?.applied ?? null))
-
-  let edited = null
-  const withEditor = makeCtx([], {
-    contextWindow: 1_000_000,
-    configEditor: {
-      entries: () => [{ options: { id: 'compaction-basic', name: '@deepseek-ai/dsh-compaction-basic' } }],
-      edit: async (_entry, change) => {
-        edited = change({ modelPolicies: [] })
-      },
-    },
-  })
-  registerRoutes(withEditor)
-  const applied = await call(withEditor, '/compaction.apply', {})
-  check('/compaction.apply 写入并如实上报条数',
-    applied.json?.value?.applied?.ok === true && applied.json.value.applied.count === 1,
-    JSON.stringify(applied.json?.value?.applied ?? null))
-  check('/compaction.apply 写入的是换算后的 modelPolicies（固定 token → 该模型占比）',
-    edited?.modelPolicies?.length === 1
-      && edited.modelPolicies[0].provider === 'deepseek-official'
-      && edited.modelPolicies[0].model === 'deepseek-flash'
-      && Math.abs(edited.modelPolicies[0].thresholdRatio - 0.25) < 1e-12,
-    JSON.stringify(edited))
 
   // The dispatch itself is covered above with an injected runner. These two are
   // deliberately limited to the paths that cannot pop a real notification on the
@@ -2817,146 +2554,7 @@ function cordisLikeContext(services) {
       probe.json?.ok === true && probe.json.value.sent === false && typeof probe.json.value.skipped === 'string',
       JSON.stringify(probe.json?.value ?? null))
   }
-
-  // The regression this whole block guards: a host whose bare `ctx.configEditor`
-  // throws (cordis, because the plugin does not inject it) while `ctx.get` works.
-  // Reading the property first used to look exactly like "no config editor".
-  const editorCtx = makeCtx([], { contextWindow: 1_000_000 })
-  const editor = {
-    entries: () => [{ options: { id: 'compaction-basic', name: '@deepseek-ai/dsh-compaction-basic' } }],
-    edit: async () => {},
-  }
-  Object.defineProperty(editorCtx, 'configEditor', {
-    configurable: true,
-    get() {
-      throw new Error('cannot get property "configEditor" without inject')
-    },
-  })
-  Object.defineProperty(editorCtx, 'get', {
-    configurable: true,
-    value: (name) => (name === 'configEditor' ? editor : editorCtx[name]),
-  })
-  registerRoutes(editorCtx)
-  const strictState = await call(editorCtx, '/state', {})
-  check('/state 在「裸读抛错、只能 get」的宿主上仍报 configEditor 可用',
-    strictState.json?.value?.compaction?.configEditor === true,
-    JSON.stringify(strictState.json?.value?.compaction?.configEditor))
-  const strictApply = await call(editorCtx, '/compaction.apply', {})
-  check('/compaction.apply 在这种宿主上仍能写入（不再假报 unavailable）',
-    strictApply.json?.value?.applied?.ok === true && strictApply.json.value.applied.count === 1,
-    JSON.stringify(strictApply.json?.value?.applied ?? null))
 }
-
-/* ── 压缩：model 自身带斜杠的路由（provider=custom + model=maas-dsv4/deepseek-v4-flash）── */
-{
-  // This is the regression the whole fix exists for: a single provider whose
-  // model ids themselves contain a `/`. The stored key
-  // `custom/maas-dsv4/deepseek-v4-flash` must round-trip to the exact live route
-  // {provider:"custom", model:"maas-dsv4/deepseek-v4-flash"} — never be split
-  // into {provider:"custom/maas-dsv4", model:"deepseek-v4-flash"}. Otherwise the
-  // policy written to compaction-basic matches nothing and compaction never fires.
-  let edited = null
-  const slashCtx = makeCtx([], {
-    contextWindow: 1_000_000,
-    configEditor: {
-      entries: () => [{ options: { id: 'compaction-basic', name: '@deepseek-ai/dsh-compaction-basic' } }],
-      edit: async (_entry, change) => {
-        edited = change({ modelPolicies: [] })
-      },
-    },
-  })
-  slashCtx.llm.listProviders = () => [{ id: 'custom', name: 'Custom' }]
-  slashCtx.llm.listModels = async (id) => (id === 'custom'
-    ? [
-        { id: 'maas-dsv4/deepseek-v4-flash', name: 'maas-dsv4/deepseek-v4-flash' },
-        { id: 'maas-coclaw/co-claw', name: 'maas-coclaw/co-claw' },
-        { id: 'deepseek-official/deepseek-v4-flash', name: 'deepseek-official/deepseek-v4-flash' },
-      ]
-    : [])
-  registerRoutes(slashCtx)
-
-  const saved = await call(slashCtx, '/save', {
-    compactionTokens: { 'custom/maas-dsv4/deepseek-v4-flash': 200_000, 'custom/maas-coclaw/co-claw': 200_000 },
-  })
-  check('带斜杠 model 的阈值能被 /save 收下（不再被 lastIndexOf 拆错而拒掉）',
-    saved.json?.ok === true
-      && saved.json.value.settings.compactionTokens['custom/maas-dsv4/deepseek-v4-flash'] === 200_000,
-    JSON.stringify(saved.json?.value?.settings?.compactionTokens ?? null))
-
-  const windowsView = await call(slashCtx, '/compaction.windows', {})
-  check('/compaction.windows 对这些路由仍报出真实 model id（含斜杠）与窗口',
-    windowsView.json?.value?.models?.length === 3
-      && windowsView.json.value.models.some((row) => row.provider === 'custom' && row.model === 'maas-dsv4/deepseek-v4-flash' && row.contextWindow === 1_000_000),
-    JSON.stringify(windowsView.json?.value?.models ?? null))
-
-  const applied = await call(slashCtx, '/compaction.apply', {})
-  check('带斜杠 model 的压缩计划解析出真实 provider/model（custom + maas-dsv4/...，不再错拆）',
-    applied.json?.value?.applied?.ok === true
-      && applied.json.value.applied.count === 2
-      && !applied.json.value.plan.skipped.some((row) => row.target.includes('custom/maas-dsv4')),
-    JSON.stringify(applied.json?.value?.plan ?? null))
-  check('写入 compaction-basic 的策略用的是真实 route，能精确命中 DSH 路由',
-    edited?.modelPolicies?.length === 2
-      && edited.modelPolicies.some((row) => row.provider === 'custom' && row.model === 'maas-dsv4/deepseek-v4-flash')
-      && edited.modelPolicies.some((row) => row.provider === 'custom' && row.model === 'maas-coclaw/co-claw')
-      && !edited.modelPolicies.some((row) => String(row.provider).includes('maas-dsv4')),
-    JSON.stringify(edited))
-}
-
-/* ── 压缩：上下文窗口的可配置性与窗口契约 ── */
-{
-  // The regression the whole feature exists for: the custom provider's models
-  // showed 262144 (the pi-ai adapter's fallback), so a 300k threshold was
-  // "exceeds-window" and never effective. The settings page now owns a window
-  // per model; a typed window must round-trip through /save, show up in
-  // /compaction.windows as the effective/configured value, and override the
-  // adapter-declared fallback when the plan is computed.
-  const winCtx = makeCtx([], { contextWindow: 262_144 })
-  registerRoutes(winCtx)
-
-  check('/save 拒绝非对象 / 坏键 / 非法范围的窗口表',
-    (await call(winCtx, '/save', { compactionWindows: [300_000] })).json?.ok === false
-      && (await call(winCtx, '/save', { compactionWindows: { nope: 300_000 } })).json?.ok === false
-      && (await call(winCtx, '/save', { compactionWindows: { 'a/b': 100 } })).json?.ok === false
-      && (await call(winCtx, '/save', { compactionWindows: { 'a/b': 9_000_000 } })).json?.ok === false)
-
-  const savedWin = await call(winCtx, '/save', {
-    compactionTokens: { 'deepseek-official/deepseek-flash': 300_000 },
-    compactionWindows: { 'deepseek-official/deepseek-flash': 300_000 },
-  })
-  check('/save 收下合法的阈值+窗口并回读（/state 的压缩契约与设置都带上窗口）',
-    savedWin.json?.ok === true
-      && savedWin.json.value.settings.compactionWindows['deepseek-official/deepseek-flash'] === 300_000
-      && savedWin.json.value.compaction.windows['deepseek-official/deepseek-flash'] === 300_000,
-    JSON.stringify(savedWin.json?.value?.settings?.compactionWindows ?? null))
-
-  const windowsView = await call(winCtx, '/compaction.windows', {})
-  check('/compaction.windows 上报默认窗口与窗口可写范围，且配置的窗口优先于适配器声明',
-    windowsView.json?.ok === true
-      && windowsView.json.value.defaultWindow === compaction.DEFAULT_CONTEXT_WINDOW
-      && windowsView.json.value.windowLimits.min === compaction.MIN_CONTEXT_WINDOW
-      && windowsView.json.value.windowLimits.max === compaction.MAX_CONTEXT_WINDOW
-      && windowsView.json.value.models.every((row) => Number.isSafeInteger(row.contextWindow)),
-    JSON.stringify(windowsView.json?.value ?? null))
-  check('/compaction.windows 对配置过窗口的模型报 configuredWindow（其余为 null）',
-    windowsView.json.value.models.find((row) => row.model === 'deepseek-flash')?.configuredWindow === 300_000
-      && windowsView.json.value.models.every((row) => row.model !== 'deepseek-flash' || row.contextWindow === 300_000)
-      && windowsView.json.value.models.filter((row) => row.model !== 'deepseek-flash').every((row) => row.configuredWindow === null),
-    JSON.stringify(windowsView.json?.value?.models ?? null))
-
-  // The plan's window lookup goes through the same index: a typed window must
-  // move the 300k threshold from "exceeds-window" (adapter said 262144) to a
-  // valid policy — the exact scenario that used to be impossible.
-  const applied = await call(winCtx, '/compaction.apply', {})
-  check('配置了窗口后，同一阈值不再超窗，能换算成策略（自定义 provider 的场景正是这样修好的）',
-    applied.json?.ok === true
-      && applied.json.value.plan.policies.some(
-        (row) => row.provider === 'deepseek-official' && row.model === 'deepseek-flash',
-      )
-      && !applied.json.value.plan.skipped.some((row) => row.target === 'deepseek-official/deepseek-flash' && row.reason === 'exceeds-window'),
-    JSON.stringify(applied.json?.value?.plan ?? null))
-}
-
 
 /* ── 通知正文：先由模型总结成一行，再推送 ── */
 {
@@ -3365,7 +2963,6 @@ const STATE = {
       btwContextTurns: 'all',
       btwContextCount: 8,
       btwSaveHistory: true,
-      compactionTokens: { 'deepseek-official/deepseek-flash': 250_000 },
       notifyOnComplete: true,
       notifyMaxChars: 200,
       notifyProvider: null,
@@ -3423,13 +3020,6 @@ const STATE = {
       // render what a question would actually use and which efforts it accepts.
       active: { provider: 'deepseek-official', model: 'deepseek-flash' },
       reasoning: { efforts: ['off', 'low', 'high'], defaultEffort: 'high' },
-    },
-    compaction: {
-      tokens: { 'deepseek-official/deepseek-flash': 250_000 },
-      entryId: 'compaction-basic',
-      limits: { minTokens: 8192, maxTokens: 4_000_000 },
-      configEditor: false,
-      plan: { policies: [], skipped: [], capped: [], yaml: '' },
     },
     notify: {
       onComplete: true,
@@ -3668,17 +3258,6 @@ function makeFetch(options = {}) {
     }
     if (action === 'btw.history') {
       return new Response(JSON.stringify({ ok: true, value: { topics: options.btwTopics ?? [], saveHistory: options.btwSaveHistory !== false } }), { status: 200 })
-    }
-    if (action === 'compaction.windows') {
-      return new Response(JSON.stringify({
-        ok: true,
-        value: {
-          limits: { minTokens: compaction.MIN_COMPACTION_TOKENS, maxTokens: compaction.MAX_COMPACTION_TOKENS },
-          models: options.compactionWindows ?? [
-            { provider: 'deepseek-official', model: 'deepseek-flash', contextWindow: 1_000_000, tokens: 250_000 },
-          ],
-        },
-      }), { status: 200 })
     }
     if (action === 'btw.save') {
       const body = seen[seen.length - 1].body ?? {}
@@ -4013,8 +3592,8 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
   const render = mountClient(bundle, bundle.SettingsPanel)
   const page = () => render({ close() {} })
 
-  const TAB_IDS = ['optimize', 'btw', 'title', 'compaction', 'notify', 'router']
-  const TAB_KEYS = ['tabOptimize', 'tabBtw', 'tabTitle', 'tabCompaction', 'tabNotify', 'tabRouter']
+  const TAB_IDS = ['optimize', 'btw', 'title', 'notify', 'router']
+  const TAB_KEYS = ['tabOptimize', 'tabBtw', 'tabTitle', 'tabNotify', 'tabRouter']
   const TAB_LABELS = TAB_KEYS.map((key) => bundle.DICT.zh[key])
   const PAGE_NODES = ['dspo-meta', 'dspo-set-ok', 'dspo-set-error']
   const tabButton = (tree, id) => findAll(tree, (node) => node.props?.id === `dspo-tab-${id}`)[0]
@@ -4048,13 +3627,13 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
   const firstTabs = tabsOf(first)
   check('设置页有 role="tablist" 的标签栏', rail !== undefined && rail.props.className === 'dspo-tabs'
     && rail.props['aria-label'] === bundle.DICT.zh.settingsTabs, JSON.stringify(rail?.props))
-  check('标签栏恰好六个 role="tab" 按钮（提示词优化只占一个，路由占最后一个）', firstTabs.length === 6, String(firstTabs.length))
+  check('标签栏恰好五个 role="tab" 按钮（提示词优化只占一个，路由占最后一个）', firstTabs.length === 5, String(firstTabs.length))
   check('六个页签按文档顺序排列，id 与文案各自对应',
     JSON.stringify(firstTabs.map((tab) => tab.props.id)) === JSON.stringify(TAB_IDS.map((id) => `dspo-tab-${id}`))
       && JSON.stringify(firstTabs.map(labelOf)) === JSON.stringify(TAB_LABELS),
     firstTabs.map((tab) => `${tab.props.id}=${labelOf(tab)}`).join(' '))
-  check('页签文案就是文档写死的六个中文标签',
-    JSON.stringify(TAB_LABELS) === JSON.stringify(['优化提示词', '旁路提问', '标题', '压缩', '通知', '路由']), TAB_LABELS.join(','))
+  check('页签文案就是文档写死的五个中文标签',
+    JSON.stringify(TAB_LABELS) === JSON.stringify(['优化提示词', '旁路提问', '标题', '通知', '路由']), TAB_LABELS.join(','))
   // The acceptance criterion for this refactor: exactly one tab carries the
   // rewrite. The old 模型 / 改写 / 提示词 trio must not exist as tabs at all.
   check('与本功能相关的页签只有一个',
@@ -4104,10 +3683,10 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
       && panelsOf(afterTitle).filter((panel) => panel.props.hidden === true).length === 2
       && visiblePanel(afterTitle).props.id === 'dspo-panel-title',
     panelsOf(afterTitle).map((panel) => `${panel.props.id}:${panel.props.hidden}`).join(' '))
-  check('compaction 面板在访问它之前始终不存在',
-    !panelsOf(afterTitle).some((panel) => panel.props.id === 'dspo-panel-compaction'))
-  const allTabs = clickTab(afterTitle, 'compaction')
-  check('访问 compaction 后四个面板齐备', panelsOf(allTabs).length === 4, String(panelsOf(allTabs).length))
+  check('没访问过的页签根本没有面板（notify 还不存在）',
+    !panelsOf(afterTitle).some((panel) => panel.props.id === 'dspo-panel-notify'))
+  const allTabs = clickTab(afterTitle, 'notify')
+  check('访问 notify 后四个面板齐备', panelsOf(allTabs).length === 4, String(panelsOf(allTabs).length))
 
   /* ── one walk that collects each tab's rows and re-checks the wiring ── */
   const labelsByTab = {}
@@ -4170,7 +3749,7 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
   /* ── the split's acceptance criterion: no omission, no duplication ── */
   // Keyed off the `dspo-set-label` nodes on purpose: the 说明 blocks re-print
   // some of these names, so raw text would double-count them.
-  const ROW_KEYS = ['recentMessagesLabel', 'promptLabel', 'outputLangLabel', 'rewriteModelLabel', 'rewriteEffortLabel', 'btwModelLabel', 'btwEffortLabel', 'btwContextLabel', 'btwSaveHistoryLabel', 'titleModelLabel', 'titleEffortLabel', 'titleRerollLabel', 'titleMaxCharsLabel', 'compactionLabel', 'notifyToggle', 'notifyPlatformLabel', 'notifyModelLabel', 'notifyEffortLabel', 'notifyCharsLabel', 'routerServiceLabel', 'routerOrderLabel', 'routerProvidersLabel', 'routerConvertersLabel', 'routerPolicyLabel', 'routerLiveStatsLabel', 'routerLiveLabel']
+  const ROW_KEYS = ['recentMessagesLabel', 'promptLabel', 'outputLangLabel', 'rewriteModelLabel', 'rewriteEffortLabel', 'btwModelLabel', 'btwEffortLabel', 'btwContextLabel', 'btwSaveHistoryLabel', 'titleModelLabel', 'titleEffortLabel', 'titleRerollLabel', 'titleMaxCharsLabel', 'notifyToggle', 'notifyPlatformLabel', 'notifyModelLabel', 'notifyEffortLabel', 'notifyCharsLabel', 'routerServiceLabel', 'routerOrderLabel', 'routerProvidersLabel', 'routerConvertersLabel', 'routerPolicyLabel', 'routerLiveStatsLabel', 'routerLiveLabel']
   const expectedRows = ROW_KEYS.map((key) => bundle.DICT.zh[key])
   const sets = TAB_IDS.map((id) => labelsByTab[id])
   const summary = TAB_IDS.map((id) => `${id}:[${labelsByTab[id].join('|')}]`).join(' ')
@@ -5213,9 +4792,9 @@ function makeClientCtx(face) {
   }
 }
 
-/* ───────────────────────── 4b. compaction + notification UI ───────────────────────── */
+/* ───────────────────────── 4b. notification UI ───────────────────────── */
 
-section('4b. 压缩与通知的浏览器半区')
+section('4b. 通知的浏览器半区')
 
 {
   const bundle = loadClientBundle(makeFetch())
@@ -5425,26 +5004,6 @@ section('4b. 压缩与通知的浏览器半区')
     findAll(tree, (node) => node.props?.id === `dspo-tab-${id}`)[0].props.onClick()
     return renderPage({ close() {} })
   }
-  page = clickTab(page, 'compaction')
-  // The window lookup is adapter I/O and therefore async; the tab paints a
-  // loading line first and fills the rows when the host answers.
-  await new Promise((resolve) => setTimeout(resolve, 0))
-  await new Promise((resolve) => setTimeout(resolve, 0))
-  page = renderPage({ close() {} })
-  const compactionPanel = findAll(page, (node) => node.props?.id === 'dspo-panel-compaction')[0]
-  const numberInputs = findAll(compactionPanel, (node) => node.type === 'input' && node.props.type === 'number')
-  const thresholdInput = numberInputs.find((input) => input.props.id?.startsWith('dspo-compact-'))
-  const windowInput = numberInputs.find((input) => input.props.id?.startsWith('dspo-window-'))
-  check('压缩页签渲染出每个模型的阈值输入、默认窗口输入与两个动作按钮',
-    thresholdInput?.props.value === '250000'
-      && windowInput?.props.value === '1000000'
-      && buttonsOf(compactionPanel).some((button) => labelOf(button).includes('保存阈值'))
-      && buttonsOf(compactionPanel).some((button) => labelOf(button).includes('写入 DSH 配置')),
-    `${numberInputs.length} input(s), ${buttonsOf(compactionPanel).map(labelOf).join('|')}`)
-  check('无 configEditor 时写入按钮禁用并说明原因',
-    buttonsOf(compactionPanel).find((button) => labelOf(button).includes('写入 DSH 配置')).props.disabled === true
-      && textOf(compactionPanel).includes('配置编辑器'))
-
   page = clickTab(page, 'notify')
   const notifyPanel = findAll(page, (node) => node.props?.id === 'dspo-panel-notify')[0]
   const notifyToggle = findAll(notifyPanel, (node) => node.props?.id === 'dspo-notify')[0]

@@ -327,7 +327,7 @@ const serviceFiles = [
 for (const file of serviceFiles) {
   const source = read(file)
   check(`${file} 不 import @deepseek-ai/*`, !/from '@deepseek-ai\//.test(source))
-  check(`${file} 不 import 插件其余模块`, !/from '\.\.\/(store|prompt|notify|title|routes|client|compaction)\.js'/.test(source))
+  check(`${file} 不 import 插件其余模块`, !/from '\.\.\/(store|prompt|notify|title|routes|client)\.js'/.test(source))
 }
 check('lib/router.js 与 lib/routing.js 已不在插件主体里',
   !existsSync(join(ROOT, 'lib/router.js')) && !existsSync(join(ROOT, 'lib/routing.js')))
