@@ -158,6 +158,12 @@ check('滚动容器不留 block-start 内边距（头部与滚动口齐平，不
 
 const prompt = await import('../lib/prompt.js')
 const store = await import('../lib/store.js')
+// The README's settings sample is what a user copies; it must be the defaults,
+// key for key and in the stored order, or the document describes another file.
+const readmeSample = (readmeSource.match(/```json\n([\s\S]*?)```/) ?? [])[1]
+check('README 的设置样例就是 DEFAULT_SETTINGS（键与顺序完全一致）',
+  typeof readmeSample === 'string'
+    && JSON.stringify(JSON.parse(readmeSample)) === JSON.stringify({ ...store.DEFAULT_SETTINGS }))
 const compaction = await import('../lib/compaction.js')
 const notify = await import('../lib/notify.js')
 const notifySummary = await import('../lib/notify-summary.js')
@@ -227,9 +233,9 @@ check('输出语言指令声明只改语言、规则照旧，且明确不是翻�
 // record count. The keys the old multi-mode feature used (model pinning, effort,
 // style, apply mode, route, shortcut) must be gone from the store, not merely
 // hidden in the UI.
-const REWRITE_ONLY_KEYS = ['systemPrompt', 'outputLang', 'recentMessages']
-const REMOVED_REWRITE_KEYS = ['provider', 'model', 'reasoningEffort', 'followSessionModel', 'style', 'applyMode', 'route', 'shortcut']
-check('store 默认值只剩改写自己的三项', REWRITE_ONLY_KEYS.every((key) => key in store.DEFAULT_SETTINGS)
+const REWRITE_ONLY_KEYS = ['systemPrompt', 'outputLang', 'recentMessages', 'provider', 'model', 'reasoningEffort']
+const REMOVED_REWRITE_KEYS = ['followSessionModel', 'style', 'applyMode', 'route', 'shortcut']
+check('store 默认值只剩改写自己的六项（含模型与强度）', REWRITE_ONLY_KEYS.every((key) => key in store.DEFAULT_SETTINGS)
   && REMOVED_REWRITE_KEYS.every((key) => !(key in store.DEFAULT_SETTINGS)), Object.keys(store.DEFAULT_SETTINGS).join(','))
 check('改写的模式/模型/快捷键常量已从 store 移除',
   store.STYLE_CHOICES === undefined && store.APPLY_MODES === undefined && store.REWRITE_ROUTES === undefined)
@@ -783,20 +789,22 @@ async function call(ctx, action, body, options) {
     && state.value.limits.maxRecentMessages === store.MAX_RECENT_MESSAGES
     && state.value.limits.defaultRecentMessages === store.DEFAULT_RECENT_MESSAGES,
     JSON.stringify(state.value.limits))
-  // Only the halves that own an effort setting report one: the rewrite's effort
-  // is fixed `off` and the notification's never thinks, so a reasoning view for
-  // either would be spent on a control that does not exist. The session model
-  // used to travel along for the same nobody.
-  check('/state 只上报仍有强度开关那几半的思考强度（改写 / 通知不带，会话模型也不广播）',
-    state.value.reasoning === undefined && state.value.sessionModel === undefined
-    && state.value.notify?.reasoning === undefined
+  // Every half now owns an effort setting, so all four report what their own
+  // route advertises. The session model still does not travel: the rewrite reads
+  // its route from `active`, not from the session's selection.
+  check('/state 为四半各自的思考强度上报路由自报的档位（会话模型不广播）',
+    state.value.sessionModel === undefined
+    && Array.isArray(state.value.reasoning?.efforts)
+    && Array.isArray(state.value.notify?.reasoning?.efforts)
     && Array.isArray(state.value.btw?.reasoning?.efforts)
     && Array.isArray(state.value.title?.reasoning?.efforts))
-  check('/state 的 active 固定取会话模型，没有可覆盖它的设置',
-    state.value.active?.model === 'deepseek-flash' && state.value.settings.provider === undefined,
+  check('/state 的 active 未固定模型时取会话模型',
+    state.value.active?.provider === 'deepseek-official' && state.value.active?.model === 'deepseek-flash'
+    && state.value.settings.provider === null && state.value.settings.model === null,
     JSON.stringify(state.value.active))
-  check('/state 不再广播改写的模型与强度设置',
-    state.value.settings.reasoningEffort === undefined && state.value.settings.model === undefined
+  check('/state 广播改写的模型与强度设置（默认跟随会话 + 关闭思考）',
+    state.value.settings.reasoningEffort === store.DEFAULT_EFFORT
+    && state.value.settings.provider === null && state.value.settings.model === null
     && state.value.settings.followSessionModel === undefined,
     JSON.stringify(Object.keys(state.value.settings)))
 
@@ -809,13 +817,38 @@ async function call(ctx, action, body, options) {
   check('/save 接受 0（不带上下文）', (await call(ctx, '/save', { recentMessages: 0 })).json?.value?.settings?.recentMessages === 0)
   // A body that still carries the removed keys must not resurrect them: they are
   // ignored, and the settings document never grows them back.
-  const legacy = (await call(ctx, '/save', { style: 'slim', applyMode: 'review', route: 'agent', shortcut: false, provider: 'ccx', model: 'ccx-1' })).json
+  const legacy = (await call(ctx, '/save', { style: 'slim', applyMode: 'review', route: 'agent', shortcut: false, followSessionModel: true })).json
   check('/save 忽略已移除的旧设置键（不写回、不报错）',
     legacy.error === undefined
     && legacy.value.settings.style === undefined && legacy.value.settings.route === undefined
-    && legacy.value.settings.provider === undefined && legacy.value.settings.shortcut === undefined
+    && legacy.value.settings.followSessionModel === undefined && legacy.value.settings.shortcut === undefined
     && legacy.value.active?.model === 'deepseek-flash',
     JSON.stringify({ error: legacy.error, active: legacy.value?.active }))
+
+  // The rewrite's own model pair and effort: string-or-null like the other three
+  // halves, and the pair decides what a rewrite actually calls.
+  const pinned = (await call(ctx, '/save', { provider: 'ccx', model: 'ccx-1', reasoningEffort: 'high' })).json
+  check('/save 接受改写自己的模型与强度，/state 立刻改用它',
+    pinned.value.settings.provider === 'ccx' && pinned.value.settings.model === 'ccx-1'
+    && pinned.value.settings.reasoningEffort === 'high'
+    && pinned.value.active?.provider === 'ccx' && pinned.value.active?.model === 'ccx-1',
+    JSON.stringify({ settings: pinned.value.settings, active: pinned.value.active }))
+  const pinnedAt = ctx.calls.length
+  await call(ctx, '/optimize', { text: '草稿' })
+  // The first attempt is the one that carries the configured pair: the failure
+  // ladder's later rungs are allowed to drop the effort field.
+  check('固定模型后改写的第一跳就用固定那条路由与档位',
+    ctx.calls[pinnedAt].provider === 'ccx' && ctx.calls[pinnedAt].model === 'ccx-1'
+    && ctx.calls[pinnedAt].reasoningEffort === 'high',
+    JSON.stringify({ provider: ctx.calls[pinnedAt].provider, model: ctx.calls[pinnedAt].model, effort: ctx.calls[pinnedAt].reasoningEffort }))
+  check('/save 拒绝非法改写强度与非法模型取值',
+    (await call(ctx, '/save', { reasoningEffort: 'ultra' })).json?.error?.code === 'bad-request'
+    && (await call(ctx, '/save', { provider: 7 })).json?.error?.code === 'bad-request'
+    && (await call(ctx, '/save', { model: 7 })).json?.error?.code === 'bad-request')
+  const cleared = (await call(ctx, '/save', { provider: null, model: null, reasoningEffort: 'off' })).json
+  check('清空改写模型后回落会话模型',
+    cleared.value.settings.provider === null && cleared.value.active?.provider === 'deepseek-official'
+    && cleared.value.active?.model === 'deepseek-flash', JSON.stringify(cleared.value.active))
 
   // The session-title half: its own model pair and effort, plus the two numbers
   // that define the feature. Every one of them round-trips through /save, and
@@ -944,18 +977,31 @@ const textStep = (text) => [{ type: 'text-delta', text }, { type: 'finish', reas
 }
 
 {
-  // Thinking is fixed off now: an old `reasoningEffort` in the settings file no
-  // longer reaches the call.
+  // The rewrite's effort is a setting: `off` unless changed, and `auto` omits the
+  // field so the adapter's own default applies.
   const ctx = makeCtx([textStep('x')])
   registerRoutes(ctx)
   await call(ctx, '/save', { reasoningEffort: 'high' })
+  const high = (await call(ctx, '/optimize', { text: '草稿' })).json
+  check('改写发送配置的思考档位',
+    ctx.calls[0].reasoningEffort === 'high' && high?.value?.effort === 'high',
+    String(ctx.calls[0].reasoningEffort))
+  await call(ctx, '/save', { reasoningEffort: 'auto' })
+  const auto = (await call(ctx, '/optimize', { text: '草稿' })).json
+  check('auto = 完全不发送强度字段',
+    ctx.calls[1].reasoningEffort === undefined && auto?.value?.effort === null,
+    JSON.stringify(ctx.calls[1].reasoningEffort))
+  await call(ctx, '/save', { reasoningEffort: 'off' })
   await call(ctx, '/optimize', { text: '草稿' })
-  check('改写始终发送 off（旧键已无作用）', ctx.calls[0].reasoningEffort === 'off', String(ctx.calls[0].reasoningEffort))
+  check('默认档位 off 照旧发送 off', ctx.calls[2].reasoningEffort === 'off', String(ctx.calls[2].reasoningEffort))
 }
 
 {
   const ctx = makeCtx([textStep('x')], { reasoning: { reasoning: { efforts: [{ id: 'high' }], defaultEffort: 'high' } } })
   registerRoutes(ctx)
+  // The stored value is the default `off` here; the route only advertises `high`,
+  // so the picker's negotiation is what the call must show.
+  await call(ctx, '/save', { reasoningEffort: 'off' })
   const res = await call(ctx, '/optimize', { text: '草稿' })
   check('路由不支持 off 时按它支持的档位降级',
     ctx.calls[0].reasoningEffort === 'high' && res.json.value.effortDegraded === true,
@@ -1177,10 +1223,10 @@ store.clearBtwTopics('session-a')
   check('/save 接受旁路提问自己的模型与强度',
     btwSaved.value.settings.btwProvider === 'ccx' && btwSaved.value.settings.btwModel === 'ccx-1'
       && btwSaved.value.settings.btwReasoningEffort === 'high')
-  check('/save 不因为旁路设置而改动「优化提示词」的两项设置',
-    ['systemPrompt', 'recentMessages']
+  check('/save 不因为旁路设置而改动「优化提示词」的设置',
+    ['systemPrompt', 'recentMessages', 'provider', 'model', 'reasoningEffort']
       .every((key) => btwSaved.value.settings[key] === settingsBefore[key]),
-    ['systemPrompt', 'recentMessages']
+    ['systemPrompt', 'recentMessages', 'provider', 'model', 'reasoningEffort']
       .map((key) => `${key}:${JSON.stringify(settingsBefore[key])}->${JSON.stringify(btwSaved.value.settings[key])}`).join(' '))
   check('/state 分别上报两半的路由（btw.active 是旁路自己的那一份）',
     btwSaved.value.btw.active?.provider === 'ccx' && btwSaved.value.btw.active?.model === 'ccx-1'
@@ -2972,6 +3018,9 @@ const STATE = {
       systemPrompt: null,
       outputLang: null,
       recentMessages: 8,
+      provider: null,
+      model: null,
+      reasoningEffort: 'off',
       btwContextTurns: 'all',
       btwContextCount: 8,
       btwSaveHistory: true,
@@ -2980,6 +3029,7 @@ const STATE = {
       notifyMaxChars: 200,
       notifyProvider: null,
       notifyModel: null,
+      notifyReasoningEffort: 'off',
       titleProvider: null,
       titleModel: null,
       titleReasoningEffort: 'off',
@@ -3010,6 +3060,7 @@ const STATE = {
       { id: 'ccx', name: 'CCX', models: [{ id: 'deepseek-v4-flash', name: 'deepseek-v4-flash' }], error: null },
     ],
     active: { provider: 'deepseek-official', model: 'deepseek-flash' },
+    reasoning: { efforts: ['off', 'low', 'high'], defaultEffort: 'high' },
     effortChoices: [...store.EFFORT_CHOICES],
     configFile: store.CONFIG_FILE,
     limits: {
@@ -3050,6 +3101,7 @@ const STATE = {
       // `reasoning` rides along: nothing here may pick an effort.
       active: { provider: 'deepseek-official', model: 'deepseek-flash' },
       thinking: 'off',
+      reasoning: { efforts: ['off', 'low', 'high'], defaultEffort: 'high' },
       maxInputChars: notifySummary.NOTIFY_SUMMARY_INPUT_CHARS,
       fallbackBody: notifySummary.NOTIFY_SUMMARY_FALLBACK_BODY,
       limits: {
@@ -3697,10 +3749,10 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
   /* ── every original surface assertion, unioned over the tabs ── */
   const panelsById = Object.fromEntries(panelsOf(walk).map((panel) => [panel.props.id, panel]))
   const panelText = TAB_IDS.map((id) => textOf(panelsById[`dspo-panel-${id}`])).join('\n')
-  check('提示词优化页签只有该功能的两项设置',
+  check('提示词优化页签里有该功能的设置项',
     panelText.includes('自定义优化提示词') && panelText.includes('携带最近会话消息'))
-  check('提示词优化页签如实说明模型与思考是固定的（不是设置项）',
-    panelText.includes('跟随当前会话的模型') && panelText.includes('deepseek-flash') && panelText.includes('不开启思考'))
+  check('提示词优化页签的错误提示用的是会话模型',
+    panelText.includes('跟随当前会话的模型') && panelText.includes('deepseek-flash'))
   // Everything the multi-mode feature exposed is gone, rows included.
   check('已移除的设置项不再渲染成行',
     !['跟随当前会话的模型（推荐）', '优化模型', '思考强度', '默认档位', '改写完成后', '改写方式', '启用 Alt+O 触发优化']
@@ -3709,9 +3761,10 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
     ['dspo-style', 'dspo-apply', 'dspo-route', 'dspo-shortcut', 'dspo-follow', 'dspo-provider', 'dspo-model', 'dspo-effort']
       .every((id) => findAll(walk, (node) => node.props?.id === id).length === 0))
   const selects = findAll(walk, (node) => node.type === 'select')
-  check('设置页仍渲染出旁路 / 标题的下拉（模型 + 强度）', selects.length >= 6, String(selects.length))
-  check('提示词优化页签里没有下拉（模型与强度不是这里的选择项）',
-    findAll(panelsById['dspo-panel-optimize'], (node) => node.type === 'select').length === 0)
+  check('设置页渲染出四半各自的模型与强度下拉', selects.length >= 10, String(selects.length))
+  check('提示词优化页签里也有模型与强度的下拉（两项都是设置）',
+    findAll(panelsById['dspo-panel-optimize'], (node) => node.type === 'select').length === 3,
+    String(findAll(panelsById['dspo-panel-optimize'], (node) => node.type === 'select').length))
   const textarea = findAll(walk, (node) => node.type === 'textarea')[0]
   check('自定义提示词框留空（不预填默认）', textarea !== undefined && textarea.props.value === '')
   check('设置页可展开查看内置默认', textOf(walk).includes('查看内置默认提示词'))
@@ -3736,7 +3789,7 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
   /* ── the split's acceptance criterion: no omission, no duplication ── */
   // Keyed off the `dspo-set-label` nodes on purpose: the 说明 blocks re-print
   // some of these names, so raw text would double-count them.
-  const ROW_KEYS = ['recentMessagesLabel', 'promptLabel', 'outputLangLabel', 'btwModelLabel', 'btwEffortLabel', 'btwContextLabel', 'btwSaveHistoryLabel', 'titleModelLabel', 'titleEffortLabel', 'titleRerollLabel', 'titleMaxCharsLabel', 'compactionLabel', 'notifyToggle', 'notifyPlatformLabel', 'notifyModelLabel', 'notifyCharsLabel', 'routerToggle', 'routerOrderLabel', 'routerRetriesLabel', 'routerThresholdLabel', 'routerWindowLabel', 'routerCooldownLabel', 'routerCooldownFactorLabel', 'routerCooldownMaxLabel', 'routerSwitchesLabel', 'routerRecoveryLabel', 'routerLogLevelLabel', 'routerLiveLabel']
+  const ROW_KEYS = ['recentMessagesLabel', 'promptLabel', 'outputLangLabel', 'rewriteModelLabel', 'rewriteEffortLabel', 'btwModelLabel', 'btwEffortLabel', 'btwContextLabel', 'btwSaveHistoryLabel', 'titleModelLabel', 'titleEffortLabel', 'titleRerollLabel', 'titleMaxCharsLabel', 'compactionLabel', 'notifyToggle', 'notifyPlatformLabel', 'notifyModelLabel', 'notifyEffortLabel', 'notifyCharsLabel', 'routerToggle', 'routerOrderLabel', 'routerRetriesLabel', 'routerThresholdLabel', 'routerWindowLabel', 'routerCooldownLabel', 'routerCooldownFactorLabel', 'routerCooldownMaxLabel', 'routerSwitchesLabel', 'routerRecoveryLabel', 'routerLogLevelLabel', 'routerLiveLabel']
   const expectedRows = ROW_KEYS.map((key) => bundle.DICT.zh[key])
   const sets = TAB_IDS.map((id) => labelsByTab[id])
   const summary = TAB_IDS.map((id) => `${id}:[${labelsByTab[id].join('|')}]`).join(' ')
@@ -3746,7 +3799,7 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
       && sets.every((labels, index) => sets.slice(index + 1).every((other) => labels.every((label) => !other.includes(label)))),
     summary)
   const union = [...new Set(sets.flat())].sort()
-  check('六个页签的行标签并集恰好是词典里的这 28 行（无遗漏、无重复）',
+  check('六个页签的行标签并集恰好是词典里的这 31 行（无遗漏、无重复）',
     union.length === ROW_KEYS.length && JSON.stringify(union) === JSON.stringify([...expectedRows].sort()),
     `${union.length}: ${union.join('|')}`)
 
@@ -4247,6 +4300,65 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
   check('宿主没挂载路由运行时时页面说明原因', textOf(panel).includes(bundle.DICT.zh.routerLiveUnavailable))
   check('没有实时状态时清空按钮不可用',
     findAll(panel, (node) => node.type === 'button' && labelOf(node).trim() === bundle.DICT.zh.routerLiveReset)[0].props.disabled === true)
+  bundle.__restore()
+}
+
+{
+  // The rewrite's own model and thinking level. Both used to be fixed facts; they
+  // are settings now, and the pair is one control — the sentinel means "follow the
+  // session", a provider pins both halves at once.
+  const fetchImpl = makeFetch({ saveOk: true })
+  const bundle = loadClientBundle(fetchImpl)
+  await bundle.settingsStore.load(true)
+  const render = mountClient(bundle, bundle.SettingsPanel)
+  const page = () => render({ close() {} })
+  const settle = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  }
+  const panelOf = (tree, id) => findAll(tree, (node) => node.props?.role === 'tabpanel' && node.props.id === `dspo-panel-${id}`)[0]
+  const lastSave = () => fetchImpl.seen.filter((entry) => entry.action === 'save').at(-1)
+  findAll(page(), (node) => node.props?.id === 'dspo-tab-optimize')[0].props.onClick()
+  await settle()
+  const at = (id) => findAll(panelOf(page(), 'optimize'), (node) => node.props?.id === id)[0]
+  check('改写的模型下拉默认停在「跟随当前会话」，模型不可改',
+    at('dspo-rewrite-provider')?.props?.value === '' && at('dspo-rewrite-model-pick')?.props?.disabled === true,
+    `${at('dspo-rewrite-provider')?.props?.value} / ${at('dspo-rewrite-model-pick')?.props?.disabled}`)
+  check('跟随态下模型下拉显示会话当前模型', at('dspo-rewrite-model-pick')?.props?.value === 'deepseek-flash')
+  check('改写的思考强度默认 off，选项来自该路由自报的档位',
+    at('dspo-rewrite-effort')?.props?.value === 'off'
+      && (at('dspo-rewrite-effort').children ?? []).map((option) => option.props.value).join(',') === 'off,low,high',
+    JSON.stringify((at('dspo-rewrite-effort')?.children ?? []).map((option) => option.props.value)))
+
+  at('dspo-rewrite-provider').props.onChange({ target: { value: 'ccx' } })
+  await settle()
+  check('选一个供应商就把 provider 与它的第一个模型一起固定',
+    JSON.stringify(lastSave()?.body) === JSON.stringify({ provider: 'ccx', model: 'deepseek-v4-flash' }),
+    JSON.stringify(lastSave()?.body))
+  at('dspo-rewrite-provider').props.onChange({ target: { value: '' } })
+  await settle()
+  check('选「跟随当前会话」把两半一起写回 null',
+    JSON.stringify(lastSave()?.body) === JSON.stringify({ provider: null, model: null }),
+    JSON.stringify(lastSave()?.body))
+  at('dspo-rewrite-effort').props.onChange({ target: { value: 'high' } })
+  await settle()
+  check('改写的思考强度只发 reasoningEffort 一个键',
+    JSON.stringify(lastSave()?.body) === JSON.stringify({ reasoningEffort: 'high' }),
+    JSON.stringify(lastSave()?.body))
+
+  // The notification summary's level is the same shape of setting, on its tab.
+  findAll(page(), (node) => node.props?.id === 'dspo-tab-notify')[0].props.onClick()
+  await settle()
+  const notifyAt = (id) => findAll(panelOf(page(), 'notify'), (node) => node.props?.id === id)[0]
+  check('通知页签也有思考强度下拉，默认 off',
+    notifyAt('dspo-notify-effort')?.props?.value === 'off'
+      && (notifyAt('dspo-notify-effort').children ?? []).map((option) => option.props.value).includes('off'),
+    JSON.stringify(notifyAt('dspo-notify-effort')?.props?.value))
+  notifyAt('dspo-notify-effort').props.onChange({ target: { value: 'low' } })
+  await settle()
+  check('通知的思考强度只发 notifyReasoningEffort 一个键',
+    JSON.stringify(lastSave()?.body) === JSON.stringify({ notifyReasoningEffort: 'low' }),
+    JSON.stringify(lastSave()?.body))
   bundle.__restore()
 }
 
