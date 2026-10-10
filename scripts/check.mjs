@@ -94,16 +94,16 @@ check('服务配置的写入集中在 config.js 一处',
   (read('lib/service/config.js').match(/writeFileSync\(/g) ?? []).length === 1)
 
 const registers = [...clientSource.matchAll(/slots\.register\(\{\s*name:\s*'([^']+)'/g)].map((m) => m[1])
-check('恰好 6 个字面 slots.register（预检按字面读取）', registers.length === 6, registers.join(','))
+check('恰好 7 个字面 slots.register（预检按字面读取）', registers.length === 7, registers.join(','))
 check(
-  '注册座位 = 工具行×2 + 输入卡浮层×2（旁路提问 + 完成通知）+ composer dock + 设置页',
+  '注册座位 = 工具行×3 + 输入卡浮层×2（旁路提问 + 完成通知）+ composer dock + 设置页',
   registers.includes('conversation.input.left')
     && registers.includes('conversation.input.overlay')
     && registers.includes('conversation.input.dock')
     && registers.includes('settings.section'),
   registers.join(','),
 )
-check('每个注册都带 id 与 order', (clientSource.match(/slots\.register\(\{[^}]*id: ID[^}]*order:/g) ?? []).length === 6)
+check('每个注册都带 id 与 order', (clientSource.match(/slots\.register\(\{[^}]*id: ID[^}]*order:/g) ?? []).length === 7)
 check('侧问座位用 session 作用域（浮层在输入卡内，拿得到 useChat）', clientSource.includes("const OVERLAY_SLOT = 'conversation.input.overlay'"))
 // A list slot rejects a second entry under an id it already holds, and that
 // rejection fails activation — so the two composer-row entries must not share one.
@@ -536,10 +536,12 @@ function makeTitleHarness(options = {}) {
   h.say('第五条')
   h.say('第六条')
   await h.installer.whenIdle()
-  // The first revision itself occupies a seq, so the three newest user messages
-  // after it are 4, 5 and 6 — not 3, 4 and 5.
+  // The first revision itself occupies a seq, and so does the outcome line
+  // (`session/title-refresh`) this plugin writes right after it, so the three
+  // newest user messages after the second boundary are 5, 6 and 7 — not 4, 5
+  // and 6, and never 3, 4 and 5.
   check('第二个边界读的是最近 3 条，而不是前 3 条',
-    JSON.stringify(h.autoTitles()[1].data.messageSeqs) === '[4,5,6]', JSON.stringify(h.autoTitles()[1].data.messageSeqs))
+    JSON.stringify(h.autoTitles()[1].data.messageSeqs) === '[5,6,7]', JSON.stringify(h.autoTitles()[1].data.messageSeqs))
 }
 
 {
@@ -623,6 +625,70 @@ function makeTitleHarness(options = {}) {
   h.say('一')
   await h.installer.whenIdle()
   check('卸载后不再响应会话事件', h.calls.length === 0 && h.autoTitles().length === 0)
+}
+
+{
+  // The manual path is the cadence implementation with a different trigger: it
+  // must not wait for a boundary, must return the outcome to the caller, and
+  // must write that outcome into the session log (`session/title-refresh`).
+  const h = makeTitleHarness({ settings: { titleRerollTurns: 100, titleMaxChars: 12 } })
+  h.say('第一条')
+  h.say('第二条')
+  await h.installer.whenIdle()
+  const outcome = await h.installer.refreshNow(h.session.id)
+  await h.installer.whenIdle()
+  check('refreshNow 不理会轮数立刻重总结并返回新标题',
+    outcome.ok === true && outcome.title === '模型给的标题' && h.calls.length === 1, JSON.stringify(outcome))
+  const refreshEvents = h.session.snapshotEvents().filter((event) => event.type === 'session/title-refresh')
+  check('refreshNow 把成功结果写进会话日志（session/title-refresh）',
+    refreshEvents.length === 1 && refreshEvents[0].data.ok === true
+      && refreshEvents[0].data.trigger === 'manual' && refreshEvents[0].data.title === '模型给的标题',
+    JSON.stringify(refreshEvents))
+  const missing = await h.installer.refreshNow('不存在的会话 id')
+  check('refreshNow 找不到会话时报 no-session', missing.ok === false && missing.code === 'no-session', JSON.stringify(missing))
+  check('会话不存在时不会发起模型调用', h.calls.length === 1)
+}
+
+{
+  const h = makeTitleHarness({ settings: { titleRerollTurns: 1 } })
+  h.say('一')
+  await h.installer.whenIdle()
+  h.session.append('session/title', { title: '手写的', messageSeqs: [], source: { kind: 'user' } })
+  const pinned = await h.installer.refreshNow(h.session.id)
+  await h.installer.whenIdle()
+  check('refreshNow 也尊重手动命名（不覆盖 user 标题）', pinned.ok === false && pinned.code === 'pinned', JSON.stringify(pinned))
+}
+
+{
+  // A restart must not restart the cadence: a long session (many historical
+  // messages, title still the harness's) is re-titled once shortly after mount,
+  // counting from the historical log length instead of waiting for a boundary
+  // the resumed session may never reach.
+  const seed = [userEvent(0, '历史 1'), userEvent(1, '历史 2'), userEvent(2, '历史 3')]
+  const h = makeTitleHarness({ settings: { titleRerollTurns: 3, titleMaxChars: 12 }, events: seed })
+  await h.installer.whenIdle()
+  check('按历史会话长度：重启后长会话在启动时补一次重总结',
+    h.calls.length === 1 && h.autoTitles().length === 1 && h.autoTitles()[0].data.title === '模型给的标题',
+    `${h.calls.length} call(s)`)
+  const bootEvents = h.session.snapshotEvents().filter((event) => event.type === 'session/title-refresh')
+  check('补重总结记录 trigger=boot 的留痕', bootEvents.length === 1 && bootEvents[0].data.trigger === 'boot', JSON.stringify(bootEvents))
+}
+
+{
+  // A session this plugin already titled is not re-summarized again on boot:
+  // the cadence owns it from here, and a boot catch-up would only repeat work.
+  // The title event must already be in the log *at mount* — that is the moment
+  // the boot catch-up reads it — so it is part of the seed, not appended after.
+  const h = makeTitleHarness({
+    settings: { titleRerollTurns: 2 },
+    events: [
+      userEvent(0, '历史 1'),
+      userEvent(1, '历史 2'),
+      { type: 'session/title', seq: 2, data: { title: '插件标题', messageSeqs: [0], source: { kind: 'provider', provider: title.TITLE_PROVIDER_ID, model: { provider: 'x', model: 'y' } } } },
+    ],
+  })
+  await h.installer.whenIdle()
+  check('启动补写不会重复总结已经由插件定题的会话', h.calls.length === 0, String(h.calls.length))
 }
 
 /* ───────────────────────── 3. host routes ───────────────────────── */
