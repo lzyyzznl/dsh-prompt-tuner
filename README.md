@@ -148,10 +148,12 @@ defineConverter({ id, label, match, toUpstream, fromUpstream, fromUpstreamChunk,
 请求头仍然是一个字符串值的扁平 JSON 对象，直接合并进上游请求。
 
 **每个模型可以单独覆盖上下文窗口**：`GET /v1/models` 给三个语境名各报一个 `context_window`（取各自候选里最小的那个），取值顺序是
-**管理页填的窗口 → 上游 `GET /models` 自己声明的窗口 → 100 万 token 默认**。ZTE 那两个网关的 `/models` 是 404 不报窗口，
-所以不填的话它们和直连官方的小窗口模型都按 1M 报——想要真实数字，就在供应商区块的「上下文窗口」里给对应模型填一个：窗口留空 =
-用上游发现的值（都没有才落到 1M 默认），把整行删掉再保存 = 清掉覆盖回到默认/发现。窗口存在配置（`providers.<id>.contextWindows`）里，
-页面保存时校验 1–100,000,000 的整数。
+**顺序表那一列填的窗口 → 上游 `GET /models` 自己声明的窗口 → 100 万 token 默认**。填的地方就在**「路由」页签顺序表的每一行上**——
+一行本来就是一个模型（供应商 + 模型 + 备注 + 图片），多出来的「上下文窗口」列直接跟它并排，不用再把模型 id 抄一遍。留空 = 用上游发现的值
+（都没有才落到 1M 默认），清空这一格再保存 = 清掉覆盖。ZTE 那两个网关的 `/models` 是 404 不报窗口，所以不填的话它们和直连官方的小窗口模型
+都按 1M 报。窗口存在配置（`providers.<id>.contextWindows`，**一个模型一个数**）里，页面校验 1–100,000,000 的整数；同一个模型在两张表里各有一格，
+那两格是**同一个数的两个视图**（改一处另一处立刻跟着变，包括清空），所以不会出现"填了一格却被另一格拦下"的情况。
+只有真的动了窗口的那次保存才会连带提交供应商文档（否则只发路由），且密钥按空值回显、不会被顺手轮换。
 
 ### 熔断：颗粒度在 key，不在供应商
 
@@ -264,8 +266,8 @@ defineConverter({ id, label, match, toUpstream, fromUpstream, fromUpstreamChunk,
 ### 自检
 
 ```sh
-npm run check:service   # 458 项：桩上游 + 真服务 + 真 socket，离线、零 token
-npm run check:ui        # 115 项：管理页（假 DOM 跑真脚本），离线、零 token
+npm run check:service   # 459 项：桩上游 + 真服务 + 真 socket，离线、零 token
+npm run check:ui        # 125 项：管理页（假 DOM 跑真脚本），离线、零 token
 npm run check:live      # 28 项：对真实网关的端到端实测，需网络与密钥，非离线自检
 ```
 

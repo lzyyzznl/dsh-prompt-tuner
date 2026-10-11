@@ -1243,6 +1243,35 @@ check('contextWindows 整体不是对象时被拒绝',
   cwBadShape.json?.ok === false && /contextWindows/.test(cwBadShape.json?.error?.message ?? ''),
   cwBadShape.json?.error?.message)
 
+// The routing tab writes a window from the row that names the model, so its save
+// carries providers and router in one patch: the provider document there is a
+// full replacement (with blank secrets meaning "keep the stored one"), which has
+// to leave the router half of the same request intact.
+const cwDocAt = providersDoc()
+const cwCombined = await post(`${base}/admin/api/config`, {
+  providers: {
+    ...cwDocAt,
+    'p-models': {
+      ...PROVIDER_SPEC['p-models'],
+      keys: [{ id: 'k1', label: '', key: '' }, { id: 'k2', label: '', key: '' }],
+      contextWindows: { 'm-manual': 131_072 },
+    },
+  },
+  router: { retries: 5 },
+}, adminHeaders)
+const cwCombinedState = cwCombined.json?.value
+check('providers 与 router 同一次 patch：窗口写进去、重试次数也照改、密钥按留空保留',
+  cwCombined.json?.ok === true
+  && providerState('p-models').contextWindows?.['m-manual'] === 131_072
+  && providerState('p-models').keys?.every((entry) => entry.set === true) === true
+  && cwCombinedState?.router?.retries === 5,
+  JSON.stringify({
+    cw: providerState('p-models').contextWindows,
+    keys: providerState('p-models').keys,
+    retries: cwCombinedState?.router?.retries,
+  }))
+await saveProvider('p-models', { contextWindows: {}, timeoutMs: 120_000 })
+
 /* ───────────────────────── 11. order-table reconciliation ───────────────────────── */
 
 section('11. 路由表对账：provider 与模型都对得上')

@@ -825,8 +825,8 @@ check(`页面引用的 ${referenced.length} 个键在中英词典里都有定义
 check('新增的字段/枚举/原因键都在词典里',
   ['failureRateThreshold', 'minSamples', 'windowSize', 'halfOpenSuccesses', 'thUnit', 'thRate',
     'thBlacklist', 'kindBlacklist', 'kindIgnored', 'kindUnconfigured', 'reasonInsufficientBalance',
-    'classRetryable', 'removedOrderRows', 'contextWindowsTitle', 'contextWindowsHint', 'cwModel',
-    'cwTokens', 'addContextWindow', 'deleteContextWindow', 'invalidContextWindow', 'cwLimitReached']
+    'classRetryable', 'removedOrderRows', 'thContextWindow', 'cwTitle', 'cwPlaceholder',
+    'invalidContextWindow', 'cwConflict']
     .every((key) => zhKeys.includes(key) && enKeys.includes(key)))
 
 /* ───────────────────────── 3. buttons and handlers ───────────────────────── */
@@ -1461,104 +1461,163 @@ check('路由页签顶部也有同一句实时选路行',
   && routingLive.textContent.includes('alpha → beta → ghost'),
   routingLive ? routingLive.textContent : 'missing')
 
-/* ──────────────────────── 13. context windows ──────────────────────── */
+/* ──────────────── 13. context windows: a column on the model's row ──────────────── */
 
-section('13. 上下文窗口：每行一个模型 + 窗口，留空即回落默认/上游发现')
+section('13. 上下文窗口：顺序表每行一列，留空即回落默认/上游发现')
 
 const cwPage = bootPage()
 await cwPage.settle()
-const cwGroupOf = (id) => cwPage.all('[data-role="provider"]').find((node) => node.getAttribute('data-id') === id)
-const alphaCW = cwGroupOf('alpha')
-const betaCW = cwGroupOf('beta')
-const cwRowsOf = (group) => group.querySelectorAll('[data-role="cw-row"]')
-check('服务端回传的窗口渲染成预填行（alpha-small → 128000）',
-  cwRowsOf(alphaCW).length === 1
-  && cwRowsOf(alphaCW)[0].querySelector('input[data-field="cw-model"]').value === 'alpha-small'
-  && cwRowsOf(alphaCW)[0].querySelector('input[data-field="cw-window"]').value === '128000',
-  JSON.stringify([...cwRowsOf(alphaCW)].map((row) => ({
-    model: row.querySelector('input[data-field="cw-model"]').value,
-    window: row.querySelector('input[data-field="cw-window"]').value
-  }))))
-check('没有窗口的供应商也渲染一个空行（用户知道在哪填）',
-  cwRowsOf(betaCW).length === 1
-  && cwRowsOf(betaCW)[0].querySelector('input[data-field="cw-model"]').value === ''
-  && cwRowsOf(betaCW)[0].querySelector('input[data-field="cw-window"]').value === '')
-check('每个供应商区块都有新增窗口按钮，每行有删除按钮，计数徽标等于可见行数',
-  alphaCW.querySelector('button[data-act="add-cw"]') !== null
-  && betaCW.querySelector('button[data-act="add-cw"]') !== null
-  && cwRowsOf(alphaCW)[0].querySelector('button[data-act="remove-cw"]') !== null
-  && alphaCW.querySelector('[data-role="cw-count"]').textContent === '1'
-  && betaCW.querySelector('[data-role="cw-count"]').textContent === '1')
+const peakOf = (page) => page.document.querySelector('tbody[data-role="route-body"][data-kind="peak"]')
+const offPeakOf = (page) => page.document.querySelector('tbody[data-role="route-body"][data-kind="off-peak"]')
+const cwCell = (tr) => tr.querySelector('input[data-field="cw"]')
+const cwAt = (body, index) => cwCell(body.querySelectorAll('tr')[index]).value
 
-const cwSave = bootPage()
-await cwSave.settle()
-cwSave.click(cwSave.all('button[data-act="save-providers"]')[0])
-await cwSave.settle()
-const bodyCW = cwSave.lastBody('config')
-const rowErrorsCW = cwSave.all('[data-role="row-error"]').map((node) => node.textContent).filter((text) => text !== '')
-check('保存把已存窗口原样提交，没有窗口的供应商提交空 map（可清空旧值）',
-  bodyCW !== null && rowErrorsCW.length === 0
-  && bodyCW.providers.alpha.contextWindows['alpha-small'] === 128000
-  && JSON.stringify(bodyCW.providers.beta.contextWindows) === '{}',
-  `rowErrors=${rowErrorsCW.join('|')} alpha=${JSON.stringify(bodyCW?.providers?.alpha?.contextWindows)} beta=${JSON.stringify(bodyCW?.providers?.beta?.contextWindows)}`)
+check('表头多了一列「上下文窗口」，每个模型行一个窗口输入框',
+  cwPage.document.querySelector('#sec-routing th.cw') !== null
+  && cwPage.document.querySelector('#sec-routing th.cw').textContent === strings.zh.thContextWindow
+  && cwCell(peakOf(cwPage).querySelectorAll('tr')[0]) !== null)
+check('已存的窗口回填到模型行，同一个模型在两张表里显示同一个数',
+  cwAt(peakOf(cwPage), 0) === '128000' && cwAt(offPeakOf(cwPage), 0) === '128000',
+  `${cwAt(peakOf(cwPage), 0)} / ${cwAt(offPeakOf(cwPage), 0)}`)
+check('没有覆盖的模型行留空，并注明留空是什么意思',
+  cwAt(peakOf(cwPage), 1) === ''
+  && cwCell(peakOf(cwPage).querySelectorAll('tr')[1]).getAttribute('title') === strings.zh.cwTitle
+  && cwCell(peakOf(cwPage).querySelectorAll('tr')[1]).getAttribute('placeholder') === strings.zh.cwPlaceholder)
+check('供应商页签里那块独立的窗口编辑器已经整块删掉',
+  cwPage.all('[data-role="cw-row"]').length === 0
+  && cwPage.all('button[data-act="add-cw"]').length === 0
+  && cwPage.all('[data-role="cw-count"]').length === 0
+  && cwPage.all('[data-role="provider"] input[data-field="cw-window"]').length === 0)
 
+// A save that did not touch a window stays a router-only patch: the provider
+// document is a full replacement that also re-runs order reconciliation, so a
+// plain reorder must not rewrite it.
+const cwSame = bootPage()
+await cwSame.settle()
+cwSame.click(cwSame.all('button[data-act="save-routing"]')[0])
+await cwSame.settle()
+const sameBody = cwSame.lastBody('config')
+check('没改窗口的保存仍然只提交 router，不重写整个供应商文档',
+  sameBody !== null && sameBody.router !== undefined && sameBody.providers === undefined,
+  JSON.stringify(Object.keys(sameBody ?? {})))
+
+// Editing one row's window persists one number per provider/model, and the rest
+// of the provider document has to survive the trip: ids stay, secrets go back
+// blank (which the service reads as "keep the stored credential").
 const cwEdit = bootPage()
 await cwEdit.settle()
-const cwAlpha = cwEdit.all('[data-role="provider"]').find((node) => node.getAttribute('data-id') === 'alpha')
-const cwBeta = cwEdit.all('[data-role="provider"]').find((node) => node.getAttribute('data-id') === 'beta')
-cwEdit.type(cwAlpha.querySelector('[data-role="cw-row"] [data-field="cw-window"]'), '262144')
-cwEdit.click(cwAlpha.querySelector('button[data-act="add-cw"]'))
-const cwNewRows = cwAlpha.querySelectorAll('[data-role="cw-row"]')
-cwEdit.type(cwNewRows[1].querySelector('input[data-field="cw-model"]'), 'alpha-large')
-// 第二行窗口留空：该模型的覆盖被丢弃（回落上游发现 / 1M 默认）
-cwEdit.type(cwBeta.querySelector('[data-role="cw-row"] [data-field="cw-model"]'), 'beta-1')
-cwEdit.type(cwBeta.querySelector('[data-role="cw-row"] [data-field="cw-window"]'), '65536')
-cwEdit.click(cwEdit.all('button[data-act="save-providers"]')[0])
+const editRows = peakOf(cwEdit).querySelectorAll('tr')
+cwEdit.type(cwCell(editRows[1]), '65536')
+cwEdit.click(cwEdit.all('button[data-act="save-routing"]')[0])
 await cwEdit.settle()
-const bodyEdit = cwEdit.lastBody('config')
-check('编辑后提交的窗口映射包含改动的值与新行，空窗口行不产生条目',
-  bodyEdit !== null
-  && bodyEdit.providers.alpha.contextWindows['alpha-small'] === 262144
-  && bodyEdit.providers.alpha.contextWindows['alpha-large'] === undefined
-  && bodyEdit.providers.beta.contextWindows['beta-1'] === 65536,
-  JSON.stringify({ alpha: bodyEdit?.providers?.alpha?.contextWindows, beta: bodyEdit?.providers?.beta?.contextWindows }))
-check('新增窗口行后计数徽标跟着变', cwAlpha.querySelector('[data-role="cw-count"]').textContent === '2')
+const editBody = cwEdit.lastBody('config')
+check('改了窗口的那一行按 provider/model 落进 contextWindows，其它行的值原样保留',
+  editBody !== null && editBody.providers !== undefined
+  && editBody.providers.beta.contextWindows['beta-1'] === 65536
+  && editBody.providers.alpha.contextWindows['alpha-small'] === 128000,
+  JSON.stringify(editBody?.providers && { alpha: editBody.providers.alpha.contextWindows, beta: editBody.providers.beta.contextWindows }))
+check('同一对 provider/model 在另一张表那一行留空，不构成第二个值',
+  editBody !== null && Object.keys(editBody.providers.beta.contextWindows).length === 1,
+  JSON.stringify(editBody?.providers?.beta?.contextWindows))
+check('顺带回显的供应商字段没有丢东西：key id 保留、密钥留空、models 原样',
+  editBody !== null
+  && editBody.providers.alpha.keys.map((entry) => entry.id).join(',') === 'k1,k2'
+  && editBody.providers.alpha.keys.every((entry) => entry.key === '')
+  && editBody.providers.alpha.models.join(',') === 'alpha-small'
+  && editBody.providers.alpha.baseURL === 'https://alpha.example/v1',
+  JSON.stringify(editBody?.providers?.alpha && { keys: editBody.providers.alpha.keys, models: editBody.providers.alpha.models }))
 
-const cwRemove = bootPage()
-await cwRemove.settle()
-const cwRemoval = cwRemove.all('[data-role="provider"]').find((node) => node.getAttribute('data-id') === 'alpha')
-cwRemove.click(cwRemoval.querySelector('[data-role="cw-row"] button[data-act="remove-cw"]'))
-cwRemove.click(cwRemove.all('button[data-act="save-providers"]')[0])
-await cwRemove.settle()
-const bodyRemoved = cwRemove.lastBody('config')
-check('删除唯一的窗口行后提交空 map（覆盖被彻底清掉，回到默认/发现）',
-  bodyRemoved !== null
-  && JSON.stringify(bodyRemoved.providers.alpha.contextWindows) === '{}'
-  && cwRemoval.querySelector('[data-role="cw-count"]').textContent === '0',
-  JSON.stringify(bodyRemoved?.providers?.alpha?.contextWindows))
+// One number per model: typing in one table's cell moves the twin in the other
+// table, so filling in the cell in front of you cannot be refused for
+// disagreeing with a cell you never touched.
+const cwMirror = bootPage()
+await cwMirror.settle()
+const mirrorPeakRows = peakOf(cwMirror).querySelectorAll('tr')
+const mirrorOffRows = offPeakOf(cwMirror).querySelectorAll('tr')
+check('两张表里同一个模型的两格初始就是同一个数（alpha-small → 128000）',
+  cwCell(mirrorPeakRows[0]).value === '128000' && cwCell(mirrorOffRows[0]).value === '128000',
+  `${cwCell(mirrorPeakRows[0]).value} / ${cwCell(mirrorOffRows[0]).value}`)
+cwMirror.type(cwCell(mirrorPeakRows[0]), '262144')
+check('在高峰表改一格，低谷表的同一对立刻跟着改',
+  cwCell(mirrorOffRows[0]).value === '262144', cwCell(mirrorOffRows[0]).value)
+cwMirror.click(cwMirror.all('button[data-act="save-routing"]')[0])
+await cwMirror.settle()
+const mirrorBody = cwMirror.lastBody('config')
+check('镜像之后保存不再自相矛盾：一个模型一个数，也没有行内报错',
+  mirrorBody !== null && mirrorBody.providers !== undefined
+  && Object.keys(mirrorBody.providers.alpha.contextWindows).length === 1
+  && mirrorBody.providers.alpha.contextWindows['alpha-small'] === 262144
+  && cwMirror.all('[data-role="row-error"]').every((node) => node.textContent === ''),
+  JSON.stringify(mirrorBody?.providers?.alpha?.contextWindows))
+
+// Clearing mirrors too: blank in one table means blank in the other, because the
+// two cells are the same "this model has no override".
+const cwClear = bootPage()
+await cwClear.settle()
+cwClear.type(cwCell(peakOf(cwClear).querySelectorAll('tr')[0]), '')
+check('清空一格，另一张表的同一对也清空',
+  cwCell(offPeakOf(cwClear).querySelectorAll('tr')[0]).value === '')
+cwClear.click(cwClear.all('button[data-act="save-routing"]')[0])
+await cwClear.settle()
+const clearBody = cwClear.lastBody('config')
+check('清掉之后提交空 map（而不是 0 或 1M）',
+  clearBody !== null && clearBody.providers !== undefined
+  && JSON.stringify(clearBody.providers.alpha.contextWindows) === '{}',
+  JSON.stringify(clearBody?.providers?.alpha?.contextWindows))
+
+// The disagreement check is a safety net under the mirroring: the page cannot
+// reach it through its own inputs, so it is poked in directly here. A genuine
+// contradiction is refused rather than silently resolved one way.
+const cwClash = bootPage()
+await cwClash.settle()
+const clashPeakRows = peakOf(cwClash).querySelectorAll('tr')
+const clashOffRows = offPeakOf(cwClash).querySelectorAll('tr')
+cwCell(clashPeakRows[0]).value = '262144'
+cwCell(clashOffRows[0]).value = '65536'
+const beforeClash = cwClash.posts().length
+cwClash.click(cwClash.all('button[data-act="save-routing"]')[0])
+await cwClash.settle()
+check('万一两格真的不一致：两行都点名，且不发保存请求',
+  cwClash.posts().length === beforeClash
+  && clashPeakRows[0].querySelector('[data-role="row-error"]').textContent.includes(strings.zh.cwConflict)
+  && clashOffRows[0].querySelector('[data-role="row-error"]').textContent.includes(strings.zh.cwConflict),
+  clashPeakRows[0].querySelector('[data-role="row-error"]').textContent)
 
 const cwBad = bootPage()
 await cwBad.settle()
-const cwBadAlpha = cwBad.all('[data-role="provider"]').find((node) => node.getAttribute('data-id') === 'alpha')
-cwBad.type(cwBadAlpha.querySelector('[data-role="cw-row"] [data-field="cw-window"]'), '0')
-const beforeBadCW = cwBad.posts().length
-cwBad.click(cwBad.all('button[data-act="save-providers"]')[0])
+const badRows = peakOf(cwBad).querySelectorAll('tr')
+cwBad.type(cwCell(badRows[1]), '0')
+const beforeBadWindow = cwBad.posts().length
+cwBad.click(cwBad.all('button[data-act="save-routing"]')[0])
 await cwBad.settle()
-check('越界的窗口值被拦下：显示行内错误且不发保存请求',
-  cwBad.posts().length === beforeBadCW
-  && cwBadAlpha.querySelector('[data-role="row-error"]').textContent.includes(strings.zh.invalidContextWindow),
-  cwBadAlpha.querySelector('[data-role="row-error"]').textContent)
+check('越界的窗口值被拦在行内：报错且一个请求都不发',
+  cwBad.posts().length === beforeBadWindow
+  && badRows[1].querySelector('[data-role="row-error"]').textContent.includes(strings.zh.invalidContextWindow),
+  badRows[1].querySelector('[data-role="row-error"]').textContent)
 
-const cwNoModel = bootPage()
-await cwNoModel.settle()
-const cwBadBeta = cwNoModel.all('[data-role="provider"]').find((node) => node.getAttribute('data-id') === 'beta')
-cwNoModel.type(cwBadBeta.querySelector('[data-role="cw-row"] [data-field="cw-window"]'), '64000')
-const beforeBadBeta = cwNoModel.posts().length
-cwNoModel.click(cwNoModel.all('button[data-act="save-providers"]')[0])
-await cwNoModel.settle()
-check('有窗口没模型的空行同样被拦下',
-  cwNoModel.posts().length === beforeBadBeta
-  && cwBadBeta.querySelector('[data-role="row-error"]').textContent.includes(strings.zh.invalidContextWindow),
-  cwBadBeta.querySelector('[data-role="row-error"]').textContent)
+// The cell is a view of the pair the row names: re-pointing the row shows that
+// pair's stored window instead of carrying the old number onto another model.
+const cwSync = bootPage()
+await cwSync.settle()
+const syncRows = peakOf(cwSync).querySelectorAll('tr')
+check('beta/beta-1 那一行的窗口为空（beta 没有覆盖）', cwCell(syncRows[1]).value === '')
+cwSync.select(syncRows[1].querySelector('select[data-field="provider"]'), 'alpha')
+const syncModel = syncRows[1].querySelector('input[data-field="model"]')
+check('只换 provider 时窗口跟着这一对变成空（alpha/beta-1 没有覆盖）', cwCell(syncRows[1]).value === '')
+syncModel.value = 'alpha-small'
+cwSync.fire(syncModel, 'change')
+check('模型也指向 alpha-small 后，窗口立刻显示已存的 128000',
+  cwCell(syncRows[1]).value === '128000', cwCell(syncRows[1]).value)
+
+const cwProviders = bootPage()
+await cwProviders.settle()
+cwProviders.click(cwProviders.all('button[data-act="save-providers"]')[0])
+await cwProviders.settle()
+const providersBody = cwProviders.lastBody('config')
+check('供应商页签的保存不再提交 contextWindows（缺席即保留，窗口不会被它抹掉）',
+  providersBody !== null
+  && providersBody.providers.alpha.contextWindows === undefined
+  && providersBody.providers.beta.contextWindows === undefined,
+  JSON.stringify(providersBody?.providers?.alpha && Object.keys(providersBody.providers.alpha)))
 
 finish()
