@@ -3858,7 +3858,7 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
   /* ── the split's acceptance criterion: no omission, no duplication ── */
   // Keyed off the `dspo-set-label` nodes on purpose: the 说明 blocks re-print
   // some of these names, so raw text would double-count them.
-  const ROW_KEYS = ['recentMessagesLabel', 'promptLabel', 'outputLangLabel', 'rewriteModelLabel', 'rewriteEffortLabel', 'btwModelLabel', 'btwEffortLabel', 'btwContextLabel', 'btwSaveHistoryLabel', 'titleModelLabel', 'titleEffortLabel', 'titleRerollLabel', 'titleMaxCharsLabel', 'notifyToggle', 'notifyPlatformLabel', 'notifyModelLabel', 'notifyEffortLabel', 'notifyCharsLabel', 'routerServiceLabel', 'routerOrderLabel', 'routerProvidersLabel', 'routerConvertersLabel', 'routerPolicyLabel', 'routerLiveStatsLabel', 'routerLiveLabel']
+  const ROW_KEYS = ['recentMessagesLabel', 'promptLabel', 'outputLangLabel', 'rewriteModelLabel', 'rewriteEffortLabel', 'btwModelLabel', 'btwEffortLabel', 'btwContextLabel', 'btwSaveHistoryLabel', 'titleModelLabel', 'titleEffortLabel', 'titleRerollLabel', 'titleMaxCharsLabel', 'notifyToggle', 'notifyPlatformLabel', 'notifyModelLabel', 'notifyEffortLabel', 'notifyCharsLabel', 'routerServiceLabel', 'routerOrderLabel', 'routerProvidersLabel', 'routerConvertersLabel', 'routerPolicyLabel', 'routerBusinessLabel', 'routerLiveStatsLabel', 'routerLiveLabel']
   const expectedRows = ROW_KEYS.map((key) => bundle.DICT.zh[key])
   const sets = TAB_IDS.map((id) => labelsByTab[id])
   const summary = TAB_IDS.map((id) => `${id}:[${labelsByTab[id].join('|')}]`).join(' ')
@@ -3868,7 +3868,7 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
       && sets.every((labels, index) => sets.slice(index + 1).every((other) => labels.every((label) => !other.includes(label)))),
     summary)
   const union = [...new Set(sets.flat())].sort()
-  check('六个页签的行标签并集恰好是词典里的这 31 行（无遗漏、无重复）',
+  check('六个页签的行标签并集恰好是词典里的这 32 行（无遗漏、无重复）',
     union.length === ROW_KEYS.length && JSON.stringify(union) === JSON.stringify([...expectedRows].sort()),
     `${union.length}: ${union.join('|')}`)
 

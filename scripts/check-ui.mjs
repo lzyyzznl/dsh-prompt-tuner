@@ -616,6 +616,7 @@ function fixtureState() {
       maxSwitches: 0,
       logLevel: 'info',
       budget: 4,
+      businessRule: true,
       timeSlots: [
         { start: '09:00', end: '12:00', priority: { alpha: 1, beta: 0 } },
         { start: '22:00', end: '02:00', priority: { ghost: 3 } }
@@ -654,7 +655,10 @@ function fixtureState() {
       at: '10:00',
       label: '09:00-12:00',
       rule: { start: '09:00', end: '12:00', priority: { alpha: 1, beta: 0 } },
-      effective: { alpha: 1, beta: 0, ghost: null }
+      source: 'slots',
+      status: null,
+      effective: { alpha: 1, beta: 0, ghost: null },
+      businessRule: true
     },
     limits: {
       orderRows: 12, maxRetries: 20, failureThreshold: 100, minFailureRate: 0, maxFailureRate: 1,
@@ -1189,5 +1193,100 @@ check('新供应商的模型出现在路由行 datalist（切到它即重建）'
     relink.select(row.querySelector('select[data-field="provider"]'), 'gamma')
     return row.querySelector('datalist').querySelectorAll('option').map((node) => node.value).join(',') === 'gamma-1'
   })())
+
+/* ───────────────────────── 11. business rule switch ───────────────────────── */
+
+section('11. 内置高峰规则开关：位置、状态、保存')
+
+/** Every element under `root`, in document order (the fake DOM has no compareDocumentPosition). */
+const walkElements = (root, out = []) => {
+  for (const child of root.childNodes ?? []) {
+    if (child.nodeType === 1) {
+      out.push(child)
+      walkElements(child, out)
+    }
+  }
+  return out
+}
+
+const biz = bootPage()
+await biz.settle()
+const bizSection = biz.document.querySelector('#sec-routing')
+const bizButton = bizSection.querySelector('button[data-act="toggle-business"]')
+const slotsBody = bizSection.querySelector('tbody[data-role="slots-body"]')
+check('路由页签渲染出内置高峰规则开关', bizButton !== null)
+check('开关的初始状态与 /state 的 businessRule 一致（fixture 里是 true）',
+  bizButton !== null && bizButton.getAttribute('data-on') === '1'
+  && bizButton.getAttribute('aria-pressed') === 'true'
+  && bizButton.textContent.includes(strings.zh.businessRuleOn),
+  bizButton ? `${bizButton.getAttribute('data-on')} / ${bizButton.textContent}` : 'missing')
+check('开关在时段表上方（文档顺序里先于 slots-body）',
+  bizButton !== null && slotsBody !== null
+  && (() => {
+    const flat = walkElements(bizSection)
+    return flat.indexOf(bizButton) < flat.indexOf(slotsBody)
+  })())
+
+const bizOffState = fixtureState()
+bizOffState.router.businessRule = false
+const bizOff = bootPage({ state: bizOffState })
+await bizOff.settle()
+const bizOffButton = bizOff.document.querySelector('#sec-routing button[data-act="toggle-business"]')
+check('businessRule=false 时开关显示未启用（不写成已启用）',
+  bizOffButton !== null && bizOffButton.getAttribute('data-on') === '0'
+  && bizOffButton.textContent.includes(strings.zh.businessRuleOff),
+  bizOffButton ? `${bizOffButton.getAttribute('data-on')} / ${bizOffButton.textContent}` : 'missing')
+check('businessRule 缺失（老服务）时按未启用渲染，不报错',
+  (() => {
+    const legacy = fixtureState()
+    delete legacy.router.businessRule
+    delete legacy.timeSlot.businessRule
+    const page = bootPage({ state: legacy })
+    const node = page.document.querySelector('#sec-routing button[data-act="toggle-business"]')
+    return node !== null && node.getAttribute('data-on') === '0'
+  })())
+
+biz.click(bizButton)
+await biz.settle()
+check('点击开关立刻改成本地待保存状态（未被轮询回滚）',
+  bizButton.getAttribute('data-on') === '0'
+  && bizButton.getAttribute('aria-pressed') === 'false'
+  && bizButton.textContent.includes(strings.zh.businessRuleOff),
+  `${bizButton.getAttribute('data-on')} / ${bizButton.textContent}`)
+
+biz.click(bizButton)
+await biz.settle()
+check('再点一次回到已启用',
+  bizButton.getAttribute('data-on') === '1' && bizButton.textContent.includes(strings.zh.businessRuleOn))
+
+biz.click(biz.all('button[data-act="save-routing"]')[0])
+await biz.settle()
+const bizBody = biz.lastBody('config')
+check('保存时 businessRule 随 router 一起提交（布尔 true）',
+  bizBody !== null && bizBody.router.businessRule === true,
+  JSON.stringify(bizBody && bizBody.router && bizBody.router.businessRule))
+check('保存时 timeSlots 照旧提交（开着高峰规则时它仍当档位表用）',
+  bizBody !== null && Array.isArray(bizBody.router.timeSlots) && bizBody.router.timeSlots.length === 2
+  && bizBody.router.timeSlots[0].priority.alpha === 1,
+  JSON.stringify(bizBody && bizBody.router && bizBody.router.timeSlots))
+
+// Toggling off must be savable as an explicit `false`: a patch without the key
+// means "keep the stored value" on the server side.
+biz.click(biz.document.querySelector('#sec-routing button[data-act="toggle-business"]'))
+await biz.settle()
+biz.click(biz.all('button[data-act="save-routing"]')[0])
+await biz.settle()
+const bizOffBody = biz.lastBody('config')
+check('关掉后提交的是显式 false（不是缺省「保持」）',
+  bizOffBody !== null && bizOffBody.router.businessRule === false,
+  JSON.stringify(bizOffBody && bizOffBody.router && bizOffBody.router.businessRule))
+
+const bizEn = bootPage()
+await bizEn.settle()
+bizEn.click(bizEn.document.getElementById('lang-toggle'))
+check('英文环境下开关也有文案（不是空按钮）',
+  bizEn.document.querySelector('#sec-routing button[data-act="toggle-business"]').textContent
+    .includes(strings.en.businessRuleOn),
+  bizEn.document.querySelector('#sec-routing button[data-act="toggle-business"]').textContent)
 
 finish()

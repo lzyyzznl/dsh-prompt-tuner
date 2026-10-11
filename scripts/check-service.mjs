@@ -1972,6 +1972,251 @@ check('清空时段后 /state 不再报命中，选路回到静态顺序',
   && service.admin.state().router.timeSlots.length === 0,
   JSON.stringify(service.admin.state().timeSlot))
 
+/* ───────────────────────── 25. 内置高峰规则 ───────────────────────── */
+
+section('25. 内置高峰规则：北京时间的工作日峰谷 + 覆盖 timeSlots')
+
+/** A Beijing instant as an epoch millisecond: `at('2026-10-14 10:00')`. */
+const bj = (text) => {
+  const [date, time] = String(text).trim().split(/\s+/)
+  const [y, m, d] = date.split('-').map(Number)
+  const [hh, mm] = time.split(':').map(Number)
+  return Date.UTC(y, m - 1, d, hh - 8, mm)
+}
+
+// -- 纯函数：周内峰谷 -----------------------------------------------------
+const wedMorning = TS.beijingPeakStatus(bj('2026-10-14 09:00'))
+check('beijingPeakStatus：周三 09:00 起算高峰（含起点）',
+  wedMorning.status === 'peak' && wedMorning.weekday === 3 && wedMorning.minutes === 540 && wedMorning.date === '2026-10-14',
+  JSON.stringify(wedMorning))
+check('beijingPeakStatus：周二至周五的 10:00 都是高峰',
+  ['2026-10-13 10:00', '2026-10-14 10:00', '2026-10-15 10:00', '2026-10-16 10:00']
+    .every((text) => TS.beijingPeakStatus(bj(text)).status === 'peak'))
+check('beijingPeakStatus：11:59 仍是高峰，12:00 起午休',
+  TS.beijingPeakStatus(bj('2026-10-14 11:59')).status === 'peak'
+  && TS.beijingPeakStatus(bj('2026-10-14 12:00')).status === 'off-peak')
+check('beijingPeakStatus：14:00 回到高峰，18:00 起下班',
+  TS.beijingPeakStatus(bj('2026-10-14 14:00')).status === 'peak'
+  && TS.beijingPeakStatus(bj('2026-10-14 17:59')).status === 'peak'
+  && TS.beijingPeakStatus(bj('2026-10-14 18:00')).status === 'off-peak')
+check('beijingPeakStatus：工作日 08:59 与 23:00 都是空闲',
+  TS.beijingPeakStatus(bj('2026-10-14 08:59')).status === 'off-peak'
+  && TS.beijingPeakStatus(bj('2026-10-14 23:00')).status === 'off-peak')
+check('beijingPeakStatus：周六周日整天都是空闲（10:00 也空闲）',
+  ['2026-10-17 10:00', '2026-10-18 14:00'].every((text) => {
+    const status = TS.beijingPeakStatus(bj(text))
+    return status.status === 'off-peak' && status.weekend === true
+  }))
+check('beijingPeakStatus：时钟按北京时间读，UTC 与本地都不是判据',
+  // 02:00Z 周三 = 北京 10:00（高峰）；00:30Z 周三 = 北京 08:30（空闲）；
+  // 06:00Z 周二 = 北京 14:00（高峰，跨了一天）。
+  TS.beijingPeakStatus(Date.UTC(2026, 9, 14, 2, 0)).status === 'peak'
+  && TS.beijingPeakStatus(Date.UTC(2026, 9, 14, 0, 30)).status === 'off-peak'
+  && TS.beijingPeakStatus(Date.UTC(2026, 9, 13, 6, 0)).status === 'peak',
+  JSON.stringify([
+    TS.beijingPeakStatus(Date.UTC(2026, 9, 14, 2, 0)),
+    TS.beijingPeakStatus(Date.UTC(2026, 9, 14, 0, 30)),
+    TS.beijingPeakStatus(Date.UTC(2026, 9, 13, 6, 0)),
+  ]))
+
+// -- 纯函数：法定节假日（周内也要变空闲） --------------------------------
+const holidayWeekday = ['2026-10-02 10:00', '2026-05-01 10:00', '2026-01-01 10:00', '2026-02-17 10:00']
+check('beijingPeakStatus：周内的法定节假日整天算空闲',
+  holidayWeekday.every((text) => {
+    const status = TS.beijingPeakStatus(bj(text))
+    return status.status === 'off-peak' && status.holiday === true && status.weekend === false
+  }),
+  JSON.stringify(holidayWeekday.map((text) => TS.beijingPeakStatus(bj(text)))))
+check('beijingPeakStatus：节日区间两端都算假日，区间结束后的工作日立刻恢复（国庆 10-01…10-08）',
+  ['2026-10-01 10:00', '2026-10-08 10:00'].every((text) => TS.beijingPeakStatus(bj(text)).holiday === true)
+  && TS.beijingPeakStatus(bj('2026-10-09 10:00')).holiday === false
+  && TS.beijingPeakStatus(bj('2026-10-09 10:00')).status === 'peak',
+  JSON.stringify(['2026-10-08 10:00', '2026-10-09 10:00'].map((text) => TS.beijingPeakStatus(bj(text)))))
+check('beijingPeakStatus：春节连休跨到下一周，2-15（周日）到 2-21（周六）都算假日',
+  ['2026-02-15 10:00', '2026-02-19 10:00', '2026-02-21 10:00']
+    .every((text) => TS.beijingPeakStatus(bj(text)).holiday === true)
+  && TS.beijingPeakStatus(bj('2026-02-24 10:00')).holiday === false,
+  JSON.stringify(['2026-02-15 10:00', '2026-02-21 10:00', '2026-02-24 10:00']
+    .map((text) => TS.beijingPeakStatus(bj(text)))))
+check('beijingPeakStatus：调休上班的周末没有被写成假日（按表判定，不外推）',
+  TS.beijingPeakStatus(bj('2026-10-10 10:00')).status === 'off-peak'
+  && TS.beijingPeakStatus(bj('2026-10-10 10:00')).weekend === true,
+  JSON.stringify(TS.beijingPeakStatus(bj('2026-10-10 10:00'))))
+check('isStatutoryHoliday：可换表，不写死',
+  TS.isStatutoryHoliday({ year: 2030, month: 1, day: 1 }) === false
+  && TS.isStatutoryHoliday({ year: 2030, month: 1, day: 1 }, ['2030-01-01']) === true)
+const badInstant = TS.beijingPeakStatus(Number.NaN)
+check('beijingPeakStatus：坏时刻不抛异常（读时兜底为空闲）',
+  badInstant.status === 'off-peak' && badInstant.date === '', JSON.stringify(badInstant))
+
+// -- 纯函数：档位表（timeSlots 只当表用，窗口被忽略） ---------------------
+const bizSlots = [
+  { start: '09:00', end: '12:00', priority: { a: 3, b: 0 } },
+  { start: '22:00', end: '02:00', priority: { a: 1, c: 5 } },
+]
+check('effectiveBusinessPriority：同一供应商取最低档位，与窗口无关',
+  JSON.stringify(TS.effectiveBusinessPriority(bizSlots)) === JSON.stringify({ a: 1, b: 0, c: 5 }),
+  JSON.stringify(TS.effectiveBusinessPriority(bizSlots)))
+check('effectiveBusinessPriority：空表/坏表退化为空映射',
+  Object.keys(TS.effectiveBusinessPriority([])).length === 0
+  && Object.keys(TS.effectiveBusinessPriority(null)).length === 0)
+
+// -- 覆盖优先级：businessRule 开 = 内置日历算窗口，关 = timeSlots ----------
+const bizCfg = C.normalizeConfig({
+  providers: { x: { baseURL: 'https://host/v1', apiKey: 'k', models: ['m'] } },
+  router: { order: [{ provider: 'x', model: 'm' }], businessRule: true },
+})
+check('normalizeConfig：businessRule 缺省为 false，写了 true 就保留',
+  C.normalizeConfig({}).router.businessRule === false && bizCfg.router.businessRule === true)
+const bizPatched = C.applyConfigPatch(bizCfg, { router: { businessRule: false } })
+check('applyConfigPatch：businessRule 可写回 false',
+  bizPatched.config.router.businessRule === false)
+check('applyConfigPatch：businessRule 非布尔被拒',
+  throws(() => C.applyConfigPatch(bizCfg, { router: { businessRule: 'yes' } }))
+  && throws(() => C.applyConfigPatch(bizCfg, { router: { businessRule: 1 } }))
+  && throws(() => C.applyConfigPatch(bizCfg, { router: { businessRule: null } })))
+check('applyConfigPatch：只发 timeSlots 不会顺手改写 businessRule（缺省=保持）',
+  C.applyConfigPatch(bizCfg, { router: { timeSlots: [] } }).config.router.businessRule === true)
+check('normalizeConfig：坏 businessRule 读时兜底为 false',
+  C.normalizeConfig({ router: { businessRule: 'yes' } }).router.businessRule === false)
+
+// -- HTTP：坏配置被拒 -----------------------------------------------------
+const badBiz = await post(`${base}/admin/api/config`, { router: { businessRule: 'on' } }, adminHeaders)
+check('HTTP：businessRule 非布尔被管理面拒绝（不改磁盘）',
+  badBiz.json?.ok === false && /boolean/.test(badBiz.json?.error?.message ?? ''),
+  JSON.stringify(badBiz.json))
+
+// -- 真服务：开关切换与 /state 上报 --------------------------------------
+const beforeBiz = service.admin.state().router.businessRule
+check('/state 上报 router.businessRule（默认 false）', beforeBiz === false, String(beforeBiz))
+
+await cleanSlate()
+await configure({ order: fullOrder(), router: { businessRule: false, timeSlots: [slotNow({ 'p-switch': 1 })] } })
+stub.keyStatus = { 'gw-good': 503 }
+stub.calls.length = 0
+await chat('deepseek-v4-flash')
+check('关（缺省）时仍走 timeSlots：被点名的供应商先被尝试',
+  stub.calls.map((call) => call.key).join(',') === 'gw-good,sw-a',
+  stub.calls.map((call) => call.key).join(','))
+const slotsSource = service.admin.state().timeSlot
+check('关时 /state 的生效来源是自定义时段表，标签就是窗口本身',
+  slotsSource?.source === 'slots' && slotsSource?.businessRule === false
+  && /^[0-9]{2}:[0-9]{2}-[0-9]{2}:[0-9]{2}$/.test(String(slotsSource?.label)),
+  JSON.stringify(slotsSource))
+
+await cleanSlate()
+await configure({ order: fullOrder(), router: { businessRule: true, timeSlots: [slotNow({ 'p-switch': 1 })] } })
+check('/state 打开开关后上报 businessRule=true',
+  service.admin.state().router.businessRule === true)
+stub.keyStatus = { 'gw-good': 503 }
+stub.calls.length = 0
+await chat('deepseek-v4-flash')
+
+// The service has one real clock, so the assertion is stated relative to what
+// that clock says about Beijing right now: the same input must produce the
+// peak behaviour during peak hours and the static order outside them. Both
+// branches are exact, so this is deterministic whenever it runs.
+const nowStatus = TS.beijingPeakStatus(Date.now())
+const bizState = service.admin.state().timeSlot
+const bizCalls = stub.calls.map((call) => call.key).join(',')
+check('开时 /state 的生效来源标成内置高峰规则，标签写明「高峰规则」',
+  bizState?.source === 'business' && bizState?.businessRule === true
+  && (nowStatus.status === 'peak' ? bizState.label === '高峰规则' : bizState.label === null),
+  `${JSON.stringify(bizState)} raw=${nowStatus.status}`)
+check('开时 /state 带出北京时间的峰谷判定结果（含周末/节假日标志）',
+  bizState?.status?.status === nowStatus.status && bizState?.status?.date === nowStatus.date
+  && bizState?.status?.weekend === nowStatus.weekend && bizState?.status?.holiday === nowStatus.holiday,
+  `${JSON.stringify(bizState?.status)} vs ${JSON.stringify(nowStatus)}`)
+if (nowStatus.status === 'peak') {
+  check('高峰时段：内置规则把被点名的供应商前移（窗口由日历算，不看 timeSlots 的 start/end）',
+    bizCalls === 'gw-good,sw-a', bizCalls)
+  check('高峰时段：命中的供应商未配档位时留在静态位置（p-switch 是 1，maas-coclaw 仍按静态序）',
+    bizState?.effective?.['p-switch'] === 1 && bizState?.effective?.['maas-coclaw'] === null,
+    JSON.stringify(bizState?.effective))
+} else {
+  check('空闲时段：内置规则不动静态顺序（周末/节假日全天、午休、夜间都空闲）',
+    bizCalls === 'gw-good,gw-broken', bizCalls)
+  check('空闲时段：没有生效规则，/state 的生效档位全为 null',
+    Object.values(bizState?.effective ?? { x: 1 }).every((value) => value === null),
+    JSON.stringify(bizState?.effective))
+}
+
+// -- 真服务：高峰时档位 0 停用 + 事件原因写明高峰规则 --------------------
+await cleanSlate()
+await configure({ order: fullOrder(), router: { businessRule: true, timeSlots: [slotNow({ 'maas-coclaw': 0, 'p-switch': 1 })] } })
+stub.keyStatus = { 'gw-good': 503 }
+stub.calls.length = 0
+await chat('deepseek-v4-flash')
+const bizAfterDisable = service.admin.state()
+if (nowStatus.status === 'peak') {
+  check('高峰时段：档位 0 的供应商本轮完全不发请求',
+    stub.calls.every((call) => call.key !== 'gw-broken'),
+    stub.calls.map((call) => call.key).join(','))
+  check('高峰时段：停用事件的原因写明「高峰规则」而不是笼统的时段窗口',
+    (bizAfterDisable.recent ?? []).some((event) => event.kind === 'timeslot'
+      && event.provider === 'maas-coclaw' && event.message === '高峰规则'),
+    JSON.stringify((bizAfterDisable.recent ?? []).filter((event) => event.kind === 'timeslot')))
+  check('高峰时段：/state 如实上报生效档位 0',
+    bizAfterDisable.timeSlot?.effective?.['maas-coclaw'] === 0,
+    JSON.stringify(bizAfterDisable.timeSlot))
+} else {
+  check('空闲时段：档位 0 不生效（空闲时不看档位表，静态顺序照走）',
+    stub.calls.map((call) => call.key).join(',') === 'gw-good,gw-broken'
+    && (bizAfterDisable.recent ?? []).every((event) => event.kind !== 'timeslot'),
+    `${stub.calls.map((call) => call.key).join(',')} / ${JSON.stringify((bizAfterDisable.recent ?? []).filter((event) => event.kind === 'timeslot'))}`)
+}
+
+// -- 真服务：关掉开关立刻退回 timeSlots ---------------------------------
+await cleanSlate()
+await configure({ order: fullOrder(), router: { businessRule: false, timeSlots: [slotNow({ 'p-switch': 1 })] } })
+stub.keyStatus = { 'gw-good': 503 }
+stub.calls.length = 0
+await chat('deepseek-v4-flash')
+check('关掉开关立刻退回 timeSlots（无需重启服务）',
+  stub.calls.map((call) => call.key).join(',') === 'gw-good,sw-a'
+  && service.admin.state().timeSlot?.source === 'slots',
+  `${stub.calls.map((call) => call.key).join(',')} / ${service.admin.state().timeSlot?.source}`)
+
+await cleanSlate()
+await configure({ order: fullOrder(), router: { businessRule: true, timeSlots: [] } })
+check('开着开关但没有档位表时退化为恒等变换（不误伤静态顺序）',
+  service.admin.state().timeSlot?.rule === null
+  && service.admin.state().timeSlot?.effective?.['maas-coclaw'] === null,
+  JSON.stringify(service.admin.state().timeSlot))
+
+await configure({ order: DEFAULT_ORDER, router: { businessRule: false, timeSlots: [], retries: 0, failureThreshold: 2 } })
+
+// -- 高峰分支的确定性覆盖（不依赖跑用例的时刻） -------------------------
+// The live assertions above follow whatever the wall clock happens to say, so
+// on a weekend only the off-peak branch runs. These pin the instant and drive
+// the very three functions `walk()` chains together (beijingPeakStatus →
+// effectiveBusinessPriority → partitionByRule with pin:1), which is exactly the
+// peak-time decision, so the peak branch is covered on any day.
+const peakRule = { rule: { start: '0500', end: '2300', priority: TS.effectiveBusinessPriority(bizSlots) } }
+const peakRows = [
+  { provider: 'a', model: 'm1' }, { provider: 'b', model: 'm2' },
+  { provider: 'c', model: 'm3' }, { provider: 'd', model: 'm4' },
+]
+const peakPartition = TS.partitionByRule(peakRows, peakRule, { pin: 1 })
+check('高峰规则（固定时刻）：命中的供应商整体前移，未点名者留在原地',
+  peakPartition.rows.map((row) => row.provider).join(',') === 'a,c,d',
+  peakPartition.rows.map((row) => row.provider).join(','))
+check('高峰规则（固定时刻）：档位 0 的供应商进入 disabled 列表（事件流据此上报）',
+  peakPartition.disabled.map((row) => row.provider).join(',') === 'b',
+  peakPartition.disabled.map((row) => row.provider).join(','))
+check('高峰规则（固定时刻）：pin=1 让调用方指定的首行保持在最前',
+  TS.partitionByRule(
+    [{ provider: 'd', model: 'm4' }, { provider: 'a', model: 'm1' }],
+    { rule: { start: '0500', end: '2300', priority: { a: 1 } } },
+    { pin: 1 },
+  ).rows.map((row) => row.provider).join(',') === 'd,a')
+check('高峰规则（固定时刻）：同一个时刻在日历上确实是高峰，午休时不是',
+  TS.beijingPeakStatus(bj('2026-10-14 10:00')).status === 'peak'
+  && TS.beijingPeakStatus(bj('2026-10-14 12:30')).status === 'off-peak')
+check('停用事件的原因文案就是「高峰规则」（不存在第二个峰值标签）',
+  read('lib/service/proxy.js').includes("label: '高峰规则'")
+  && !read('lib/service/proxy.js').includes("label: '高峰时段'"))
+
 /* ───────────────────────── 23. stop ───────────────────────── */
 
 section('23. 停得下来')

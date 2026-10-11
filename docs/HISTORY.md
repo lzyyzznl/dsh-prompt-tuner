@@ -850,6 +850,25 @@ models:
 **踩到的坑（都留了测试）**：浏览器的 `collectTimeSlots` 一开始把 `\d` 直接写进了服务端渲染的那个模板字符串里——模板字符串把它当转义序列吃掉，发到页面的正则成了 `/^([01]?d|2[0-3]):([0-5]d)$/`，于是**任何**时间都填不进去、保存一律被自己拦下。改成不含反斜杠的 `[0-9]` 字符类；这类「模板字符串吃掉转义」的写法在 `lib/service/ui.js` 里是个通用陷阱，值得记住。
 
 
+## 内置高峰规则（2026-10-11）
+
+**要解决的问题**：时段表把窗口交给操作员自己声明之后，「工作日白天高峰、夜间与周末空闲」这个**最常见**的峰谷，每个人仍要抄一遍 `09:00–12:00 / 14:00–18:00` 并自己维护一整年中国法定节假日。抄错一次就是一段时间的错误路由，而且没人会去核对。所以把它做成一条**可一键启用**的内置规则，而不是又一份文档模板。
+
+**开关放哪、为什么是布尔**：`router.businessRule`（布尔，默认 `false`）挂在 `router` 上、随 `normalizeRouter` 一起携带，与 `timeSlots` 同级——它是**一套选路方式的选择**，不是某个供应商的属性。读时兜底 `false`、写时校验布尔（`router.businessRule must be a boolean`），与其余配置一样「读修写拒」。
+
+**几个想清楚的点**：
+
+- **时钟固定为北京时间（UTC+8），不看进程时区**。要判「周一至周五 9 点」就必须先回答「谁的时间」，而「中国法定节假日」这个条件已经把答案限定在一种日历上；沿用 `timeSlots` 的本地时钟，一台 UTC 的服务器就会把高峰判到北京时间下午——这种错很难被发现。实现上给瞬间加 8 小时再用 `getUTC*` 取值，不依赖 `Intl` 或系统时区库。
+- **高峰/空闲是一个二分，不是「换一组档位」**。空闲时段（含周末与节假日全天、工作日午休、夜间）**完全不重排**，静态顺序照走：空闲的含义就是「按平时的来」，此时再叠一层档位只会让顺序表失去意义。
+- **覆盖 `timeSlots` 的是窗口，不是档位**。开关打开后 `timeSlots` 各条的 `start`/`end` 被忽略、只当**档位表**读：某供应商的高峰档位是它在所有条目里出现过的**最低档位**。这是 spec 里唯一自洽的读法——「覆盖、不合并」与「档位数字取 `timeSlots` 内最低档位」只有在「窗口归内置日历、档位归时段表」时才不矛盾。好处是打开开关不需要新表：把白天的档位写进现有时段表即可；关掉开关立刻回到原来的窗口语义，两边共用同一份数据。
+- **合成规则不经过 `parseClock`/`activeRuleAt`**。内置规则被表示成一条**合成规则对象**直接喂给 `partitionByRule`（后者只读 `priority`），所以它不需要合法的 `start`/`end`，也永远不会被「最具体者胜」或 `start === end` 的校验误伤。窗口判定与档位应用因此各自只有一处实现。
+- **`0` 仍是停用，事件原因写明「高峰规则」**。停用走既有的 `note({ kind: 'timeslot' })`，但 `message` 是 `高峰规则` 而不是某个窗口字符串——否则最近事件里根本看不出这条是内置规则干的还是操作员自己配的。`/state` 里 `label` 同样如此，另有 `source`（`business`/`slots`）与北京时间判定结果 `status` 供核对。
+- **节假日表是数据，不是算法**。内置 2025–2026 的常见区间（元旦 / 春节 / 清明 / 劳动节 / 端午 / 中秋 / 国庆），依据是国务院公布的放假安排；**不**做「第几个周一」这种推导，也不猜调休，表外年份按非节假日处理（只按周末判定）。跨年时按新公告更新表——这是这套规则唯一的长期维护成本，已写进 README 与模块注释。
+- **不改动其余任何行为**：熔断、重试、切换预算、探测、key 邻接、上游应答透传、`enabled: false` 的纯代理路径全部不动；开关关掉（或缺省）时与上一版同行为，这也是自检里「关掉立刻退回 `timeSlots`」那条用例的意义。
+
+**踩到的坑（都留了测试）**：`timeSlotView` 组装 `rule` 时把 `resolveActiveSlot` 已经包过一层的 `rule` 又取了一次 `.rule`（`active.rule.rule`），槽位路径一取值就 `TypeError`——纯函数单测全绿，只有真服务跑 `configure` 才炸出来；`/state` 这种「只在装配处出错」的路径值得用真服务覆盖。另外管理页这次加的是**按钮式开关**而不是 checkbox：checkbox 的 `checked` 会被浏览器默认动作和轮询重渲染各翻一次，而按钮把状态放在自己的 `data-on` 上，`collectRouting` 读它、`dirty.routing` 保护它，语义上没有第二种真相。**关掉时必须提交显式 `false`**（缺省等于「保持原值」，那样就永远关不掉），这条也单独留了用例。
+
+
 ## 设置页
 
 设置页按功能模块分成 **5 个页签**：**优化提示词 / 旁路提问 / 标题 / 通知 / 路由**。切换形态与 shell 自己的插件页一致（同一条下划线导轨、同一个 13px 标签与 2px 激活条、同一套焦点环），`←` `→` 与 `Home`/`End` 可在页签间走。切走的页签**保持挂载**，所以写在提示词框里的草稿不会因为切页签丢掉。
@@ -974,8 +993,9 @@ models:
 | `lib/service/converters/registry.js` | 转换器注册接口与「哪个转换器认领哪条路由」的匹配 |
 | `lib/service/converters/maas.js` | ZTE MaaS → `api.deepseek.com` 契约的字典：入参翻译、出参归一、错误重写、`/v1/models` 合成 |
 | `lib/service/ui.js` | 服务自带的管理页：供应商/密钥/顺序表/熔断参数可编辑，实时熔断表与最近事件可看 |
-| `scripts/check-service.mjs` | 服务自检：桩上游 + 真服务 + 真 socket，292 项，离线零 token |
-| `scripts/check-ui.mjs` | 管理页自检：假 DOM 跑真页面脚本，74 项，离线零 token |
+| `lib/service/time-slots.js` | 时段与内置高峰规则：`HH:mm` 解析/格式化、跨午夜窗口、最具体者胜、北京时间峰谷与节假日表（纯函数、零 import） |
+| `scripts/check-service.mjs` | 服务自检：桩上游 + 真服务 + 真 socket，416 项，离线零 token |
+| `scripts/check-ui.mjs` | 管理页自检：假 DOM 跑真页面脚本，85 项，离线零 token |
 | `scripts/check-live.mjs` | 真实网关端到端实测，28 项，需网络与凭据，**不**随 `npm run check` 跑 |
 | `lib/store.js` | 配置读写（原子写、容错读）+ 旁路历史存储（每会话分片、裁剪） |
 | `lib/http.js` | JSON 信封、有上限的 body 读取、回环信任围栏 |
@@ -988,8 +1008,8 @@ models:
 
 ```sh
 npm run check                 # 854 项，含宿主通知/标题/路由服务与设置页契约
-npm run check:service         # 379 项，路由服务本体（桩上游，离线）
-npm run check:ui              # 74 项，管理页脚本（假 DOM）
+npm run check:service         # 416 项，路由服务本体（桩上游，离线）
+npm run check:ui              # 85 项，管理页脚本（假 DOM）
 npm run check:shape           # 对**已安装**的 DSH 复核旁路提问的消息形状（需要本机有 DSH）
 npm run check:title           # 对**已安装**的 DSH 复核标题重总结（真会话、真投影，不调模型）
 node scripts/bench.mjs --runs 3
@@ -1002,6 +1022,8 @@ node scripts/bench.mjs --runs 3
 **改写自己的模型与强度**（宿主与浏览器两侧）：`/save` 接受 `provider` / `model`（字符串或 null）与 `reasoningEffort`（闭集），非法取值一律拒；`/state` 的 `active` 在固定后立刻改用它，`reasoning` 上报该路由自报的档位；`/optimize` 的第一跳带着固定的一对与配置的档位（`auto` 则完全不发该字段），清空后回落会话模型；浏览器半区按真实点击走一遍：默认停在「跟随当前会话」且模型下拉禁用、选供应商把 provider 与它的第一个模型一起固定、选回「跟随」把两半一起写回 null、改强度只发 `reasoningEffort` 一个键，以及通知页签的强度行只发 `notifyReasoningEffort`；词典键双向一致、页签行标签并集恰好 31 项。
 
 **时段优先级**（独立模块 + 真服务两层）：`lib/service/time-slots.js` 是零依赖纯函数半边——`parseClock`/`formatClock` 的合法与非法写法、`clockInside` 的普通区间与跨午夜（含起点不含终点）、`activeRuleAt` 的「窗口最短 → 先定义者」（含「同起点不同长度时整点不翻回宽规则」的回归守卫）、`applyTimeOrder` 的稳定二分与 `pin: 1`（首行不被时钟撬动）、`providerPriorityAt` 对未点名者返回 null、`validateTimeSlots` 拒坏 HH:mm / 起止相同 / 越界或非整数档位 / 空供应商表 / 非数组 / 超上限、`normalizeTimeSlots` 的读时修复（丢坏留好并封顶）；再接真服务验证接线：`normalizeConfig` 不被白名单丢掉、`applyConfigPatch` 写入合法规则而拒绝起止相同者，以及**端到端选路**——无时段时第一条失败后按静态顺序落到第二家、时段命中时被点名的供应商越过静态顺序而在匹配行之后先被尝试、档位 0 的供应商本轮一个请求都不发且 `/state` 的 `effective` 如实报 0 并在事件流里留下 `kind=timeslot`、`/state` 的 `label`/`at` 形状、以及清空时段后回到静态顺序。管理页那一侧由 `check:ui` 覆盖：时段表渲染出规则（含**已不存在的供应商仍渲染并标注未注册**）、`data-act` 与委托分支一一对应、以及「输入 70 提交 0.7」这类保存链路不再被时段校验误伤。
+
+**内置高峰规则**（纯函数判定 + 真服务接线 + 管理页开关三层）：`beijingPeakStatus` 覆盖工作日 `09:00`/`11:59`/`12:00`/`14:00`/`17:59`/`18:00` 的每个边界、上午/下午两段、工作日 `08:59` 与 `23:00` 的空闲、周末整天（`weekend` 标志）、**周内的法定节假日整天**（国庆、劳动节、元旦、春节各取一天）、节日区间两端、**跨周的春节连休**、区间结束后的第一个工作日立刻恢复高峰、调休上班的周末**不**被当成假日（按表判定不外推）、`isStatutoryHoliday` 可换表、坏时刻不抛异常；`effectiveBusinessPriority` 取每个供应商的最低档位并与窗口无关、空表/坏表退化为空映射；`partitionByRule` 在固定高峰时刻上验证「命中者整体前移、档位 0 进 disabled、`pin: 1` 保住调用方点名的首行」。配置接线：`normalizeConfig` 缺省 `false`、坏值读时兜底 `false`，`applyConfigPatch` 可写回 `false`、拒非布尔（字符串/数字/`null`）、且**只发 `timeSlots` 不会顺手改写 `businessRule`**；HTTP 面拒 `businessRule: 'on'` 并给出含 `boolean` 的原因。真服务（`check-service`）验证**开关切换**：关时仍走 `timeSlots` 且 `/state.source === 'slots'`、开时 `/state` 上报 `businessRule: true` / `source: 'business'` / 北京时间的 `status`（`weekend`、`holiday`、`date` 与纯函数逐字段一致），并按当前真实时刻分别断言高峰（被点名者前移、档位 0 停用、事件 `message === '高峰规则'`、`effective` 报 0）与空闲（静态顺序、无生效规则、`effective` 全 `null`）两条分支；再验证关掉开关**无需重启**立刻退回 `timeSlots`，以及开着开关但没有档位表时退化为恒等变换。管理页那一侧由 `check:ui` 覆盖：开关渲染在时段表**上方**（按文档顺序断言）、初始状态与 `/state.businessRule` 一致、`false` 与**缺省（老服务）**都渲染成未启用、点击翻转 `data-on`/`aria-pressed`/文案且不被轮询回滚、保存时 `businessRule` 随 `router` 一起提交而 `timeSlots` 照旧、**关掉提交的是显式 `false` 而不是缺省「保持」**、英文环境下也有文案；`check.mjs` 的设置页契约把新增的只读行登记进「六个页签行标签并集」的白名单，保证它既不被遗漏也不与其他页签重复。
 
 **熔断与路由的状态机**（独立一层）：`lib/service/router.js` 用注入的时钟确定性地走完 closed → open → half-open → closed 的全部转移（阈值与窗口的裁剪、冷却到期、探测槽、探测超时释放、探测失败重新熔断、`immediate` 模式、环形顺序表、全候选熔断时回 null、`switchBudget` 的 0 = 自动语义、**按连续熔断次数递增的冷却与成功归零**、**`retryWaitMs` 的 0.5s 翻倍 / 听 retry-after / 超 5s 判「别重试了」**，以及「手改坏的文件按字段修复而不是让插件启动失败」）。**熔断与切换的行为**移到 `scripts/check-service.mjs`，用桩上游 + 真服务 + 真 socket 覆盖：同一条路由先重试、用完才切换、阈值以下只记账到阈值才熔断、已熔断的行被跳过、上游 200 但 body 不是 JSON 判 503、流式逐片归一并以 `[DONE]` 收尾、末尾片带 `usage`；管理面必须有令牌（无令牌/错令牌 401）、配置校验拒绝越界端口/缺 baseURL/缺 model、指向未注册供应商的行被接受但标 `registered:false`、留空密钥不抹掉已存密钥、密钥只以掩码回传；转换器注册表拒绝重复 id 与非法 id、匹配抛异常视为不匹配、六项缺省全是原样透传；配置修复覆盖坏端口/坏行丢弃/冷却上限倒挂；SSE 行三种含义与 `retry-after` 的秒/毫秒两种写法；最后是**插件真的能把它拉起来**：fork → 等就绪行 → `view()` 拿到服务状态 → 转达探测与 reset → 第二个客户端改为接入而不是再拉一个 → disposer 里停掉自己拉起的那个、接入方停不掉别人的。**插件侧只被验证「不再有钩子、也不再自己算路由」**：宿主半区不含 `agent/request` / `agent/request-error`，不含 `createRouter`/`createRouting`，`lib/router.js` 与 `lib/routing.js` 不在插件主体里，`/save` 丢掉路由字段而不报错，`/router.state|reset|probe` 在服务不可达时回 `unavailable`（带服务给的原话）而不是假装成功。
 
