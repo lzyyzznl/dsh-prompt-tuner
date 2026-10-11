@@ -575,9 +575,9 @@ check('上游收到 bearer 凭据', stub.calls[0]?.headers?.authorization === 'B
 
 stub.calls.length = 0
 await post(`${base}/v1/chat/completions`, { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'x' }], thinking: { type: 'enabled', budget_tokens: 2048 } })
-check('budget_tokens 映射到就近档位', stub.calls[0]?.body?.reasoning_effort === 'medium', stub.calls[0]?.body?.reasoning_effort)
+check('非 off 的预算档位一律收成 max', stub.calls[0]?.body?.reasoning_effort === 'max', stub.calls[0]?.body?.reasoning_effort)
 await post(`${base}/v1/chat/completions`, { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'x' }], reasoning_effort: 'minimal' })
-check('minimal 落到 low（网关没有这个词）', stub.calls[1]?.body?.reasoning_effort === 'low', stub.calls[1]?.body?.reasoning_effort)
+check('minimal 作为非 off 档位收成 max', stub.calls[1]?.body?.reasoning_effort === 'max', stub.calls[1]?.body?.reasoning_effort)
 await post(`${base}/v1/chat/completions`, { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'x' }] })
 check('调用方什么都没说时不自作主张加档位', stub.calls[2]?.body?.reasoning_effort === undefined, stub.calls[2]?.body?.reasoning_effort)
 
@@ -597,7 +597,7 @@ const unreadable = [
   ['thinking.empty', { thinking: {} }, undefined, '空的 thinking 不算表态，不发档位'],
   ['reasoning_effort', { reasoning_effort: null }, undefined, 'null 等同于没表态'],
   ['reasoning_effort', { reasoning_effort: '' }, undefined, '空串等同于没表态'],
-  ['both', { effort: 'bogus', reasoning_effort: 'high' }, 'high', '能读出来的写法优先于读不出来的'],
+  ['both', { effort: 'bogus', reasoning_effort: 'off' }, 'none', '能读出来的写法优先于读不出来的（off 胜出）'],
   ['reasoning_effort', { reasoning_effort: 'off' }, 'none', 'off 仍然是真的关（归一成 none）'],
   ['thinking', { thinking: { type: 'disabled' }, reasoning_effort: 'bogus' }, 'none', 'thinking 胜过 reasoning_effort'],
 ]
@@ -607,11 +607,19 @@ for (let i = 0; i < unreadable.length; i += 1) {
   const got = stub.calls[i]?.body?.reasoning_effort
   check(label, got === expected, `期望 ${JSON.stringify(expected)}，实到 ${JSON.stringify(got)}`)
 }
-// The rule is "normalize", not "rewrite everything": a level the gateway accepts
-// still travels under one of the words the converter's own level table allows.
+// The rule here is a ceiling, not a menu: whatever depth a caller expresses, the
+// routes are operated at one speed grade. Only off survives verbatim; every
+// non-off level — including an alias the gateway itself would accept — lands on
+// max, so "on, to some depth" cannot mean different things per spelling.
 stub.calls.length = 0
 await post(`${base}/v1/chat/completions`, { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'x' }], reasoning_effort: 'xhigh' })
-check('xhigh 归一到 max 档（不落在网关不认的拼写上）', stub.calls[0]?.body?.reasoning_effort === 'max', stub.calls[0]?.body?.reasoning_effort)
+check('xhigh 作为非 off 档位收成 max', stub.calls[0]?.body?.reasoning_effort === 'max', stub.calls[0]?.body?.reasoning_effort)
+await post(`${base}/v1/chat/completions`, { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'x' }], reasoning_effort: 'low' })
+check('low 也收成 max', stub.calls[1]?.body?.reasoning_effort === 'max', stub.calls[1]?.body?.reasoning_effort)
+await post(`${base}/v1/chat/completions`, { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'x' }], reasoning_effort: 'medium' })
+check('medium 也收成 max', stub.calls[2]?.body?.reasoning_effort === 'max', stub.calls[2]?.body?.reasoning_effort)
+await post(`${base}/v1/chat/completions`, { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'x' }], thinking: { type: 'enabled', budget_tokens: 4096 } })
+check('开启 + 中等预算同样收成 max', stub.calls[3]?.body?.reasoning_effort === 'max', stub.calls[3]?.body?.reasoning_effort)
 
 stub.calls.length = 0
 // `chat_template_kwargs.enable_thinking` is the backends' own thinking switch —
@@ -625,7 +633,7 @@ check('上游的模板开关被写成与档位一致', stub.calls[0]?.body?.chat
 await post(`${base}/v1/chat/completions`, { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'x' }], chat_template_kwargs: { enable_thinking: 'off' } })
 check('模板开关的字符串写法也认（off → none）', stub.calls[1]?.body?.reasoning_effort === 'none', stub.calls[1]?.body?.reasoning_effort)
 await post(`${base}/v1/chat/completions`, { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'x' }], chat_template_kwargs: { enable_thinking: true } })
-check('enable_thinking=true 是开启思考', stub.calls[2]?.body?.reasoning_effort === 'high', stub.calls[2]?.body?.reasoning_effort)
+check('enable_thinking=true 是开启思考（收成 max）', stub.calls[2]?.body?.reasoning_effort === 'max', stub.calls[2]?.body?.reasoning_effort)
 await post(`${base}/v1/chat/completions`, { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'x' }], chat_template_kwargs: { enable_thinking: 'maybe' } })
 check('模板开关读不出来时同样归一成 max', stub.calls[3]?.body?.reasoning_effort === 'max', stub.calls[3]?.body?.reasoning_effort)
 await post(`${base}/v1/chat/completions`, { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'x' }], chat_template_kwargs: { unrelated_template_var: 7 } })

@@ -886,6 +886,10 @@ models:
 **踩到的坑（留了测试）**：`models()` 计算"候选里最小的窗口"时把 1M 默认值当成了初始下界，于是候选真实窗口是 3M 时被 `Math.min` 夹回 1M——**报了一个比真实更小的窗口，方向恰好和意图相反**。改成下界未设置、只有没有候选时才回落默认值；`check:service` 里那条"用上游上报的窗口而不是 1M 默认"的用例抓到了它。
 
 **被这次取代的旧契约**（记录保留在下面 2026-10-10 那节，别再照它实现）：未提供服务的模型名 → 404；`provider/model` 点名 → 只打那一行；`model` 回显请求名；`/v1/models` 列举 `provider/model`；`pin: 1` 保住调用方点名的行。另外 README 里"都不匹配就从第一行开始"是更早一版的残留描述（实现早已是 404），顺带修掉。
+## maas 思考档位封顶成 max（2026-10-11）
+
+这两个网关按**同一档**在跑，所以细粒度思考等级对它们没有意义——之前 `low`/`medium`/`high`/`max`、任何 `budget_tokens`、以及各种别名（`minimal`→`low`、`xhigh`/`maximum`→`max`）会被**原样换算成各自等级**，同一个"开思考"却可能因为调用方拼写不同而让两条路由用不同深度。现改为**一个天花板**：`toUpstream` 里 `resolveEffort` 的结果只有 `none`（一切 off 拼写）被原样保留，**任一非 off 档位一律收成 `max`**；没表态仍不发字段（各网关默认照旧）。`resolveEffort` 只负责读懂并决出等级，封顶发生在落线那一层，所以 `enable_thinking` 的同步写出也自动跟着 `max` 走。`check:service` 的预算/别名/`enable_thinking:true` 断言从 `medium`/`low`/`high` 改成 `max`（419 项），并新增 low/medium/预算 4096 三条显式封顶用例。
+
 
 ## 设置页
 
@@ -1012,7 +1016,7 @@ models:
 | `lib/service/converters/maas.js` | ZTE MaaS → `api.deepseek.com` 契约的字典：入参翻译、出参归一、错误重写、`/v1/models` 合成 |
 | `lib/service/ui.js` | 服务自带的管理页：供应商/密钥/顺序表/熔断参数可编辑，实时熔断表与最近事件可看 |
 | `lib/service/time-slots.js` | 时段与内置高峰规则：`HH:mm` 解析/格式化、跨午夜窗口、最具体者胜、**档位升序排名**（`0` 移出候选）、北京时间峰谷与节假日表（纯函数、零 import） |
-| `scripts/check-service.mjs` | 服务自检：桩上游 + 真服务 + 真 socket，416 项，离线零 token |
+| `scripts/check-service.mjs` | 服务自检：桩上游 + 真服务 + 真 socket，419 项，离线零 token |
 | `scripts/check-ui.mjs` | 管理页自检：假 DOM 跑真页面脚本，88 项，离线零 token |
 | `scripts/check-live.mjs` | 真实网关端到端实测，28 项，需网络与凭据，**不**随 `npm run check` 跑 |
 | `lib/store.js` | 配置读写（原子写、容错读）+ 旁路历史存储（每会话分片、裁剪） |
@@ -1026,7 +1030,7 @@ models:
 
 ```sh
 npm run check                 # 847 项，含宿主通知/标题/路由服务与设置页契约
-npm run check:service         # 416 项，路由服务本体（桩上游，离线）
+npm run check:service         # 419 项，路由服务本体（桩上游，离线）
 npm run check:ui              # 88 项，管理页脚本（假 DOM）
 npm run check:shape           # 对**已安装**的 DSH 复核旁路提问的消息形状（需要本机有 DSH）
 npm run check:title           # 对**已安装**的 DSH 复核标题重总结（真会话、真投影，不调模型）
