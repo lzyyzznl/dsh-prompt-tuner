@@ -1298,6 +1298,28 @@ check('拖到顶部后该行成为高峰表第一行（无任何数字参与）'
   dragOut !== null && dragOut.router.peakOrder.map((r) => r.provider).join(',') === 'ghost,alpha,beta',
   JSON.stringify(dragOut && dragOut.router && dragOut.router.peakOrder))
 
+// 图片能力是行级的：勾上一行保存后该行带上 vision: true，其余行干脆不带这个字段。
+const vis = bootPage()
+await vis.settle()
+const visPeak = vis.document.querySelector('tbody[data-role="route-body"][data-kind="peak"]')
+const visRows = () => visPeak.querySelectorAll('tr')
+check('路由行都有图片勾选框', visRows()[0].querySelector('input[data-field="vision"]') !== null)
+visRows()[0].querySelector('input[data-field="vision"]').checked = true
+vis.click(vis.all('button[data-act="save-routing"]')[0])
+await vis.settle()
+const visOut = vis.lastBody('config')
+check('勾上的行保存后带 vision: true，其余行不带 vision 字段',
+  visOut !== null
+  && visOut.router.peakOrder.map((r) => (r.vision === true ? r.provider + ':v' : r.provider)).join(',') === 'alpha:v,beta,ghost',
+  JSON.stringify(visOut && visOut.router && visOut.router.peakOrder))
+const visState = fixtureState()
+visState.router.peakOrder[1] = { provider: 'beta', model: 'beta-1', vision: true }
+const visPage2 = bootPage({ state: visState })
+await visPage2.settle()
+const visPeak2 = visPage2.document.querySelector('tbody[data-role="route-body"][data-kind="peak"]')
+check('已有 vision: true 的行渲染时勾选框是勾上的',
+  [...visPeak2.querySelectorAll('tr')].map((tr) => tr.querySelector('input[data-field="vision"]').checked).join(',') === 'false,true,false')
+
 /* ──────────────────────── 12. time-slot-line 文案 ──────────────────────── */
 
 section('12. 实时选路行：说清当前高峰/低谷与试序，不再提时段窗口')

@@ -1537,7 +1537,8 @@ const {
   reconcileOrder,
 } = await import('../lib/service/config.js')
 
-const { buildCandidates, NORTHBOUND_MODEL, NORTHBOUND_MODELS, NORTHBOUND_OWNER, resolveNorthbound } = await import('../lib/service/proxy.js')
+const { buildCandidates, NORTHBOUND_MODEL, NORTHBOUND_MODELS, NORTHBOUND_OWNER, requestHasImage, resolveNorthbound } = await import('../lib/service/proxy.js')
+const { normalizeOrder } = await import('../lib/service/router.js')
 
 section('3c-1. 熔断单位：provider 与 provider#key')
 
@@ -1886,6 +1887,19 @@ section('3c-8. 候选展开：整张顺序表 × key（北向只服务 auto）')
     }))
   check('名字不参与选行：解析结果里没有任何 provider / model 字段',
     Object.keys(resolveNorthbound('co-claw')).sort().join(',') === 'context,known,name')
+  check('normalizeOrder 保留 vision 标记；只有字面 true 才算数',
+    normalizeOrder([{ provider: 'p', model: 'm', vision: true }, { provider: 'q', model: 'n', vision: false }, { provider: 'r', model: 'o', vision: 'yes' }])
+      .map((row) => JSON.stringify(row)).join('|') === '{"provider":"p","model":"m","vision":true}|{"provider":"q","model":"n"}|{"provider":"r","model":"o"}'
+      && normalizeOrder([{ provider: 'q', model: 'n', vision: false }])[0].vision === undefined)
+  check('requestHasImage：content 数组里的 image_url 部件就算有图',
+    requestHasImage({ messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }, { type: 'image_url', image_url: { url: 'data:image/png;base64,AAA' } }] }] }) === true
+    && requestHasImage({ messages: [{ role: 'user', content: [{ type: 'image_url', image_url: 'data:image/png;base64,BBB' }] }] }) === true)
+  check('requestHasImage：纯文本、裸字符串、没有 messages、非数组都不算有图',
+    requestHasImage({ messages: [{ role: 'user', content: 'hi' }] }) === false
+    && requestHasImage({ messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] }) === false
+    && requestHasImage({}) === false && requestHasImage(null) === false
+    && requestHasImage({ messages: [{ role: 'user' }] }) === false
+    && requestHasImage({ messages: [{ role: 'user', content: [{ type: 'audio', audio: { url: 'x' } }] }] }) === false)
 
   const unitsFor = (row) => (row.provider === 'p1'
     ? [{ id: 'k1', label: 'a', key: 's1' }, { id: 'k2', label: 'b', key: 's2' }]

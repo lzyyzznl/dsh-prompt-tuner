@@ -191,6 +191,18 @@ defineConverter({ id, label, match, toUpstream, fromUpstream, fromUpstreamChunk,
   （缓存条目、来源、最近一次失败）。
   插件设置页「路由」页签只读展示同一句「当前=高峰/低谷 → 实际试序」加一行「日历判定」。
 
+#### 图片输入：带图的请求只走「图片」行，当前表一行都没有就报错
+
+各家网关能力不均匀——`maas` 那几行现在都不吃图片，只有直连官方的行是多模态。所以顺序表的每一行多了一个**「图片」勾选框**
+（行级能力，存成 `vision: true`），带图片的请求只在这些行里挑：
+
+- **不带图 → 按原规则走**：正常按当前时段的顺序表试，一行不漏。
+- **带图 → 收窄到「图片」行**：只在当前表里勾过「图片」的行里按序试（熔断/重试/切换照旧），排在前面的非图片行会被跳过。
+- **当前表一行「图片」都没有 → 400**：错误信息点名是哪个时段缺能力（`peak` / `off-peak`），**不跨到另一张表去找人**、也不落到会拒图的
+  模型上。比如现在高峰表只有 `maas-dsv4 / maas-coclaw`，高峰时段带图请求就会明确报错，直到你把官方那行也排进高峰表。
+- **图片的判据**：任一消息的 `content` 数组里含有 `{type: "image_url"}` 部件即算（参照契约里纯字符串 `content` 装不了图）。
+- 插件只读页签里支持图片的行带 🖼 标记，并有一行「图片行」列出当前能吃图的行；管理页「路由」页签每行一个勾选框，勾完保存立即生效。
+
 #### 口径以 DeepSeek 的峰谷计费为准：**调休上班的周末、法定节假日全天都算空闲时段**
 
 这条是参考方的规则，不是我们发明的：DeepSeek API 的峰谷说明里，**调休上班的周末与中国法定节假日全天均按空闲时段计费**。
@@ -247,8 +259,8 @@ defineConverter({ id, label, match, toUpstream, fromUpstream, fromUpstreamChunk,
 ### 自检
 
 ```sh
-npm run check:service   # 438 项：桩上游 + 真服务 + 真 socket，离线、零 token
-npm run check:ui        # 103 项：管理页（假 DOM 跑真脚本），离线、零 token
+npm run check:service   # 451 项：桩上游 + 真服务 + 真 socket，离线、零 token
+npm run check:ui        # 106 项：管理页（假 DOM 跑真脚本），离线、零 token
 npm run check:live      # 28 项：对真实网关的端到端实测，需网络与密钥，非离线自检
 ```
 
@@ -264,7 +276,7 @@ dsh plugin add github:lzyyzznl/dsh-prompt-tuner
 仓库根有 `cordis.patch.yml`（一条 `insert`），`package.json` 声明 `dsh.bundle.patch` 与 `dsh.client.platform=web`；不含构建步骤，`lib/` 即源码。
 
 ```sh
-npm run check        # 自检（855 项），不需要本机装 DSH
+npm run check        # 自检（858 项），不需要本机装 DSH
 npm run eval:prompt  # 三臂盲评：只打印计划，加 --live / --judge 才发真实请求
 npm run eval:attribution  # 归因审计：读已有运行记录，量「改写加了什么用户没提的东西」
 ```

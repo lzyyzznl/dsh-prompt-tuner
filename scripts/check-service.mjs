@@ -2583,6 +2583,172 @@ section('26. 对外三个语境名：点名语境有效，点名内部行无效'
   }
 }
 
+/* ──────────────── 27. 多模态：带图的请求只挑 vision 行 ──────────────── */
+
+section('27. 多模态：带图的请求只走支持图片的行，当前表一行都没有则 400')
+
+const PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII='
+const imageBody = (model, parts = 1) => ({
+  model,
+  messages: [{
+    role: 'user',
+    content: [
+      { type: 'text', text: 'what is in this image?' },
+      ...Array.from({ length: parts }, () => ({ type: 'image_url', image_url: { url: PNG } })),
+    ],
+  }],
+})
+
+{
+  // The vision row is not first: an image must skip the higher non-vision row and
+  // land exactly once on the vision row, while a text-only request keeps the
+  // normal (unfiltered) chain.
+  const { svc, base, headers } = await startPinned(PIN_PEAK, {
+    peakOrder: [
+      { provider: 'maas-coclaw', model: 'co-claw' },
+      { provider: 'maas-dsv4', model: 'deepseek-v4-flash', vision: true },
+    ],
+  })
+  try {
+    stub.keyStatus = {}
+    stub.calls.length = 0
+    const img = await post(`${base}/v1/chat/completions`, imageBody('auto'), headers)
+    check('带图请求跳过表头（非 vision 的 coclaw），一次只打 vision 行（dsv4）',
+      img.status === 200 && stub.calls.map((call) => call.key).join(',') === 'gw-good',
+      `${img.status} ${stub.calls.map((call) => call.key).join(',')}`)
+    check('回应了它，回显仍是规范名 auto', img.json?.model === 'auto', img.json?.model)
+    stub.calls.length = 0
+    const txt = await post(`${base}/v1/chat/completions`, { model: 'auto', messages: [{ role: 'user', content: 'hi' }] }, headers)
+    check('同一配置下不带图 → 完全照常：先试表头 coclaw',
+      txt.status === 200 && stub.calls.map((call) => call.key).join(',') === 'gw-broken',
+      `${txt.status} ${stub.calls.map((call) => call.key).join(',')}`)
+    stub.calls.length = 0
+    const multi = await post(`${base}/v1/chat/completions`, imageBody('auto', 2), headers)
+    check('两张图跟一张图一样：也只打 vision 行一次', multi.status === 200 && stub.calls.length === 1
+      && stub.calls[0]?.key === 'gw-good', `${multi.status} ${stub.calls.map((call) => call.key).join(',')}`)
+  } finally {
+    await svc.stop()
+  }
+}
+
+{
+  // The whole point of the capability: a context with no vision row must refuse,
+  // with a message that names the context — not fail over to a row that would
+  // reject the image, and not go fishing in the other table.
+  const { svc, base, headers } = await startPinned(PIN_PEAK, {
+    peakOrder: [
+      { provider: 'maas-coclaw', model: 'co-claw' },
+      { provider: 'maas-dsv4', model: 'deepseek-v4-flash' },
+    ],
+  })
+  try {
+    stub.keyStatus = {}
+    stub.calls.length = 0
+    const img = await post(`${base}/v1/chat/completions`, imageBody('auto'), headers)
+    check('高峰表没有 vision 行 → 带图请求 400，一个上游都不碰',
+      img.status === 400 && stub.calls.length === 0, `${img.status} calls=${stub.calls.length}`)
+    check('错误信息说清是哪个语境缺能力', img.text.includes('peak') && img.text.includes('no vision-capable route'),
+      img.text.slice(0, 200))
+    stub.calls.length = 0
+    const txt = await post(`${base}/v1/chat/completions`, { model: 'auto', messages: [{ role: 'user', content: 'hi' }] }, headers)
+    check('同一配置不带图不受影响：照常服务', txt.status === 200 && stub.calls.length === 1 && stub.calls[0]?.key === 'gw-broken',
+      `${txt.status} ${stub.calls.map((call) => call.key).join(',')}`)
+  } finally {
+    await svc.stop()
+  }
+}
+
+{
+  // Named context interacts exactly like the clock: the *forced* table is the
+  // rule, so a forced context without a vision row errors even when the other
+  // table has one — that other table was not asked for.
+  const { svc, base, headers } = await startPinned(PIN_PEAK, {
+    peakOrder: [{ provider: 'maas-dsv4', model: 'deepseek-v4-flash', vision: true }],
+    offPeakOrder: [{ provider: 'maas-coclaw', model: 'co-claw' }],
+  })
+  try {
+    stub.keyStatus = {}
+    stub.calls.length = 0
+    const offImg = await post(`${base}/v1/chat/completions`, imageBody('off-peak'), headers)
+    check('点名 off-peak（该表无 vision 行）→ 400，绝不跨到高峰表找人',
+      offImg.status === 400 && stub.calls.length === 0 && offImg.text.includes('off-peak'),
+      `${offImg.status} calls=${stub.calls.length} ${offImg.text.slice(0, 160)}`)
+    stub.calls.length = 0
+    const pkImg = await post(`${base}/v1/chat/completions`, imageBody('peak'), headers)
+    check('点名 peak（该表有 vision 行）→ 正常走 dsv4',
+      pkImg.status === 200 && stub.calls.map((call) => call.key).join(',') === 'gw-good', `${pkImg.status} ${stub.calls.map((call) => call.key).join(',')}`)
+  } finally {
+    await svc.stop()
+  }
+}
+
+{
+  // The vision subset is still a failure chain: one vision row failing falls to
+  // the next; a single vision row failing and nothing left is exhausted -> 503.
+  const { svc, base, headers } = await startPinned(PIN_PEAK, {
+    peakOrder: [
+      { provider: 'maas-dsv4', model: 'deepseek-v4-flash', vision: true },
+      { provider: 'maas-coclaw', model: 'co-claw', vision: true },
+    ],
+  })
+  try {
+    stub.keyStatus = { 'gw-good': 503 }
+    stub.calls.length = 0
+    await post(`${base}/v1/chat/completions`, imageBody('auto'), headers)
+    check('vision 行失败 → 依次落到下一条 vision 行（不碰非 vision 行，因为它们本来就不在候选里）',
+      stub.calls.map((call) => call.key).join(',') === 'gw-good,gw-broken', stub.calls.map((call) => call.key).join(','))
+  } finally {
+    await svc.stop()
+  }
+}
+{
+  const { svc, base, headers } = await startPinned(PIN_PEAK, {
+    peakOrder: [{ provider: 'maas-dsv4', model: 'deepseek-v4-flash', vision: true }],
+  })
+  try {
+    stub.keyStatus = { 'gw-good': 503 }
+    stub.calls.length = 0
+    const img = await post(`${base}/v1/chat/completions`, imageBody('auto'), headers)
+    check('唯一一条 vision 行也失败 → 换无可换，503（错不在图片）',
+      img.status === 503, `${img.status} ${img.text.slice(0, 160)}`)
+  } finally {
+    await svc.stop()
+  }
+}
+
+{
+  // enabled=false 的纯代理一样要认能力：只打那张表里第一条 vision 行一次。
+  const { svc, base, headers } = await startPinned(PIN_PEAK, {
+    peakOrder: [
+      { provider: 'maas-coclaw', model: 'co-claw' },
+      { provider: 'maas-dsv4', model: 'deepseek-v4-flash', vision: true },
+    ],
+    enabled: false,
+  })
+  try {
+    stub.keyStatus = { 'gw-good': 503, 'gw-broken': 200 }
+    stub.calls.length = 0
+    await post(`${base}/v1/chat/completions`, imageBody('auto'), headers)
+    check('enabled=false + 带图：只打第一条 vision 行一次，不重试',
+      stub.calls.map((call) => call.key).join(',') === 'gw-good', stub.calls.map((call) => call.key).join(','))
+  } finally {
+    await svc.stop()
+  }
+}
+
+{
+  // A wholly empty table still 503s before the vision question is even asked:
+  // "no route" is a different problem than "no vision route".
+  const { svc, base, headers } = await startPinned(PIN_PEAK, { peakOrder: [] })
+  try {
+    const img = await post(`${base}/v1/chat/completions`, imageBody('auto'), headers)
+    check('当前表整个为空时的带图请求 → 503「no route is configured」，不是 400',
+      img.status === 503 && img.text.includes('no route is configured'), `${img.status} ${img.text.slice(0, 120)}`)
+  } finally {
+    await svc.stop()
+  }
+}
+
 /* ───────────────────────── 23. stop ───────────────────────── */
 
 section('23. 停得下来')
