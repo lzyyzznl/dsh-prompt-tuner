@@ -1396,6 +1396,39 @@ check('补班周末：高峰表里的 ghost 不出现（这次走的是低谷表
 check('补班周末不出现「内置节假日表（回退）」这句（判断来自外部接口，不是回退）',
   !makeupLine.text.includes(strings.zh.timeLineSourceBuiltin), makeupLine.text)
 
+// 对外暴露的三个语境名：列表来自服务（/state.timeSlot.northbound），括号里的解释
+// 才是页面自己的文案 —— 这样页面不可能宣传一个路由服务其实不认的名字。
+const northboundOf = async (state) => {
+  const page = bootPage({ state })
+  await page.settle()
+  const node = page.document.querySelector('[data-northbound]')
+  return { page, node, text: node?.textContent }
+}
+const nbState = fixtureState()
+nbState.timeSlot = {
+  flavor: 'peak',
+  status: { status: 'peak', weekday: 3, weekend: false, holiday: false, date: '2026-10-14', minutes: 600, workday: true, source: 'builtin', info: '' },
+  order: { peak: [{ provider: 'alpha', model: 'alpha-small' }], offPeak: [{ provider: 'alpha', model: 'alpha-small' }] },
+  northbound: {
+    models: [{ id: 'auto', context: 'auto' }, { id: 'peak', context: 'peak' }, { id: 'off-peak', context: 'off-peak' }],
+    fallback: 'auto: an unknown name, or a forced context whose order table is empty'
+  }
+}
+const nb = await northboundOf(nbState)
+check('对外模型名一行：三个语境名都列出来，各自带上「跟随日历 / 强制哪张表」的说明',
+  nb.text !== undefined && nb.text.includes('auto' + strings.zh.northboundAuto)
+  && nb.text.includes('peak' + strings.zh.northboundPeak)
+  && nb.text.includes('off-peak' + strings.zh.northboundOffPeak),
+  nb.text)
+check('这一行同时说明「其它名字一律按 auto 服务」',
+  nb.text.includes('其它名字'), nb.text)
+check('名字列表来自服务而不是页面里写死的第二份拷贝',
+  nb.node?.getAttribute('data-northbound') === nbState.timeSlot.northbound.fallback,
+  nb.node?.getAttribute('data-northbound'))
+const nbMissing = await northboundOf(peakState)
+check('服务没报名字时这一行不渲染（对着老版本服务也不报错）',
+  nbMissing.node === undefined || nbMissing.node === null)
+
 const routedPage = await lineOf(peakState)
 const routingLive = routedPage.page.document.querySelector('#routing-body p.hint')
 check('路由页签顶部也有同一句实时选路行',

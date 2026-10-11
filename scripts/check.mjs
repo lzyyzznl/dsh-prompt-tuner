@@ -130,6 +130,11 @@ check('设置页用集合名（导航与标题）',
 check('指向设置页的报错文案已跟着改名', !routeSource.includes(OLD_PROJECT_NAME) && routeSource.includes('设置 → 插件优化集合'))
 check('README 以集合定位起头并留下标识符不变的说明',
   readmeSource.startsWith('# DSH 插件优化集合') && readmeSource.includes('标识符保持不变'))
+check('只读路由页签公布三个对外模型名，且名单读的是服务给的列表（不写第二份）',
+  clientSource.includes('routerModelsLabel') && clientSource.includes('timeSlotInfo?.northbound?.models')
+  && clientSource.includes("routerModelsValue: 'auto / peak / off-peak'"))
+check('只读页签也说明「其它名字一律按 auto」，中英都有',
+  clientSource.includes("routerModelsHint: 'auto 跟随日历") && clientSource.includes('is served as auto'))
 check('client 读草稿芯片（occurrences）以守卫整稿替换', clientSource.includes('state.occurrences'))
 check('client 读 draftRev 实现「只在草稿未变时自动替换」', clientSource.includes('state.draftRev'))
 
@@ -1532,7 +1537,7 @@ const {
   reconcileOrder,
 } = await import('../lib/service/config.js')
 
-const { buildCandidates, NORTHBOUND_MODEL, NORTHBOUND_OWNER } = await import('../lib/service/proxy.js')
+const { buildCandidates, NORTHBOUND_MODEL, NORTHBOUND_MODELS, NORTHBOUND_OWNER, resolveNorthbound } = await import('../lib/service/proxy.js')
 
 section('3c-1. 熔断单位：provider 与 provider#key')
 
@@ -1857,11 +1862,30 @@ section('3c-8. 候选展开：整张顺序表 × key（北向只服务 auto）')
     { provider: 'p1', model: 'm1' },
     { provider: 'p2', model: 'm2' },
   ]
-  // The northbound model name is no longer an input: every request is served by
-  // the whole order table, and the routing rules decide the order. There is no
-  // "matching row goes first" and no "provider/model dials only itself", which
-  // is what used to let a caller pin a row and bypass the rules.
-  check('对外只服务一个模型名：auto', NORTHBOUND_MODEL === 'auto' && NORTHBOUND_OWNER === 'dsh-prompt-tuner')
+  // The northbound name still selects no row: it selects a *time context*, and
+  // the routing rules choose the provider/model inside it. There is no "matching
+  // row goes first" and no "provider/model dials only itself", which is what used
+  // to let a caller pin a row and bypass the rules.
+  check('对外是三个语境名：auto / peak / off-peak',
+    NORTHBOUND_MODELS.map((entry) => entry.id).join(',') === 'auto,peak,off-peak'
+    && NORTHBOUND_MODEL === 'auto' && NORTHBOUND_OWNER === 'dsh-prompt-tuner',
+    NORTHBOUND_MODELS.map((entry) => entry.id).join(','))
+  check('auto 跟随日历，peak / off-peak 各自断言一张表',
+    NORTHBOUND_MODELS.map((entry) => entry.context).join(',') === 'auto,peak,off-peak')
+  check('点名 auto → 语境 auto，回显 auto',
+    JSON.stringify(resolveNorthbound('auto')) === JSON.stringify({ name: 'auto', context: 'auto', known: true }))
+  check('点名 peak / off-peak → 各自的语境',
+    resolveNorthbound('peak').context === 'peak' && resolveNorthbound('off-peak').context === 'off-peak')
+  check('offpeak 与大小写、空白都算同义词，回显规范名',
+    resolveNorthbound(' offpeak ').context === 'off-peak' && resolveNorthbound('OFF-PEAK').name === 'off-peak'
+    && resolveNorthbound('OFF-PEAK').known === true)
+  check('不认识的名字（含内部行名、空串、非字符串）一律按 auto，且标记为不认识',
+    ['deepseek-v4-flash', 'co-claw', '', '   ', null, undefined, 42, {}].every((raw) => {
+      const resolved = resolveNorthbound(raw)
+      return resolved.context === 'auto' && resolved.name === 'auto' && resolved.known === false
+    }))
+  check('名字不参与选行：解析结果里没有任何 provider / model 字段',
+    Object.keys(resolveNorthbound('co-claw')).sort().join(',') === 'context,known,name')
 
   const unitsFor = (row) => (row.provider === 'p1'
     ? [{ id: 'k1', label: 'a', key: 's1' }, { id: 'k2', label: 'b', key: 's2' }]

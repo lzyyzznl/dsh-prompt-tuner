@@ -547,15 +547,15 @@ section('4. /v1/models 与入参语义')
 const models = await get(`${base}/v1/models`)
 check('/v1/models 返回 list 形状', models.json?.object === 'list' && Array.isArray(models.json.data))
 const modelIds = (models.json?.data ?? []).map((entry) => entry.id)
-check('目录只有一条 auto：调用方不再从内部行里选',
-  modelIds.length === 1 && modelIds[0] === 'auto', modelIds.join(','))
-check('这条是 OpenAI 形状，owner 是路由器自己而不是某个供应商',
+check('目录是三个语境名：auto / peak / off-peak（仍然没有任何内部行名）',
+  modelIds.join(',') === 'auto,peak,off-peak', modelIds.join(','))
+check('每条都是 OpenAI 形状，owner 是路由器自己而不是某个供应商',
   (models.json?.data ?? []).every((entry) => entry.object === 'model' && Number.isFinite(entry.created)
-    && entry.owned_by === 'dsh-prompt-tuner' && entry.name === 'auto'),
+    && entry.owned_by === 'dsh-prompt-tuner' && entry.name === entry.id),
   JSON.stringify(models.json?.data))
-check('窗口取候选里最小的那个（ZTE 网关都不报 → 落到 1M 默认）',
-  (models.json?.data ?? []).every((entry) => Number.isSafeInteger(entry.context_window))
-    && models.json.data[0].context_window === U.DEFAULT_CONTEXT_WINDOW,
+check('窗口取候选里最小的那个（ZTE 网关都不报 → 三条都落到 1M 默认）',
+  (models.json?.data ?? []).every((entry) => Number.isSafeInteger(entry.context_window)
+    && entry.context_window === U.DEFAULT_CONTEXT_WINDOW),
   JSON.stringify(models.json?.data))
 
 stub.mode = 'ok'
@@ -1147,10 +1147,22 @@ check('发现 context_window 后写入 discoveredWindows',
   winProvider.discoveredWindows['m-manual'] === 3_000_000 && winProvider.discoveredWindows['stub-alpha'] === 2_000_000,
   JSON.stringify(winProvider.discoveredWindows))
 const modelsWithWin = await get(`${base}/v1/models`)
-check('/v1/models 的 auto 报候选里最小的窗口，而不是 1M 默认',
-  modelsWithWin.json?.data?.length === 1 && modelsWithWin.json.data[0].id === 'auto'
-  && modelsWithWin.json.data[0].context_window === 3_000_000,
+check('/v1/models 报候选里最小的窗口，而不是 1M 默认',
+  modelsWithWin.json?.data?.length === 3
+  && modelsWithWin.json.data.every((entry) => entry.context_window === 3_000_000),
   JSON.stringify(modelsWithWin.json?.data))
+
+// The window is per *context*: a name may only be served by the table it selects,
+// so advertising the union's floor for a forced context would overpromise.
+await configure({
+  peakOrder: [{ provider: 'p-models', model: 'm-manual' }],
+  offPeakOrder: [{ provider: 'p-models', model: 'stub-alpha' }],
+})
+const windowsByContext = await get(`${base}/v1/models`)
+const windowOfId = (id) => windowsByContext.json?.data?.find((entry) => entry.id === id)?.context_window
+check('peak 只按高峰表的候选算窗口，off-peak 只按低谷表算，auto 取两者最小值',
+  windowOfId('peak') === 3_000_000 && windowOfId('off-peak') === 2_000_000 && windowOfId('auto') === 2_000_000,
+  JSON.stringify(windowsByContext.json?.data))
 stub.modelsBody = null
 
 stub.calls.length = 0
@@ -2448,6 +2460,123 @@ async function startPinned(nowAt, routerOverrides = {}, extra = {}) {
       JSON.stringify({ status: st?.status, calendar: st?.calendar }))
     await post(`${base}/v1/chat/completions`, { model: 'm-switch', messages: [{ role: 'user', content: 'ping' }] }, headers)
     check('限流不影响选路：照旧按高峰表试 coclaw',
+      stub.calls.map((call) => call.key).join(',') === 'gw-broken', stub.calls.map((call) => call.key).join(','))
+  } finally {
+    await svc.stop()
+  }
+}
+
+/* ──────────────── 26. 对外三个语境名：auto / peak / off-peak ──────────────── */
+
+section('26. 对外三个语境名：点名语境有效，点名内部行无效')
+
+{
+  // One instant, one pair of tables, several names. `peak` and `off-peak` are
+  // assertions about *which table* to use and must beat the clock; `auto` and any
+  // unknown name follow the clock. The peak table starts at coclaw (key
+  // `gw-broken`) and the off-peak table at dsv4 (key `gw-good`), so which key was
+  // dialled *is* the answer to which table was used. Every stub row is healthy
+  // here, so exactly one call is made per request — no failover, no breaker state
+  // leaking from one assertion into the next.
+  const chatAs = (base, headers, model) => post(`${base}/v1/chat/completions`,
+    { model, messages: [{ role: 'user', content: 'ping' }] }, headers)
+  const firstCall = () => stub.calls.map((call) => call.key).join(',')
+
+  for (const [label, instant, timed, other, timedFirst, otherFirst] of [
+    ['低谷时刻（周日 12:30）', PIN_OFF, 'off-peak', 'peak', 'gw-good', 'gw-broken'],
+    ['高峰时刻（周三 10:00）', PIN_PEAK, 'peak', 'off-peak', 'gw-broken', 'gw-good'],
+  ]) {
+    const { svc, base, headers } = await startPinned(instant)
+    try {
+      stub.keyStatus = {}
+      const st = svc.admin.state().timeSlot
+      check(`${label}：日历判定就是 ${timed}`, st?.flavor === timed, JSON.stringify(st?.status))
+      check(`${label}：/state 公布三个语境名，并说明未识别名字与空表都退回 auto`,
+        st?.northbound?.models?.map((entry) => entry.id).join(',') === 'auto,peak,off-peak'
+        && String(st?.northbound?.fallback ?? '').includes('auto'),
+        JSON.stringify(st?.northbound))
+
+      stub.calls.length = 0
+      const auto = await chatAs(base, headers, 'auto')
+      check(`${label}：auto 跟随日历 → 只打 ${timedFirst} 一次`,
+        firstCall() === timedFirst, firstCall())
+      check(`${label}：auto 的回显仍是 auto`, auto.json?.model === 'auto', auto.json?.model)
+
+      // The forced context that *agrees* with the clock would prove nothing, so
+      // each instant also exercises the one that contradicts it.
+      stub.calls.length = 0
+      const forced = await chatAs(base, headers, other)
+      check(`${label}：点名 ${other}（与日历相反）→ 改走 ${other} 表，只打 ${otherFirst} 一次`,
+        forced.status === 200 && firstCall() === otherFirst, `${forced.status} ${firstCall()}`)
+      check(`${label}：回显是服务时的规范名 ${other}`, forced.json?.model === other, forced.json?.model)
+
+      stub.calls.length = 0
+      const alias = await chatAs(base, headers, 'OffPeak')
+      check(`${label}：offpeak / 大小写混写是同义词 → 走低谷表，回显规范名 off-peak`,
+        firstCall() === 'gw-good' && alias.json?.model === 'off-peak',
+        `${firstCall()} ${alias.json?.model}`)
+
+      stub.calls.length = 0
+      const unknown = await chatAs(base, headers, 'deepseek-v4-flash')
+      check(`${label}：不认识的名字按 auto 服务（跟随日历 → ${timedFirst}）`,
+        unknown.status === 200 && firstCall() === timedFirst && unknown.json?.model === 'auto',
+        `${unknown.status} ${firstCall()} ${unknown.json?.model}`)
+    } finally {
+      await svc.stop()
+    }
+  }
+}
+
+{
+  // A forced context whose table is empty falls back to the calendar instead of
+  // failing: the caller's intent is honoured when it can be, never at the price of
+  // a request that had somewhere to go.
+  const { svc, base, headers } = await startPinned(PIN_OFF, { peakOrder: [] })
+  try {
+    stub.keyStatus = {}
+    stub.calls.length = 0
+    const forced = await post(`${base}/v1/chat/completions`,
+      { model: 'peak', messages: [{ role: 'user', content: 'ping' }] }, headers)
+    check('点名 peak 但高峰表是空的 → 不报错，改按日历（低谷）服务',
+      forced.status === 200 && stub.calls.map((call) => call.key).join(',') === 'gw-good',
+      `${forced.status} ${stub.calls.map((call) => call.key).join(',')}`)
+    check('回显仍是 peak（它确实被服务了，只是退回按时间选表）',
+      forced.json?.model === 'peak', forced.json?.model)
+  } finally {
+    await svc.stop()
+  }
+}
+
+{
+  // Both tables empty is still the caller's problem to fix, and still a 503: there
+  // is nothing left to fall back to.
+  const { svc, base, headers } = await startPinned(PIN_OFF, { peakOrder: [], offPeakOrder: [] })
+  try {
+    const none = await post(`${base}/v1/chat/completions`,
+      { model: 'off-peak', messages: [{ role: 'user', content: 'ping' }] }, headers)
+    check('两张表都空 → 仍是 503「no route is configured」', none.status === 503, `${none.status} ${none.text.slice(0, 120)}`)
+    check('空表不影响 /state 与语境的形状',
+      svc.admin.state().timeSlot?.northbound?.models?.length === 3)
+  } finally {
+    await svc.stop()
+  }
+}
+
+{
+  // enabled=false is "plain proxy, no policy": the resolved context still picks
+  // which row goes first — one call, no retry, no chain.
+  const { svc, base, headers } = await startPinned(PIN_OFF, { enabled: false })
+  try {
+    stub.keyStatus = { 'gw-good': 503, 'gw-broken': 200 }
+    stub.calls.length = 0
+    await post(`${base}/v1/chat/completions`,
+      { model: 'off-peak', messages: [{ role: 'user', content: 'ping' }] }, headers)
+    check('enabled=false + off-peak：只打低谷表第一行一次（dsv4），不重试',
+      stub.calls.map((call) => call.key).join(',') === 'gw-good', stub.calls.map((call) => call.key).join(','))
+    stub.calls.length = 0
+    await post(`${base}/v1/chat/completions`,
+      { model: 'peak', messages: [{ role: 'user', content: 'ping' }] }, headers)
+    check('enabled=false + peak：改打高峰表第一行一次（coclaw）',
       stub.calls.map((call) => call.key).join(',') === 'gw-broken', stub.calls.map((call) => call.key).join(','))
   } finally {
     await svc.stop()

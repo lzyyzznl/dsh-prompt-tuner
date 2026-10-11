@@ -73,7 +73,7 @@
 
 | 面 | 地址 | 说明 |
 | --- | --- | --- |
-| OpenAI 兼容 | `POST http://127.0.0.1:8790/v1/chat/completions`（`GET /v1/models`） | 把任何 OpenAI 客户端/agent 的 `baseURL` 指过来即可；**只服务 `auto` 一个模型名**，入参出参按参照契约（见下） |
+| OpenAI 兼容 | `POST http://127.0.0.1:8790/v1/chat/completions`（`GET /v1/models`） | 把任何 OpenAI 客户端/agent 的 `baseURL` 指过来即可；对外**只服务三个模型名** `auto` / `peak` / `off-peak`，入参出参按参照契约（见下） |
 | 管理页 | `http://127.0.0.1:8790/` | 配置供应商与密钥、顺序表、熔断参数；看实时熔断表、最近切换与统计 |
 | 管理 API | `POST/GET http://127.0.0.1:8790/admin/api/{state,config,reset,probe,models,keys/restore,converters}` | 管理页用的接口，需要 `X-Router-Token`（页面自带，令牌在配置文件里） |
 | 存活 | `GET /healthz` | 插件用它判断该接入还是该拉起 |
@@ -94,9 +94,17 @@
 }
 ```
 
-**北向只有 `auto` 一个模型**：调用方不需要知道（也无从影响）里面有哪些供应商和模型，选中谁是**路由规则**的事。`GET /v1/models` 也只广告这一条。
+**北向只服务三个模型名，且它们选的是「时段语境」而不是某一行**：调用方不需要知道（也无从影响）里面有哪些供应商和模型，选中谁是**路由规则**的事。`GET /v1/models` 就广告这三条，管理页「路由」页签与插件只读页签也列出它们。
 
-- **`model` 字段是装饰**：写 `auto`、写旧模型名（`deepseek-v4-flash`）、写 `maas-dsv4/deepseek-v4-flash`、写错、甚至不写，行为都一样——名字被**忽略**（不是被拒绝），照常按规则服务。这样已有客户端不会因为改名而突然报错；不过名字跟 `auto` 不一致时会记一条 `warn` 日志，方便发现过期的配置。
+| `model` | 用哪张顺序表 | 什么时候用 |
+| --- | --- | --- |
+| `auto` | 日历决定：高峰表或低谷表 | 默认。调用方不想操心时段 |
+| `peak` | 强制高峰表 | 调用方自己知道这单就该按高峰试序走 |
+| `off-peak` | 强制低谷表 | 批量/不着急的活，明确想走空闲时段那张表 |
+
+- **点名语境有效，点名内部行无效**：`peak` / `off-peak`（`offpeak`、大小写与首尾空白都算同义词）会**压过时钟**，直接用对应的那张表；除此之外没有任何「按名字匹配到某一行」的入口——写 `deepseek-v4-flash`、写 `maas-dsv4/deepseek-v4-flash`、写错、甚至不写，一律当 `auto` 服务（**不是被拒绝**），并记一条 `warn` 日志，方便发现过期的客户端配置。
+- **点名的表是空的就退回 `auto`**：不报错、也不静默换到另一张表；只有当两张表都空时才 503（`no route is configured`）。
+- **回显是服务时的那个规范名**：非流式响应与每个 SSE 分片的 `model` 只可能是 `auto` / `peak` / `off-peak`，绝不泄漏实际作答的供应商/模型（想看实际走了谁，去管理页或 `/state`，那是运维面）。
 - **当前时段（高峰/低谷）的那张顺序表就是候选池**：它决定先试哪一行，之后按排好的顺序往后走，**回绕**——顺序表是池子加偏好，不是单向链表。切换对调用方**透明**：只要上游还没吐出第一个字节，失败的那一跳不会出现在响应里。
 - **回显也是 `auto`**：非流式响应与每个 SSE 分片的 `model` 一律是 `auto`，不会泄漏实际作答的供应商/模型（想看实际走了谁，去管理页或 `/state`，那是运维面）。
 - **`enabled: false`（纯代理）**：规则仍然决定先试哪一行，但只打一次、不重试也不记熔断。
@@ -239,12 +247,12 @@ defineConverter({ id, label, match, toUpstream, fromUpstream, fromUpstreamChunk,
 ### 自检
 
 ```sh
-npm run check:service   # 415 项：桩上游 + 真服务 + 真 socket，离线、零 token
-npm run check:ui        # 99 项：管理页（假 DOM 跑真脚本），离线、零 token
+npm run check:service   # 438 项：桩上游 + 真服务 + 真 socket，离线、零 token
+npm run check:ui        # 103 项：管理页（假 DOM 跑真脚本），离线、零 token
 npm run check:live      # 28 项：对真实网关的端到端实测，需网络与密钥，非离线自检
 ```
 
-覆盖转换器的入参/出参映射、熔断与切换、重试、坏响应、管理面鉴权、配置校验与迁移、转换器注册表、SSE 解析、**按时段选路**、以及**插件真的能把它拉起来并转达**。
+覆盖转换器的入参/出参映射、熔断与切换、重试、坏响应、管理面鉴权、配置校验与迁移、转换器注册表、SSE 解析、**按时段选路与三个对外模型名**、以及**插件真的能把它拉起来并转达**。
 另有 `npm run check:live`：对**真实网关**的端到端实测（28 项，需要网络、需要你自己在凭据库里配好那两个 ref，会花真实 token），所以它**故意不进 `npm run check`**；结论记在历史改进记录里。
 
 ## 安装
@@ -256,7 +264,7 @@ dsh plugin add github:lzyyzznl/dsh-prompt-tuner
 仓库根有 `cordis.patch.yml`（一条 `insert`），`package.json` 声明 `dsh.bundle.patch` 与 `dsh.client.platform=web`；不含构建步骤，`lib/` 即源码。
 
 ```sh
-npm run check        # 自检（847 项），不需要本机装 DSH
+npm run check        # 自检（855 项），不需要本机装 DSH
 npm run eval:prompt  # 三臂盲评：只打印计划，加 --live / --judge 才发真实请求
 npm run eval:attribution  # 归因审计：读已有运行记录，量「改写加了什么用户没提的东西」
 ```
