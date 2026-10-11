@@ -652,7 +652,8 @@ function fixtureState() {
     blacklist: [blocked],
     timeSlot: {
       flavor: 'off-peak',
-      status: { status: 'off-peak', weekday: 7, weekend: true, holiday: false, date: '2026-10-11', minutes: 750, label: '低谷' },
+      status: { status: 'off-peak', weekday: 7, weekend: true, holiday: false, date: '2026-10-11', minutes: 750, label: '低谷', workday: false, source: 'builtin', info: '' },
+      calendar: { enabled: false, source: 'builtin', cached: null, lastError: null },
       order: {
         peak: [
           { provider: 'alpha', model: 'alpha-small' },
@@ -1311,7 +1312,7 @@ const lineOf = async (state) => {
 const peakState = fixtureState()
 peakState.timeSlot = {
   flavor: 'peak',
-  status: { status: 'peak', weekday: 3, weekend: false, holiday: false, date: '2026-10-14', minutes: 600, label: '高峰' },
+  status: { status: 'peak', weekday: 3, weekend: false, holiday: false, date: '2026-10-14', minutes: 600, label: '高峰', workday: true, source: 'builtin', info: '' },
   order: {
     peak: [
       { provider: 'alpha', model: 'alpha-small' },
@@ -1336,7 +1337,7 @@ check('高峰行试序按高峰顺序表展示（alpha → beta → ghost）',
 const offState = fixtureState()
 offState.timeSlot = {
   flavor: 'off-peak',
-  status: { status: 'off-peak', weekday: 7, weekend: true, holiday: false, date: '2026-10-11', minutes: 750, label: '低谷' },
+  status: { status: 'off-peak', weekday: 7, weekend: true, holiday: false, date: '2026-10-11', minutes: 750, label: '低谷', workday: false, source: 'builtin', info: '' },
   order: {
     peak: [
       { provider: 'alpha', model: 'alpha-small' },
@@ -1359,12 +1360,37 @@ check('低谷：说明行以「当前=低谷」开头并展示低谷试序（不
 const emptyState = fixtureState()
 emptyState.timeSlot = {
   flavor: 'peak',
-  status: { status: 'peak', weekday: 3, weekend: false, holiday: false, date: '2026-10-14', minutes: 600, label: '高峰' },
+  status: { status: 'peak', weekday: 3, weekend: false, holiday: false, date: '2026-10-14', minutes: 600, label: '高峰', workday: true, source: 'builtin', info: '' },
   order: { peak: [], offPeak: [] }
 }
 const emptyLine = await lineOf(emptyState)
 check('某张表为空时链上显示「无」，页面不报错',
   emptyLine.text !== undefined && emptyLine.text.includes(strings.zh.none), emptyLine.text)
+
+check('内置表判定时，说明行注明是内置节假日表（回退口径）',
+  peakLine.text.includes(strings.zh.timeLineSourceBuiltin), peakLine.text)
+
+// 补班周六：外部工作日接口说是工作日 —— 说明行必须点出真正下判断的是谁，
+// 否则一个「周六 = 高峰」的结论看起来就是错的。
+const makeupState = fixtureState()
+makeupState.timeSlot = {
+  flavor: 'peak',
+  status: { status: 'peak', weekday: 6, weekend: true, holiday: false, date: '2026-10-10', minutes: 600, label: '高峰', workday: true, source: 'api', info: '国庆节后补班' },
+  calendar: { enabled: true, source: 'api', cached: { date: '2026-10-10', workday: true, info: '国庆节后补班', week: '周六', fetchedAt: '2026-10-10T02:00:00.000Z' }, lastError: null },
+  order: {
+    peak: [{ provider: 'ghost', model: 'ghost-1' }],
+    offPeak: [{ provider: 'alpha', model: 'alpha-small' }]
+  }
+}
+const makeupLine = await lineOf(makeupState)
+check('补班日：说明行说「当前=高峰」并注明是外部工作日接口、带补班名称',
+  makeupLine.text !== undefined && makeupLine.text.includes(strings.zh.timeLinePeak.split('{when}')[0])
+  && makeupLine.text.includes('2026-10-10 10:00')
+  && makeupLine.text.includes('外部工作日接口') && makeupLine.text.includes('国庆节后补班')
+  && makeupLine.text.includes('ghost'),
+  makeupLine.text)
+check('补班日不再出现「内置节假日表（回退）」这句（不能用回退口径解释高峰）',
+  !makeupLine.text.includes(strings.zh.timeLineSourceBuiltin), makeupLine.text)
 
 const routedPage = await lineOf(peakState)
 const routingLive = routedPage.page.document.querySelector('#routing-body p.hint')

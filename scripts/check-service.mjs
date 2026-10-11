@@ -493,7 +493,10 @@ writeFileSync(process.env.ROUTER_SERVICE_CONFIG, `${JSON.stringify({
 const { startService, READY_PREFIX, parseArgs } = await import('../lib/service/main.js')
 const { isLoopback } = await import('../lib/service/server.js')
 const quiet = { error() {}, warn() {}, info() {}, debug() {} }
-let service = await startService({ listen: true, poll: false, logger: quiet })
+// `calendarFetch: null` is not decoration: the external workday calendar is the
+// one outbound dependency of this service, and the suite must stay provably
+// offline, so these long-lived services run on the built-in holiday table.
+let service = await startService({ listen: true, poll: false, logger: quiet, calendarFetch: null })
 let base = `http://127.0.0.1:${service.bound.port}`
 const adminHeaders = { 'x-router-token': token }
 
@@ -1639,7 +1642,7 @@ const restartPort = await freePort()
 const restartDoc = JSON.parse(readFileSync(process.env.ROUTER_SERVICE_CONFIG, 'utf8'))
 restartDoc.server.port = restartPort
 writeFileSync(process.env.ROUTER_SERVICE_CONFIG, `${JSON.stringify(restartDoc, null, 2)}\n`)
-service = await startService({ listen: true, poll: false, logger: quiet })
+service = await startService({ listen: true, poll: false, logger: quiet, calendarFetch: null })
 base = `http://127.0.0.1:${service.bound.port}`
 check('新实例绑定了配置里的新端口', service.bound.port === restartPort, `${service.bound.port} vs ${restartPort}`)
 const afterRestartState = service.admin.state()
@@ -1959,7 +1962,206 @@ check('两张表可分别写入',
 check('写上去的行没有任何档位数字字段',
   twoLists.config.router.peakOrder.every((row) => row.tier === undefined && row.priority === undefined))
 
-/* \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 25. live: the two tables drive the chain \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
+/* ───────────────────────── 24b. the workday calendar ───────────────────────── */
+
+section('24b. 工作日日历：外部接口是「补班修正层」，每天一问、失败回退内置表')
+
+const CAL = await import('../lib/service/calendar.js')
+const STORE = await import('../lib/service/state.js')
+
+/** A calendar HTTP answer, shaped exactly as the endpoint really answers. */
+const apiAnswer = (date, { workday, info, week = '', status = 1 } = {}) => ({
+  ok: true,
+  status: 200,
+  async json() {
+    return {
+      status,
+      date,
+      info: info ?? (workday ? '工作日' : '非工作日'),
+      week,
+      is_workingday: status === 1 ? (workday ? 1 : 0) : undefined,
+    }
+  },
+})
+
+/** A fetch stub that records every URL and answers per date. */
+function calendarFetch(byDate, fallback = null) {
+  const stubFn = async (url) => {
+    stubFn.calls.push(url)
+    const date = String(url).split('date=')[1] ?? ''
+    const answer = byDate[date] ?? fallback
+    if (answer === null || answer === undefined) throw new Error('offline')
+    if (typeof answer === 'function') return answer(url)
+    return answer
+  }
+  stubFn.calls = []
+  return stubFn
+}
+
+// -- 补班日：内置表说周末，外部接口说工作日 → 高峰 -------------------------
+// 2026-10-10 is a Saturday that the annual arrangement turns into a workday.
+{
+  const calls = calendarFetch({ '2026-10-10': apiAnswer('2026-10-10', { workday: true, info: '国庆节后补班', week: '周六' }) })
+  const cal = CAL.createWorkdayCalendar({ now: () => bj('2026-10-10 10:00'), fetch: calls })
+  const before = cal.status()
+  check('刷新前：内置表把补班周六当周末 → 低谷（内置表口径的已知短板）',
+    before.status === 'off-peak' && before.workday === false && before.source === 'builtin' && before.weekend === true,
+    JSON.stringify(before))
+  await cal.refresh()
+  const after = cal.status()
+  check('刷新后：外部接口说是工作日 → 补班日 10:00 判高峰',
+    after.status === 'peak' && after.workday === true && after.source === 'api' && after.info === '国庆节后补班',
+    JSON.stringify(after))
+  check('query 打的是 /workingday/api 并带上北京日期',
+    calls.calls.length === 1 && calls.calls[0].includes('/workingday/api?date=2026-10-10'), calls.calls.join('|'))
+  const again = await cal.refresh()
+  check('同一天再刷新不再请求（一天一问）', again !== null && calls.calls.length === 1, String(calls.calls.length))
+}
+
+// -- 反方向：外部接口说这个工作日不上班 → 全天低谷 --------------------------
+{
+  const calls = calendarFetch({ '2026-10-14': apiAnswer('2026-10-14', { workday: false, info: '调休放假', week: '周三' }) })
+  const cal = CAL.createWorkdayCalendar({ now: () => bj('2026-10-14 10:00'), fetch: calls })
+  check('刷新前：工作日 + 高峰时段 = 高峰（内置表）', cal.status().status === 'peak')
+  await cal.refresh()
+  const v = cal.status()
+  check('刷新后：外部接口说这天不上班 → 工作日 10:00 也判低谷',
+    v.status === 'off-peak' && v.workday === false && v.source === 'api' && v.weekend === false && v.holiday === false,
+    JSON.stringify(v))
+}
+
+// -- 高峰窗口的边界只由「工作日 + 时刻」决定 -------------------------------
+{
+  const at = (text) => CAL.createWorkdayCalendar({ now: () => bj(text), fetch: null }).status().status
+  check('工作日窗口边界：08:59 低谷、09:00 高峰、11:59 高峰、12:00 低谷',
+    at('2026-10-14 08:59') === 'off-peak' && at('2026-10-14 09:00') === 'peak'
+    && at('2026-10-14 11:59') === 'peak' && at('2026-10-14 12:00') === 'off-peak')
+  check('工作日窗口边界：13:59 低谷、14:00 高峰、17:59 高峰、18:00 低谷',
+    at('2026-10-14 13:59') === 'off-peak' && at('2026-10-14 14:00') === 'peak'
+    && at('2026-10-14 17:59') === 'peak' && at('2026-10-14 18:00') === 'off-peak')
+  const rest = CAL.createWorkdayCalendar({
+    now: () => bj('2026-10-11 10:00'),
+    fetch: calendarFetch({ '2026-10-11': apiAnswer('2026-10-11', { workday: false, info: '周日' }) }),
+  })
+  await rest.refresh()
+  check('非工作日即使正在高峰时段也是低谷', rest.status().status === 'off-peak' && rest.status().workday === false,
+    JSON.stringify(rest.status()))
+}
+
+// -- 缓存跨天失效：昨天的答案绝不拿来判今天 ---------------------------------
+{
+  const calls = calendarFetch({
+    '2026-10-10': apiAnswer('2026-10-10', { workday: true, info: '节后补班' }),
+    '2026-10-11': apiAnswer('2026-10-11', { workday: false, info: '周日' }),
+  })
+  let clock = bj('2026-10-10 10:00')
+  const cal = CAL.createWorkdayCalendar({ now: () => clock, fetch: calls })
+  await cal.refresh()
+  check('补班周六问出工作日（source=api）', cal.status().source === 'api' && cal.status().workday === true)
+  clock = bj('2026-10-11 10:00')
+  check('跨到第二天：昨天的答案立刻作废，先退回内置表（周日 → 低谷）',
+    cal.status().source === 'builtin' && cal.status().status === 'off-peak', JSON.stringify(cal.status()))
+  await cal.refresh()
+  check('跨天后重新问一次，用的是新日期',
+    cal.status().source === 'api' && cal.status().workday === false && calls.calls.length === 2, calls.calls.join('|'))
+}
+
+// -- 每一种失败都回退内置表，且不会把接口打爆 -------------------------------
+{
+  const failures = {
+    'HTTP 500': async () => ({ ok: false, status: 500, async json() { return {} } }),
+    '坏 JSON': async () => ({ ok: true, status: 200, async json() { throw new Error('not json') } }),
+    '非 JSON 对象': async () => ({ ok: true, status: 200, async json() { return 'nope' } }),
+    '网络异常': async () => { throw new Error('ECONNREFUSED') },
+    '答的是别的日期': async () => ({ ok: true, status: 200, async json() { return { status: 1, date: '2026-01-01', info: '元旦', is_workingday: 1 } } }),
+  }
+  let all = true
+  const detail = []
+  for (const [label, answer] of Object.entries(failures)) {
+    const calls = calendarFetch({}, answer)
+    const cal = CAL.createWorkdayCalendar({ now: () => bj('2026-10-10 10:00'), fetch: calls })
+    const returned = await cal.refresh().then(() => 'resolved', () => 'rejected')
+    const v = cal.status()
+    if (!(returned === 'resolved' && v.source === 'builtin' && v.status === 'off-peak' && calls.calls.length === 1)) {
+      all = false
+      detail.push(`${label}:${returned},${v.source},${v.status},calls=${calls.calls.length}`)
+    }
+    await cal.refresh()
+    if (calls.calls.length !== 1) { all = false; detail.push(`${label}:retried=${calls.calls.length}`) }
+  }
+  check('HTTP 错、坏 JSON、网络异常都回退内置表，refresh 从不抛异常，且失败后先退避', all, detail.join(' '))
+}
+{
+  // 2026-10-14 is a plain Wednesday, so the built-in table says "workday" — the
+  // point is that a rate-limited endpoint must not overwrite that fact.
+  const calls = calendarFetch({}, apiAnswer('x', { workday: true, info: '已达请求限制，请48秒钟后再试', status: 0 }))
+  let clock = bj('2026-10-14 10:00')
+  const cal = CAL.createWorkdayCalendar({ now: () => clock, fetch: calls, retryMs: 30 * 60 * 1000 })
+  await cal.refresh()
+  check('status:0（限流）被当成失败，而不是「今天不上班」',
+    cal.status().source === 'builtin' && cal.status().workday === true && cal.snapshot().lastError.includes('已达请求限制'),
+    JSON.stringify({ status: cal.status(), snap: cal.snapshot() }))
+  clock += 60_000
+  await cal.refresh()
+  check('退避期内不再请求（限流不会被自己的重试打爆）', calls.calls.length === 1, String(calls.calls.length))
+  clock += 30 * 60 * 1000
+  await cal.refresh()
+  check('退避期满后再试一次', calls.calls.length === 2, String(calls.calls.length))
+  check('仍然失败时继续用内置表判定，绝不因此改变路由结果',
+    cal.status().source === 'builtin' && cal.status().status === 'peak', JSON.stringify(cal.status()))
+}
+{
+  const calls = calendarFetch({ '2026-10-10': apiAnswer('2026-10-10', { workday: true }) })
+  let clock = bj('2026-10-10 10:00')
+  const cal = CAL.createWorkdayCalendar({ now: () => clock, fetch: calls, retryMs: 1000 })
+  await cal.refresh()
+  clock += 5000
+  const again = await cal.refresh()
+  check('当天已缓存时，退避期过了也不重复问（一天一问只针对成功）',
+    again !== null && again.workday === true && calls.calls.length === 1, `calls=${calls.calls.length}`)
+}
+
+// -- fetch:null = 完全离线（自检与离线安装走这条路） ------------------------
+{
+  const cal = CAL.createWorkdayCalendar({ now: () => bj('2026-10-14 10:00'), fetch: null })
+  const refresh = await cal.refresh()
+  check('fetch:null 时 snapshot.enabled=false，refresh 直接空转',
+    cal.snapshot().enabled === false && cal.snapshot().source === 'builtin' && refresh === null)
+  check('fetch:null 仍给出完整判定（内置表口径，高峰时段照常高峰）',
+    cal.status().status === 'peak' && cal.status().source === 'builtin' && cal.status().workday === true)
+}
+
+// -- 缓存落在运行态文件里：重启不再问，坏值被丢弃 ---------------------------
+{
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-cal-'))
+  const stateFile = join(dir, 'state.json')
+  const calls = calendarFetch({ '2026-10-10': apiAnswer('2026-10-10', { workday: true, info: '国庆节后补班', week: '周六' }) })
+  const first = STORE.createStateStore({ file: stateFile })
+  const cal1 = CAL.createWorkdayCalendar({ now: () => bj('2026-10-10 10:00'), fetch: calls, store: first })
+  await cal1.refresh()
+  first.flush()
+  const onDisk = JSON.parse(readFileSync(stateFile, 'utf8'))
+  check('每日结论写进运行态文件',
+    onDisk.calendar?.date === '2026-10-10' && onDisk.calendar?.workday === true && onDisk.calendar?.info === '国庆节后补班',
+    JSON.stringify(onDisk.calendar))
+  const second = STORE.createStateStore({ file: stateFile })
+  const cal2 = CAL.createWorkdayCalendar({ now: () => bj('2026-10-10 10:00'), fetch: calendarFetch({}, null), store: second })
+  check('重启后直接用盘上的结论，不再请求外部接口（补班日仍是高峰）',
+    cal2.status().source === 'api' && cal2.status().status === 'peak' && cal2.status().info === '国庆节后补班',
+    JSON.stringify(cal2.status()))
+  writeFileSync(stateFile, JSON.stringify({ calendar: { date: 'not-a-date', workday: true } }))
+  const third = STORE.createStateStore({ file: stateFile })
+  const cal3 = CAL.createWorkdayCalendar({ now: () => bj('2026-10-10 10:00'), fetch: null, store: third })
+  check('盘上日历值是坏的 → 丢弃而不是采信（退回内置表）',
+    third.calendar() === null && cal3.status().source === 'builtin' && cal3.status().status === 'off-peak',
+    JSON.stringify({ stored: third.calendar(), status: cal3.status() }))
+  const st = STORE.createStateStore({ file: join(dir, 'state2.json') })
+  check('setCalendar 拒绝不可用的条目（宁可没有，也不留一个假结论）',
+    st.setCalendar({ workday: true }) === null && st.calendar() === null)
+  rmSync(dir, { recursive: true, force: true })
+}
+
+/* ──────────────────────── 25. live: the two tables drive the chain ──────────────────────── */
 
 section('25. 真服务：高峰用高峰表、低谷用低谷表（注入时钟，任意时刻都确定）')
 
@@ -1989,12 +2191,15 @@ const PIN_DOC = (port, routerOverrides = {}) => ({
   converters: ['maas'],
 })
 
-async function startPinned(nowAt, routerOverrides = {}) {
+async function startPinned(nowAt, routerOverrides = {}, extra = {}) {
   const port = await freePort()
-  const stateFile = join(process.env.DSH_HOME, `pinned-${port}.json`)
+  const stateFile = extra.stateFile ?? join(process.env.DSH_HOME, `pinned-${port}.json`)
   const doc = PIN_DOC(port, routerOverrides)
-  const svc = await startService({ listen: true, poll: false, logger: quiet, config: doc, stateFile, now: () => nowAt })
-  return { svc, base: `http://127.0.0.1:${port}`, headers: { 'x-router-token': 'pin-token' } }
+  const svc = await startService({
+    listen: true, poll: false, logger: quiet, config: doc, stateFile, now: () => nowAt,
+    calendarFetch: extra.calendarFetch ?? null,
+  })
+  return { svc, base: `http://127.0.0.1:${port}`, headers: { 'x-router-token': 'pin-token' }, stateFile }
 }
 
 // -- 低谷时刻：按低谷表先试 dsv4，失败后落到第二位 -------------------------
@@ -2095,6 +2300,94 @@ async function startPinned(nowAt, routerOverrides = {}) {
     check('enabled=false 仍是纯代理：只试当前表第一行一次（coclaw），不重试',
       stub.calls.map((call) => call.key).join(',') === 'gw-broken',
       stub.calls.map((call) => call.key).join(','))
+  } finally {
+    await svc.stop()
+  }
+}
+
+// -- 外部日历改写「今天是高峰还是低谷」：同一时刻、同一批表，只换日历 ------
+{
+  // 2026-10-10 is a Saturday that the annual arrangement turned into a workday.
+  // The built-in table reads it as a weekend; the external calendar says it is a
+  // compulsory workday. Same clock, same tables — only the calendar differs.
+  const PIN_MAKEUP = bj('2026-10-10 10:00')
+  const calendarUrls = []
+  const fetchCalendar = async (url) => {
+    calendarUrls.push(url)
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return { status: 1, date: '2026-10-10', info: '国庆节后补班', week: '周六', is_workingday: 1 }
+      },
+    }
+  }
+  const { svc, base, headers } = await startPinned(PIN_MAKEUP, {}, { calendarFetch: fetchCalendar })
+  try {
+    stub.keyStatus = { 'gw-good': 503 }
+    stub.calls.length = 0
+    // The boot refresh is a background job; awaiting it (a no-op once cached)
+    // makes the assertion deterministic instead of a race.
+    await svc.calendar.refresh()
+    const st = svc.admin.state().timeSlot
+    check('补班日的真服务：外部日历说工作日 → flavor=peak（内置表会判低谷）',
+      st?.flavor === 'peak' && st?.status?.source === 'api' && st?.status?.workday === true
+      && st?.status?.info === '国庆节后补班' && st?.status?.weekend === true && st?.status?.date === '2026-10-10',
+      JSON.stringify(st?.status))
+    check('真服务：/state 带出日历自身的状态（来源、缓存条目、最近一次失败）',
+      st?.calendar?.enabled === true && st?.calendar?.source === 'api' && st?.calendar?.cached?.date === '2026-10-10'
+      && st?.calendar?.cached?.workday === true && (st?.calendar?.lastError ?? null) === null,
+      JSON.stringify(st?.calendar))
+    check('真服务向外部日历报的是北京日期，且一天只问一次',
+      calendarUrls.length === 1 && calendarUrls[0].includes('/workingday/api?date=2026-10-10'), calendarUrls.join('|'))
+    await post(`${base}/v1/chat/completions`, { model: 'm-switch', messages: [{ role: 'user', content: 'ping' }] }, headers)
+    check('补班日的请求真的按高峰表走：coclaw 先，dsv4 完全不碰',
+      stub.calls.map((call) => call.key).join(',') === 'gw-broken', stub.calls.map((call) => call.key).join(','))
+  } finally {
+    await svc.stop()
+  }
+}
+{
+  // Same instant, same tables, no external calendar: the built-in table wins and
+  // the Saturday is off-peak. This is what makes the case above meaningful.
+  const PIN_MAKEUP = bj('2026-10-10 10:00')
+  const { svc, base, headers } = await startPinned(PIN_MAKEUP)
+  try {
+    stub.keyStatus = { 'gw-good': 503 }
+    stub.calls.length = 0
+    const st = svc.admin.state().timeSlot
+    check('同一时刻关掉外部日历：内置表把周六判低谷，source=builtin',
+      st?.flavor === 'off-peak' && st?.status?.source === 'builtin' && st?.calendar?.enabled === false,
+      JSON.stringify({ status: st?.status, calendar: st?.calendar }))
+    await post(`${base}/v1/chat/completions`, { model: 'm-switch', messages: [{ role: 'user', content: 'ping' }] }, headers)
+    check('同一时刻因此按低谷表走：dsv4 先（失败再落 coclaw）',
+      stub.calls.map((call) => call.key).join(',') === 'gw-good,gw-broken', stub.calls.map((call) => call.key).join(','))
+  } finally {
+    await svc.stop()
+  }
+}
+{
+  // A rate-limited endpoint (status: 0) must never turn a workday into a holiday:
+  // the built-in table keeps deciding, and the failure is reported.
+  const PIN_MAKEUP = bj('2026-10-14 10:00')
+  const fetchLimited = async () => ({
+    ok: true,
+    status: 200,
+    async json() { return { status: 0, info: '已达请求限制，请48秒钟后再试' } },
+  })
+  const { svc, base, headers } = await startPinned(PIN_MAKEUP, {}, { calendarFetch: fetchLimited })
+  try {
+    stub.keyStatus = { 'gw-good': 503 }
+    stub.calls.length = 0
+    await svc.calendar.refresh()
+    const st = svc.admin.state().timeSlot
+    check('限流时真服务仍按内置表判定（周三 10:00 = 高峰），并如实上报失败原因',
+      st?.flavor === 'peak' && st?.status?.source === 'builtin'
+      && String(st?.calendar?.lastError ?? '').includes('请求限制'),
+      JSON.stringify({ status: st?.status, calendar: st?.calendar }))
+    await post(`${base}/v1/chat/completions`, { model: 'm-switch', messages: [{ role: 'user', content: 'ping' }] }, headers)
+    check('限流不影响选路：照旧按高峰表试 coclaw',
+      stub.calls.map((call) => call.key).join(',') === 'gw-broken', stub.calls.map((call) => call.key).join(','))
   } finally {
     await svc.stop()
   }
