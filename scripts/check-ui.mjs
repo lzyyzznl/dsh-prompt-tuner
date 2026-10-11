@@ -1289,4 +1289,51 @@ check('英文环境下开关也有文案（不是空按钮）',
     .includes(strings.en.businessRuleOn),
   bizEn.document.querySelector('#sec-routing button[data-act="toggle-business"]').textContent)
 
+/* ───────────────────────── 12. time-slot-line 文案 ───────────────────────── */
+
+section('12. 时段说明行：内置高峰规则开启时不说「无命中时段」')
+
+const lineOf = async (state) => {
+  const page = bootPage({ state })
+  // The state arrives over the async /state fetch; let it land before reading.
+  await page.settle()
+  return page.document.getElementById('time-slot-line')?.textContent
+}
+
+const peakState = fixtureState()
+peakState.timeSlot = {
+  source: 'business',
+  businessRule: true,
+  label: '\u9ad8\u5cf0\u89c4\u5219',
+  status: { status: 'peak', weekday: 3, weekend: false, holiday: false, date: '2026-10-14' },
+  effective: { alpha: 1, beta: 2 },
+}
+const peakLine = await lineOf(peakState)
+check('高峰时段：说明行说「高峰规则生效」而不是「命中时段」',
+  peakLine !== undefined && peakLine.includes(strings.zh.businessRulePeak.split('{count}')[0])
+  && !peakLine.includes(strings.zh.businessRuleIdle),
+  peakLine)
+
+const idleState = fixtureState()
+idleState.timeSlot = {
+  source: 'business',
+  businessRule: true,
+  label: '',
+  status: { status: 'off-peak', weekday: 7, weekend: true, holiday: false, date: '2026-10-11' },
+  effective: {},
+}
+const idleLine = await lineOf(idleState)
+check('闲置时段：说明行说「已开启/闲置」而不是误导的「无命中时段」',
+  idleLine !== undefined && idleLine.includes(strings.zh.businessRuleIdle)
+  && !idleLine.includes(strings.zh.timeSlotIdle),
+  idleLine)
+
+// Fall back to the per-window wording for the custom-slots source.
+const slotsIdle = fixtureState()
+slotsIdle.timeSlot = { source: 'slots', businessRule: false, label: '', status: null, effective: {} }
+const slotsIdleLine = await lineOf(slotsIdle)
+check('自定义时段源：没有命中窗口时仍沿用原「无命中时段」文案',
+  slotsIdleLine !== undefined && slotsIdleLine.includes(strings.zh.timeSlotIdle),
+  slotsIdleLine)
+
 finish()

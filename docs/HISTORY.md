@@ -1013,7 +1013,7 @@ models:
 | `lib/service/ui.js` | 服务自带的管理页：供应商/密钥/顺序表/熔断参数可编辑，实时熔断表与最近事件可看 |
 | `lib/service/time-slots.js` | 时段与内置高峰规则：`HH:mm` 解析/格式化、跨午夜窗口、最具体者胜、**档位升序排名**（`0` 移出候选）、北京时间峰谷与节假日表（纯函数、零 import） |
 | `scripts/check-service.mjs` | 服务自检：桩上游 + 真服务 + 真 socket，416 项，离线零 token |
-| `scripts/check-ui.mjs` | 管理页自检：假 DOM 跑真页面脚本，85 项，离线零 token |
+| `scripts/check-ui.mjs` | 管理页自检：假 DOM 跑真页面脚本，88 项，离线零 token |
 | `scripts/check-live.mjs` | 真实网关端到端实测，28 项，需网络与凭据，**不**随 `npm run check` 跑 |
 | `lib/store.js` | 配置读写（原子写、容错读）+ 旁路历史存储（每会话分片、裁剪） |
 | `lib/http.js` | JSON 信封、有上限的 body 读取、回环信任围栏 |
@@ -1027,7 +1027,7 @@ models:
 ```sh
 npm run check                 # 847 项，含宿主通知/标题/路由服务与设置页契约
 npm run check:service         # 416 项，路由服务本体（桩上游，离线）
-npm run check:ui              # 85 项，管理页脚本（假 DOM）
+npm run check:ui              # 88 项，管理页脚本（假 DOM）
 npm run check:shape           # 对**已安装**的 DSH 复核旁路提问的消息形状（需要本机有 DSH）
 npm run check:title           # 对**已安装**的 DSH 复核标题重总结（真会话、真投影，不调模型）
 node scripts/bench.mjs --runs 3
@@ -1041,7 +1041,7 @@ node scripts/bench.mjs --runs 3
 
 **时段优先级**（独立模块 + 真服务两层）：`lib/service/time-slots.js` 是零依赖纯函数半边——`parseClock`/`formatClock` 的合法与非法写法、`clockInside` 的普通区间与跨午夜（含起点不含终点）、`activeRuleAt` 的「窗口最短 → 先定义者」（含「同起点不同长度时整点不翻回宽规则」的回归守卫）、`applyTimeOrder` 的稳定二分与 `pin: 1`（首行不被时钟撬动）、`providerPriorityAt` 对未点名者返回 null、`validateTimeSlots` 拒坏 HH:mm / 起止相同 / 越界或非整数档位 / 空供应商表 / 非数组 / 超上限、`normalizeTimeSlots` 的读时修复（丢坏留好并封顶）；再接真服务验证接线：`normalizeConfig` 不被白名单丢掉、`applyConfigPatch` 写入合法规则而拒绝起止相同者，以及**端到端选路**——无时段时第一条失败后按静态顺序落到第二家、时段命中时被点名的供应商越过静态顺序而在匹配行之后先被尝试、档位 0 的供应商本轮一个请求都不发且 `/state` 的 `effective` 如实报 0 并在事件流里留下 `kind=timeslot`、`/state` 的 `label`/`at` 形状、以及清空时段后回到静态顺序。管理页那一侧由 `check:ui` 覆盖：时段表渲染出规则（含**已不存在的供应商仍渲染并标注未注册**）、`data-act` 与委托分支一一对应、以及「输入 70 提交 0.7」这类保存链路不再被时段校验误伤。
 
-**内置高峰规则**（纯函数判定 + 真服务接线 + 管理页开关三层）：`beijingPeakStatus` 覆盖工作日 `09:00`/`11:59`/`12:00`/`14:00`/`17:59`/`18:00` 的每个边界、上午/下午两段、工作日 `08:59` 与 `23:00` 的空闲、周末整天（`weekend` 标志）、**周内的法定节假日整天**（国庆、劳动节、元旦、春节各取一天）、节日区间两端、**跨周的春节连休**、区间结束后的第一个工作日立刻恢复高峰、调休上班的周末**不**被当成假日（按表判定不外推）、`isStatutoryHoliday` 可换表、坏时刻不抛异常；`effectiveBusinessPriority` 取每个供应商的最低档位并与窗口无关、空表/坏表退化为空映射；`partitionByRule` 在固定高峰时刻上验证「点名者按档位升序在前、未被点名者按静态序在后、档位 0 进 disabled、三家都点名时链顺序完全由档位决定」。配置接线：`normalizeConfig` 缺省 `false`、坏值读时兜底 `false`，`applyConfigPatch` 可写回 `false`、拒非布尔（字符串/数字/`null`）、且**只发 `timeSlots` 不会顺手改写 `businessRule`**；HTTP 面拒 `businessRule: 'on'` 并给出含 `boolean` 的原因。真服务（`check-service`）验证**开关切换**：关时仍走 `timeSlots` 且 `/state.source === 'slots'`、开时 `/state` 上报 `businessRule: true` / `source: 'business'` / 北京时间的 `status`（`weekend`、`holiday`、`date` 与纯函数逐字段一致），并按当前真实时刻分别断言高峰（被点名者前移、档位 0 停用、事件 `message === '高峰规则'`、`effective` 报 0）与空闲（静态顺序、无生效规则、`effective` 全 `null`）两条分支；再验证关掉开关**无需重启**立刻退回 `timeSlots`，以及开着开关但没有档位表时退化为恒等变换。管理页那一侧由 `check:ui` 覆盖：开关渲染在时段表**上方**（按文档顺序断言）、初始状态与 `/state.businessRule` 一致、`false` 与**缺省（老服务）**都渲染成未启用、点击翻转 `data-on`/`aria-pressed`/文案且不被轮询回滚、保存时 `businessRule` 随 `router` 一起提交而 `timeSlots` 照旧、**关掉提交的是显式 `false` 而不是缺省「保持」**、英文环境下也有文案；`check.mjs` 的设置页契约把新增的只读行登记进「六个页签行标签并集」的白名单，保证它既不被遗漏也不与其他页签重复。
+**内置高峰规则**（纯函数判定 + 真服务接线 + 管理页开关三层）：`beijingPeakStatus` 覆盖工作日 `09:00`/`11:59`/`12:00`/`14:00`/`17:59`/`18:00` 的每个边界、上午/下午两段、工作日 `08:59` 与 `23:00` 的空闲、周末整天（`weekend` 标志）、**周内的法定节假日整天**（国庆、劳动节、元旦、春节各取一天）、节日区间两端、**跨周的春节连休**、区间结束后的第一个工作日立刻恢复高峰、调休上班的周末**不**被当成假日（按表判定不外推）、`isStatutoryHoliday` 可换表、坏时刻不抛异常；`effectiveBusinessPriority` 取每个供应商的最低档位并与窗口无关、空表/坏表退化为空映射；`partitionByRule` 在固定高峰时刻上验证「点名者按档位升序在前、未被点名者按静态序在后、档位 0 进 disabled、三家都点名时链顺序完全由档位决定」。配置接线：`normalizeConfig` 缺省 `false`、坏值读时兜底 `false`，`applyConfigPatch` 可写回 `false`、拒非布尔（字符串/数字/`null`）、且**只发 `timeSlots` 不会顺手改写 `businessRule`**；HTTP 面拒 `businessRule: 'on'` 并给出含 `boolean` 的原因。真服务（`check-service`）验证**开关切换**：关时仍走 `timeSlots` 且 `/state.source === 'slots'`、开时 `/state` 上报 `businessRule: true` / `source: 'business'` / 北京时间的 `status`（`weekend`、`holiday`、`date` 与纯函数逐字段一致），并按当前真实时刻分别断言高峰（被点名者前移、档位 0 停用、事件 `message === '高峰规则'`、`effective` 报 0）与空闲（静态顺序、无生效规则、`effective` 全 `null`）两条分支；再验证关掉开关**无需重启**立刻退回 `timeSlots`，以及开着开关但没有档位表时退化为恒等变换；时段说明行（`#time-slot-line`）按 `source` 分支——`business` 且高峰显示「高峰规则生效」、`business` 且闲置显示「已开启/闲置时段」（不再出现误导的「当前无命中时段」）、自定义时段源仍沿用原文案。管理页那一侧由 `check:ui` 覆盖：开关渲染在时段表**上方**（按文档顺序断言）、初始状态与 `/state.businessRule` 一致、`false` 与**缺省（老服务）**都渲染成未启用、点击翻转 `data-on`/`aria-pressed`/文案且不被轮询回滚、保存时 `businessRule` 随 `router` 一起提交而 `timeSlots` 照旧、**关掉提交的是显式 `false` 而不是缺省「保持」**、英文环境下也有文案；`check.mjs` 的设置页契约把新增的只读行登记进「六个页签行标签并集」的白名单，保证它既不被遗漏也不与其他页签重复。
 
 **北向只服务 auto**（契约层 + 真服务两层）：`check.mjs` 验证对外常量（`NORTHBOUND_MODEL === 'auto'`、owner 是路由器自己）与候选展开改为「整张顺序表 × key」（同一 provider 的 key 相邻、`unitsForRow` 抛异常/返回空数组时退化为无 key 单位、空表无候选）；旧的点名矩阵（`buildChain` / `parseRouteName` / `resolveRoute` 的 `matched`/`provider`/`unknown`）随契约一起删除，所以 `npm run check` 少 7 项。`check-service` 的 `/v1/models` 断言改为「只有一条 `auto`、owner 是 `dsh-prompt-tuner`、窗口取候选最小值」，并新增「名字只是装饰」一节：点名一个**在表里**的模型名不再把它提到第一位（`co-claw` 仍从顺序表第一行开始）、瞎写的名字不再 404 而是照常服务、空字符串与**缺失 `model` 字段**都照常服务、回显一律 `auto`；`/v1/models` 的窗口用例在 `p-models` 单行配置下断言 `auto` 报的是上游发现的 3M（这条抓到了「默认值当初始下界把大窗口夹小」的实现 bug）。`partitionByRule` / `applyTimeOrder` 的纯函数用例改为断言档位升序、并列看静态位置、未点名者整体在后，并显式验证**多传的 `pin` 选项不再改变结果**（该概念已删除）；真服务侧的选路断言随之改为「档位 1 的供应商第一个被试」，`enabled: false` 保留为「规则取第一条直发、不重试不记账」。`check-live`（需真实网络与密钥，不在离线自检里）把目录断言改成单条 `auto`、回显断言改成 `auto`，并保留**故意发旧模型名**的请求以证明它仍被接受。
 
