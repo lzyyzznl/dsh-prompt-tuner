@@ -597,10 +597,14 @@ function fixtureState() {
     ],
     router: {
       enabled: true,
-      order: [
+      peakOrder: [
         { provider: 'alpha', model: 'alpha-small' },
         { provider: 'beta', model: 'beta-1' },
         { provider: 'ghost', model: 'ghost-1' }
+      ],
+      offPeakOrder: [
+        { provider: 'alpha', model: 'alpha-small' },
+        { provider: 'beta', model: 'beta-1' }
       ],
       retries: 3,
       failureThreshold: 2,
@@ -615,12 +619,7 @@ function fixtureState() {
       recoveryMode: 'probe',
       maxSwitches: 0,
       logLevel: 'info',
-      budget: 4,
-      businessRule: true,
-      timeSlots: [
-        { start: '09:00', end: '12:00', priority: { alpha: 1, beta: 0 } },
-        { start: '22:00', end: '02:00', priority: { ghost: 3 } }
-      ]
+      budget: 4
     },
     rows: [
       {
@@ -652,20 +651,25 @@ function fixtureState() {
     },
     blacklist: [blocked],
     timeSlot: {
-      at: '10:00',
-      label: '09:00-12:00',
-      rule: { start: '09:00', end: '12:00', priority: { alpha: 1, beta: 0 } },
-      source: 'slots',
-      status: null,
-      effective: { alpha: 1, beta: 0, ghost: null },
-      businessRule: true
+      flavor: 'off-peak',
+      status: { status: 'off-peak', weekday: 7, weekend: true, holiday: false, date: '2026-10-11', minutes: 750, label: '低谷' },
+      order: {
+        peak: [
+          { provider: 'alpha', model: 'alpha-small' },
+          { provider: 'beta', model: 'beta-1' },
+          { provider: 'ghost', model: 'ghost-1' }
+        ],
+        offPeak: [
+          { provider: 'alpha', model: 'alpha-small' },
+          { provider: 'beta', model: 'beta-1' }
+        ]
+      }
     },
     limits: {
       orderRows: 12, maxRetries: 20, failureThreshold: 100, minFailureRate: 0, maxFailureRate: 1,
       minSamples: 1, maxSamples: 100, minWindowSize: 1, maxWindowSize: 100, minWindowMs: 0,
       maxWindowMs: 3600000, minCooldownMs: 0, maxCooldownMs: 3600000, minCooldownFactor: 1,
-      maxCooldownFactor: 10, minHalfOpenSuccesses: 1, maxHalfOpenSuccesses: 10, minSwitches: 0, maxSwitches: 20,
-      timeSlots: 24
+      maxCooldownFactor: 10, minHalfOpenSuccesses: 1, maxHalfOpenSuccesses: 10, minSwitches: 0, maxSwitches: 20
     },
     recoveryModes: ['probe', 'immediate'],
     logLevels: ['silent', 'error', 'warn', 'info', 'debug']
@@ -977,7 +981,7 @@ section('7. 路由行切换供应商时只重建该行 datalist')
 
 const route = bootPage()
 await route.settle()
-const orderBody = route.document.querySelector('tbody[data-role="order-body"]')
+const orderBody = route.document.querySelector('tbody[data-role="route-body"][data-kind="peak"]')
 const routeRows = orderBody.querySelectorAll('tr')
 const firstRow = routeRows[0]
 const optionsOf = (tr) => tr.querySelector('datalist').querySelectorAll('option').map((node) => node.value)
@@ -1002,7 +1006,7 @@ const addRoute = bootPage()
 await addRoute.settle()
 const addRouteButton = addRoute.all('button[data-act="add-route"]')[0]
 for (let i = 0; i < 20; i += 1) addRoute.click(addRouteButton)
-const orderRows = addRoute.document.querySelector('tbody[data-role="order-body"]').querySelectorAll('tr')
+const orderRows = addRoute.document.querySelector('tbody[data-role="route-body"][data-kind="peak"]').querySelectorAll('tr')
 check('新增路由行不超过服务端的 orderRows 上限（12）', orderRows.length === 12, `rows=${orderRows.length}`)
 check('达到上限时给出提示',
   addRoute.document.getElementById('toasts').textContent
@@ -1183,157 +1187,190 @@ linkedState.providers.push({
 relink.setAnswer('config', { ...linkedState, removedOrderRows: [] })
 relink.click(relink.all('button[data-act="save-providers"]')[0])
 await relink.settle()
-const providerSelects = relink.document.querySelector('tbody[data-role="order-body"]')
+const providerSelects = relink.document.querySelector('tbody[data-role="route-body"][data-kind="peak"]')
   .querySelectorAll('select[data-field="provider"]')
 check('保存供应商后路由区的 provider 下拉反映了新的供应商集合',
   providerSelects[0].querySelectorAll('option').map((node) => node.value).includes('gamma'))
 check('新供应商的模型出现在路由行 datalist（切到它即重建）',
   (() => {
-    const row = relink.document.querySelector('tbody[data-role="order-body"]').querySelectorAll('tr')[0]
+    const row = relink.document.querySelector('tbody[data-role="route-body"][data-kind="peak"]').querySelectorAll('tr')[0]
     relink.select(row.querySelector('select[data-field="provider"]'), 'gamma')
     return row.querySelector('datalist').querySelectorAll('option').map((node) => node.value).join(',') === 'gamma-1'
   })())
 
-/* ───────────────────────── 11. business rule switch ───────────────────────── */
+/* ──────────────────────── 11. two order tables ──────────────────────── */
 
-section('11. 内置高峰规则开关：位置、状态、保存')
+section('11. 排序就是两张可拖动的顺序表（高峰/低谷），不出现数字档位')
 
-/** Every element under `root`, in document order (the fake DOM has no compareDocumentPosition). */
-const walkElements = (root, out = []) => {
-  for (const child of root.childNodes ?? []) {
-    if (child.nodeType === 1) {
-      out.push(child)
-      walkElements(child, out)
-    }
-  }
-  return out
-}
+const providerOf = (tr) => tr.querySelector('select[data-field="provider"]').value
 
-const biz = bootPage()
-await biz.settle()
-const bizSection = biz.document.querySelector('#sec-routing')
-const bizButton = bizSection.querySelector('button[data-act="toggle-business"]')
-const slotsBody = bizSection.querySelector('tbody[data-role="slots-body"]')
-check('路由页签渲染出内置高峰规则开关', bizButton !== null)
-check('开关的初始状态与 /state 的 businessRule 一致（fixture 里是 true）',
-  bizButton !== null && bizButton.getAttribute('data-on') === '1'
-  && bizButton.getAttribute('aria-pressed') === 'true'
-  && bizButton.textContent.includes(strings.zh.businessRuleOn),
-  bizButton ? `${bizButton.getAttribute('data-on')} / ${bizButton.textContent}` : 'missing')
-check('开关在时段表上方（文档顺序里先于 slots-body）',
-  bizButton !== null && slotsBody !== null
-  && (() => {
-    const flat = walkElements(bizSection)
-    return flat.indexOf(bizButton) < flat.indexOf(slotsBody)
-  })())
+const routePage = bootPage()
+await routePage.settle()
+const routingSection = routePage.document.querySelector('#sec-routing')
+const peakBody = routingSection.querySelector('tbody[data-role="route-body"][data-kind="peak"]')
+const offBody = routingSection.querySelector('tbody[data-role="route-body"][data-kind="off-peak"]')
+check('渲染出高峰与低谷两张顺序表', peakBody !== null && offBody !== null)
+check('高峰表行序来自 router.peakOrder（alpha,beta,ghost）',
+  peakBody.querySelectorAll('tr').length === 3
+  && [...peakBody.querySelectorAll('tr')].map(providerOf).join(',') === 'alpha,beta,ghost')
+check('低谷表行序来自 router.offPeakOrder（alpha,beta）',
+  offBody.querySelectorAll('tr').length === 2
+  && [...offBody.querySelectorAll('tr')].map(providerOf).join(',') === 'alpha,beta')
+check('两张表的行都可拖拽（draggable）',
+  [...peakBody.querySelectorAll('tr')].every((tr) => tr.getAttribute('draggable') === 'true'))
+check('页面上不再有内置高峰规则开关或时段表',
+  routingSection.querySelector('button[data-act="toggle-business"]') === null
+  && routingSection.querySelector('tbody[data-role="slots-body"]') === null
+  && routingSection.textContent.includes(strings.zh.peakOrderTitle))
 
-const bizOffState = fixtureState()
-bizOffState.router.businessRule = false
-const bizOff = bootPage({ state: bizOffState })
-await bizOff.settle()
-const bizOffButton = bizOff.document.querySelector('#sec-routing button[data-act="toggle-business"]')
-check('businessRule=false 时开关显示未启用（不写成已启用）',
-  bizOffButton !== null && bizOffButton.getAttribute('data-on') === '0'
-  && bizOffButton.textContent.includes(strings.zh.businessRuleOff),
-  bizOffButton ? `${bizOffButton.getAttribute('data-on')} / ${bizOffButton.textContent}` : 'missing')
-check('businessRule 缺失（老服务）时按未启用渲染，不报错',
-  (() => {
-    const legacy = fixtureState()
-    delete legacy.router.businessRule
-    delete legacy.timeSlot.businessRule
-    const page = bootPage({ state: legacy })
-    const node = page.document.querySelector('#sec-routing button[data-act="toggle-business"]')
-    return node !== null && node.getAttribute('data-on') === '0'
-  })())
+// up/down buttons move rows within their own table; a save carries both lists.
+const up = bootPage()
+await up.settle()
+const upBody = up.document.querySelector('tbody[data-role="route-body"][data-kind="peak"]')
+const upRows = () => upBody.querySelectorAll('tr')
+check('每行有上移/下移/删除按钮',
+  upRows()[1].querySelector('button[data-act="up"]') !== null
+  && upRows()[1].querySelector('button[data-act="down"]') !== null
+  && upRows()[1].querySelector('button[data-act="del-route"]') !== null)
+up.click(upRows()[1].querySelector('button[data-act="up"]'))
+check('点上移后该行与前一行互换',
+  [...upRows()].map(providerOf).join(',') === 'beta,alpha,ghost')
+up.click(up.all('button[data-act="save-routing"]')[0])
+await up.settle()
+const upBody2 = up.lastBody('config')
+check('保存提交 peakOrder + offPeakOrder（顺序即优先级）',
+  upBody2 !== null
+  && upBody2.router.peakOrder.map((r) => r.provider).join(',') === 'beta,alpha,ghost'
+  && upBody2.router.offPeakOrder.map((r) => r.provider).join(',') === 'alpha,beta',
+  JSON.stringify(upBody2 && upBody2.router && upBody2.router.peakOrder))
+check('提交的行没有任何数字档位字段',
+  upBody2 !== null && upBody2.router.peakOrder.every((r) => r.tier === undefined && r.priority === undefined))
 
-biz.click(bizButton)
-await biz.settle()
-check('点击开关立刻改成本地待保存状态（未被轮询回滚）',
-  bizButton.getAttribute('data-on') === '0'
-  && bizButton.getAttribute('aria-pressed') === 'false'
-  && bizButton.textContent.includes(strings.zh.businessRuleOff),
-  `${bizButton.getAttribute('data-on')} / ${bizButton.textContent}`)
+const del = bootPage()
+await del.settle()
+const delBody = del.document.querySelector('tbody[data-role="route-body"][data-kind="off-peak"]')
+const delRows = delBody.querySelectorAll('tr')
+del.click(delRows[1].querySelector('button[data-act="del-route"]'))
+del.click(del.all('button[data-act="save-routing"]')[0])
+await del.settle()
+const delOut = del.lastBody('config')
+check('低谷表删除一行后保存，只提交剩下的行',
+  delOut !== null && delOut.router.offPeakOrder.length === 1
+  && delOut.router.offPeakOrder[0].provider === 'alpha',
+  JSON.stringify(delOut && delOut.router && delOut.router.offPeakOrder))
+check('删除不影响另一张表',
+  delOut !== null && delOut.router.peakOrder.length === 3,
+  JSON.stringify(delOut && delOut.router && delOut.router.peakOrder))
 
-biz.click(bizButton)
-await biz.settle()
-check('再点一次回到已启用',
-  bizButton.getAttribute('data-on') === '1' && bizButton.textContent.includes(strings.zh.businessRuleOn))
+const addPage = bootPage()
+await addPage.settle()
+const addBody = addPage.document.querySelector('tbody[data-role="route-body"][data-kind="off-peak"]')
+const addBtn = addPage.document.querySelector('button[data-act="add-route"][data-kind="off-peak"]')
+check('新增按钮带 data-kind 属于各自的表',
+  addBtn !== null && addBtn.getAttribute('data-kind') === 'off-peak')
+addPage.click(addBtn)
+await addPage.settle()
+const addRows = addBody.querySelectorAll('tr')
+const newTrim = addRows[addRows.length - 1]
+addPage.select(newTrim.querySelector('select[data-field="provider"]'), 'beta')
+addPage.type(newTrim.querySelector('input[data-field="model"]'), 'beta-2')
+addPage.click(addPage.all('button[data-act="save-routing"]')[0])
+await addPage.settle()
+const addOut = addPage.lastBody('config')
+check('新增行在保存时进入对应表末尾',
+  addOut !== null
+  && addOut.router.offPeakOrder.map((r) => r.provider + '/' + r.model).join(',') === 'alpha/alpha-small,beta/beta-1,beta/beta-2',
+  JSON.stringify(addOut && addOut.router && addOut.router.offPeakOrder))
 
-biz.click(biz.all('button[data-act="save-routing"]')[0])
-await biz.settle()
-const bizBody = biz.lastBody('config')
-check('保存时 businessRule 随 router 一起提交（布尔 true）',
-  bizBody !== null && bizBody.router.businessRule === true,
-  JSON.stringify(bizBody && bizBody.router && bizBody.router.businessRule))
-check('保存时 timeSlots 照旧提交（开着高峰规则时它仍当档位表用）',
-  bizBody !== null && Array.isArray(bizBody.router.timeSlots) && bizBody.router.timeSlots.length === 2
-  && bizBody.router.timeSlots[0].priority.alpha === 1,
-  JSON.stringify(bizBody && bizBody.router && bizBody.router.timeSlots))
+// Drag reorder: front = higher priority; no number is involved anywhere.
+const drag = bootPage()
+await drag.settle()
+const dragBody = drag.document.querySelector('tbody[data-role="route-body"][data-kind="peak"]')
+const dr = () => dragBody.querySelectorAll('tr')
+check('拖拽前顺序为 alpha,beta,ghost', [...dr()].map(providerOf).join(',') === 'alpha,beta,ghost')
+drag.fire(dr()[2], 'dragstart')
+drag.fire(dr()[0], 'drop')
+drag.click(drag.all('button[data-act="save-routing"]')[0])
+await drag.settle()
+const dragOut = drag.lastBody('config')
+check('拖到顶部后该行成为高峰表第一行（无任何数字参与）',
+  dragOut !== null && dragOut.router.peakOrder.map((r) => r.provider).join(',') === 'ghost,alpha,beta',
+  JSON.stringify(dragOut && dragOut.router && dragOut.router.peakOrder))
 
-// Toggling off must be savable as an explicit `false`: a patch without the key
-// means "keep the stored value" on the server side.
-biz.click(biz.document.querySelector('#sec-routing button[data-act="toggle-business"]'))
-await biz.settle()
-biz.click(biz.all('button[data-act="save-routing"]')[0])
-await biz.settle()
-const bizOffBody = biz.lastBody('config')
-check('关掉后提交的是显式 false（不是缺省「保持」）',
-  bizOffBody !== null && bizOffBody.router.businessRule === false,
-  JSON.stringify(bizOffBody && bizOffBody.router && bizOffBody.router.businessRule))
+/* ──────────────────────── 12. time-slot-line 文案 ──────────────────────── */
 
-const bizEn = bootPage()
-await bizEn.settle()
-bizEn.click(bizEn.document.getElementById('lang-toggle'))
-check('英文环境下开关也有文案（不是空按钮）',
-  bizEn.document.querySelector('#sec-routing button[data-act="toggle-business"]').textContent
-    .includes(strings.en.businessRuleOn),
-  bizEn.document.querySelector('#sec-routing button[data-act="toggle-business"]').textContent)
-
-/* ───────────────────────── 12. time-slot-line 文案 ───────────────────────── */
-
-section('12. 时段说明行：内置高峰规则开启时不说「无命中时段」')
+section('12. 实时选路行：说清当前高峰/低谷与试序，不再提时段窗口')
 
 const lineOf = async (state) => {
   const page = bootPage({ state })
   // The state arrives over the async /state fetch; let it land before reading.
   await page.settle()
-  return page.document.getElementById('time-slot-line')?.textContent
+  return { page, text: page.document.getElementById('time-slot-line')?.textContent }
 }
 
 const peakState = fixtureState()
 peakState.timeSlot = {
-  source: 'business',
-  businessRule: true,
-  label: '\u9ad8\u5cf0\u89c4\u5219',
-  status: { status: 'peak', weekday: 3, weekend: false, holiday: false, date: '2026-10-14' },
-  effective: { alpha: 1, beta: 2 },
+  flavor: 'peak',
+  status: { status: 'peak', weekday: 3, weekend: false, holiday: false, date: '2026-10-14', minutes: 600, label: '高峰' },
+  order: {
+    peak: [
+      { provider: 'alpha', model: 'alpha-small' },
+      { provider: 'beta', model: 'beta-1' },
+      { provider: 'ghost', model: 'ghost-1' }
+    ],
+    offPeak: [
+      { provider: 'alpha', model: 'alpha-small' },
+      { provider: 'beta', model: 'beta-1' }
+    ]
+  }
 }
 const peakLine = await lineOf(peakState)
-check('高峰时段：说明行说「高峰规则生效」而不是「命中时段」',
-  peakLine !== undefined && peakLine.includes(strings.zh.businessRulePeak.split('{count}')[0])
-  && !peakLine.includes(strings.zh.businessRuleIdle),
-  peakLine)
+check('高峰：说明行以「当前=高峰」开头并带具体时刻',
+  peakLine.text !== undefined && peakLine.text.includes(strings.zh.timeLinePeak.split('{when}')[0])
+  && peakLine.text.includes('2026-10-14 10:00')
+  && peakLine.text.includes('ghost'),
+  peakLine.text)
+check('高峰行试序按高峰顺序表展示（alpha → beta → ghost）',
+  peakLine.text.includes('alpha → beta → ghost'), peakLine.text)
 
-const idleState = fixtureState()
-idleState.timeSlot = {
-  source: 'business',
-  businessRule: true,
-  label: '',
-  status: { status: 'off-peak', weekday: 7, weekend: true, holiday: false, date: '2026-10-11' },
-  effective: {},
+const offState = fixtureState()
+offState.timeSlot = {
+  flavor: 'off-peak',
+  status: { status: 'off-peak', weekday: 7, weekend: true, holiday: false, date: '2026-10-11', minutes: 750, label: '低谷' },
+  order: {
+    peak: [
+      { provider: 'alpha', model: 'alpha-small' },
+      { provider: 'beta', model: 'beta-1' },
+      { provider: 'ghost', model: 'ghost-1' }
+    ],
+    offPeak: [
+      { provider: 'alpha', model: 'alpha-small' },
+      { provider: 'beta', model: 'beta-1' }
+    ]
+  }
 }
-const idleLine = await lineOf(idleState)
-check('闲置时段：说明行说「已开启/闲置」而不是误导的「无命中时段」',
-  idleLine !== undefined && idleLine.includes(strings.zh.businessRuleIdle)
-  && !idleLine.includes(strings.zh.timeSlotIdle),
-  idleLine)
+const offLine = await lineOf(offState)
+check('低谷：说明行以「当前=低谷」开头并展示低谷试序（不含 ghost）',
+  offLine.text !== undefined && offLine.text.includes(strings.zh.timeLineOffPeak.split('{when}')[0])
+  && offLine.text.includes('alpha → beta')
+  && !offLine.text.includes('ghost'),
+  offLine.text)
 
-// Fall back to the per-window wording for the custom-slots source.
-const slotsIdle = fixtureState()
-slotsIdle.timeSlot = { source: 'slots', businessRule: false, label: '', status: null, effective: {} }
-const slotsIdleLine = await lineOf(slotsIdle)
-check('自定义时段源：没有命中窗口时仍沿用原「无命中时段」文案',
-  slotsIdleLine !== undefined && slotsIdleLine.includes(strings.zh.timeSlotIdle),
-  slotsIdleLine)
+const emptyState = fixtureState()
+emptyState.timeSlot = {
+  flavor: 'peak',
+  status: { status: 'peak', weekday: 3, weekend: false, holiday: false, date: '2026-10-14', minutes: 600, label: '高峰' },
+  order: { peak: [], offPeak: [] }
+}
+const emptyLine = await lineOf(emptyState)
+check('某张表为空时链上显示「无」，页面不报错',
+  emptyLine.text !== undefined && emptyLine.text.includes(strings.zh.none), emptyLine.text)
+
+const routedPage = await lineOf(peakState)
+const routingLive = routedPage.page.document.querySelector('#routing-body p.hint')
+check('路由页签顶部也有同一句实时选路行',
+  routingLive !== null && routingLive.textContent.includes('当前=高峰')
+  && routingLive.textContent.includes('alpha → beta → ghost'),
+  routingLive ? routingLive.textContent : 'missing')
 
 finish()

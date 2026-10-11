@@ -503,9 +503,16 @@ const blacklistHas = (unit, payload = service.admin.state()) => (payload.blackli
 const chat = (model, extra = {}) => post(`${base}/v1/chat/completions`, { model, messages: [{ role: 'user', content: 'ping' }], ...extra })
 
 /** Save the whole provider map (plus an optional router patch). */
-async function configure({ order, router = {} } = {}) {
+async function configure({ order, router = {}, peakOrder, offPeakOrder } = {}) {
   const patch = { providers: providersDoc(), router: { ...router } }
-  if (order !== undefined) patch.router.order = order
+  // The old single `order` table now means "identical peak and off-peak lists":
+  // that is the time-agnostic configuration every legacy behavior test wants.
+  if (order !== undefined) {
+    patch.router.peakOrder = order.map((row) => ({ ...row }))
+    patch.router.offPeakOrder = order.map((row) => ({ ...row }))
+  }
+  if (offPeakOrder !== undefined) patch.router.offPeakOrder = offPeakOrder
+  if (peakOrder !== undefined) patch.router.peakOrder = peakOrder
   return service.admin.save(patch)
 }
 /** Save one provider's fields, keeping every other provider as declared. */
@@ -707,7 +714,7 @@ stub.keyStatus = {}
 await cleanSlate()
 await configure({
   order: [{ provider: 'maas-dsv4', model: 'deepseek-v4-flash' }, { provider: 'maas-coclaw', model: 'co-claw' }],
-  router: { retries: 0, failureThreshold: 2, timeSlots: [] },
+  router: { retries: 0, failureThreshold: 2 },
 })
 stub.calls.length = 0
 const named = await chat('co-claw')
@@ -780,7 +787,7 @@ const badOrder = await post(`${base}/admin/api/config`, { router: { order: [{ pr
 check('缺 model 的路由行被拒绝', badOrder.json?.ok === false)
 const unknown = await post(`${base}/admin/api/config`, { router: { order: [{ provider: 'ghost', model: 'm' }] } }, adminHeaders)
 check('指向未注册供应商的行被接受但如实标记',
-  unknown.json?.ok === true && unknown.json.value.rows[0].registered === false, JSON.stringify(unknown.json?.value?.rows?.[0]))
+  unknown.json?.ok === true && unknown.json.value.rows.some((row) => row.provider === 'ghost' && row.registered === false), JSON.stringify(unknown.json?.value?.rows))
 await configure({ order: DEFAULT_ORDER, router: { retries: 0, failureThreshold: 2 } })
 
 /* ───────────────────────── 5e. 透传路由的消息 role 归一 ───────────────────────── */
@@ -1184,8 +1191,10 @@ const keepDocs = providersDoc()
 keepDocs['p-recon'] = { ...keepDocs['p-recon'], models: ['m-other'] }
 const keptRow = await service.admin.save({ providers: keepDocs })
 check('已发现模型能让手工列表里没有的行继续存活',
-  keptRow.removedOrderRows.length === 0 && keptRow.router.order.some((row) => row.provider === 'p-recon' && row.model === 'm-recon'),
-  JSON.stringify({ removed: keptRow.removedOrderRows, order: keptRow.router.order }))
+  keptRow.removedOrderRows.length === 0
+  && keptRow.router.offPeakOrder.some((row) => row.provider === 'p-recon' && row.model === 'm-recon')
+  && keptRow.router.peakOrder.some((row) => row.provider === 'p-recon' && row.model === 'm-recon'),
+  JSON.stringify({ removed: keptRow.removedOrderRows, offPeakOrder: keptRow.router.offPeakOrder, peakOrder: keptRow.router.peakOrder }))
 
 await configure({
   order: [{ provider: 'p-recon', model: 'm-recon' }, { provider: 'p-switch', model: 'm-switch' }],
@@ -1194,9 +1203,10 @@ await configure({
 const dropModelDocs = providersDoc()
 dropModelDocs['p-switch'] = { ...dropModelDocs['p-switch'], models: ['m-other'] }
 const droppedModel = await service.admin.save({ providers: dropModelDocs })
-check('模型不在 allModels 里 → 该行被移除并给出 model_not_available',
+check('模型不在 allModels 里 → 两张表里该行都被移除并给出 model_not_available',
   droppedModel.removedOrderRows.some((row) => row.provider === 'p-switch' && row.reason === 'model_not_available')
-  && !droppedModel.router.order.some((row) => row.provider === 'p-switch'),
+  && !droppedModel.router.offPeakOrder.some((row) => row.provider === 'p-switch')
+  && !droppedModel.router.peakOrder.some((row) => row.provider === 'p-switch'),
   JSON.stringify(droppedModel.removedOrderRows))
 
 await configure({
@@ -1206,18 +1216,22 @@ await configure({
 const dropProviderDocs = providersDoc()
 delete dropProviderDocs['p-switch']
 const droppedProvider = await service.admin.save({ providers: dropProviderDocs })
-check('provider 已不存在 → 该行被移除并给出 provider_not_configured',
+check('provider 已不存在 → 两张表里该行都被移除并给出 provider_not_configured',
   droppedProvider.removedOrderRows.some((row) => row.provider === 'p-switch' && row.reason === 'provider_not_configured')
-  && !droppedProvider.router.order.some((row) => row.provider === 'p-switch'),
+  && !droppedProvider.router.offPeakOrder.some((row) => row.provider === 'p-switch')
+  && !droppedProvider.router.peakOrder.some((row) => row.provider === 'p-switch'),
   JSON.stringify(droppedProvider.removedOrderRows))
 
 await configure({ order: [{ provider: 'p-recon', model: 'm-recon' }], router: { retries: 0 } })
-const onlyRouter = await service.admin.save({ router: { order: [{ provider: 'ghost', model: 'm' }] } })
+const onlyRouter = await service.admin.save({ router: { offPeakOrder: [{ provider: 'ghost', model: 'm' }] } })
 check('只改 router 时不做对账，表原样保留',
-  onlyRouter.removedOrderRows.length === 0 && onlyRouter.router.order[0]?.provider === 'ghost',
-  JSON.stringify({ removed: onlyRouter.removedOrderRows, order: onlyRouter.router.order }))
+  onlyRouter.removedOrderRows.length === 0 && onlyRouter.router.offPeakOrder[0]?.provider === 'ghost',
+  JSON.stringify({ removed: onlyRouter.removedOrderRows, offPeakOrder: onlyRouter.router.offPeakOrder }))
+check('只改路由不会顺手改动另一张表（peakOrder 保持原值）',
+  onlyRouter.router.peakOrder.every((row) => row.provider === 'p-recon'),
+  JSON.stringify(onlyRouter.router.peakOrder))
 check('未注册供应商的行留着一个 registered:false 的说明',
-  onlyRouter.rows[0]?.registered === false, JSON.stringify(onlyRouter.rows[0]))
+  onlyRouter.rows.some((row) => row.provider === 'ghost' && row.registered === false), JSON.stringify(onlyRouter.rows[0]))
 await configure({ order: DEFAULT_ORDER, router: { retries: 0, failureThreshold: 2 } })
 
 /* ───────────────────────── 12. custom headers (removed) ───────────────────────── */
@@ -1726,7 +1740,8 @@ section('21. 插件侧：真的能把这个服务拉起来并转达')
     },
     router: {
       enabled: true,
-      order: [{ provider: 'maas-dsv4', model: 'deepseek-v4-flash' }],
+      peakOrder: [{ provider: 'maas-dsv4', model: 'deepseek-v4-flash' }],
+      offPeakOrder: [{ provider: 'maas-dsv4', model: 'deepseek-v4-flash' }],
       retries: 0,
       failureThreshold: 2,
       logLevel: 'silent',
@@ -1798,7 +1813,8 @@ section('22. readConfig：缺失时 seed、坏文件只在内存里修复')
     writeFileSync(process.env.ROUTER_SERVICE_CONFIG, '{not json')
     const broken = C.readConfig({ seed: false })
     check('坏文件在内存里就地修复并报告 repaired',
-      broken.repaired === true && broken.config.router.order.length === 0 && broken.config.server.port === 8790)
+      broken.repaired === true && broken.config.router.offPeakOrder.length === 0
+      && broken.config.router.peakOrder.length === 0 && broken.config.server.port === 8790)
     check('坏文件不会被覆盖（人工半途修改不该被抹掉）',
       readFileSync(process.env.ROUTER_SERVICE_CONFIG, 'utf8') === '{not json')
 
@@ -1808,8 +1824,9 @@ section('22. readConfig：缺失时 seed、坏文件只在内存里修复')
     }))
     const repaired = C.readConfig({ seed: false })
     check('读时修复：坏端口回落、坏行被丢掉',
-      repaired.config.server.port === 8790 && repaired.config.router.order.length === 1 && repaired.repaired === true,
-      JSON.stringify(repaired.config.router.order))
+      repaired.config.server.port === 8790 && repaired.config.router.offPeakOrder.length === 1
+      && repaired.config.router.peakOrder.length === 1 && repaired.repaired === true,
+      JSON.stringify(repaired.config.router.offPeakOrder))
   } finally {
     writeFileSync(process.env.ROUTER_SERVICE_CONFIG, original)
   }
@@ -1817,186 +1834,11 @@ section('22. readConfig：缺失时 seed、坏文件只在内存里修复')
 
 /* ───────────────────────── 24. time slots ───────────────────────── */
 
-section('24. 时段优先级：只在选路时刻改变候选顺序')
+section('24. 时间路由的新模型：高峰/低谷两张顺序表 + 旧配置迁移')
 
 const TS = await import('../lib/service/time-slots.js')
 
-// -- pure parser ---------------------------------------------------------
-check('parseClock 只接受合法 HH:mm', TS.parseClock('09:05') === 545 && TS.parseClock('9:05') === 545
-  && TS.parseClock('23:59') === 1439 && TS.parseClock('24:00') === null
-  && TS.parseClock('12:60') === null && TS.parseClock('noon') === null && TS.parseClock('') === null)
-check('formatClock 归一化补零', TS.formatClock(545) === '09:05' && TS.formatClock(0) === '00:00')
-
-check('clockInside：普通区间含起点不含终点', TS.clockInside(600, 540, 660) === true
-  && TS.clockInside(540, 540, 660) === true && TS.clockInside(660, 540, 660) === false
-  && TS.clockInside(539, 540, 660) === false)
-check('clockInside：跨午夜区间', TS.clockInside(1380, 1320, 120) === true
-  && TS.clockInside(60, 1320, 120) === true && TS.clockInside(600, 1320, 120) === false
-  && TS.clockInside(120, 1320, 120) === false)
-check('clockInside：起止相同 = 全天', TS.clockInside(0, 480, 480) === true
-  && TS.clockInside(479, 480, 480) === true && TS.clockInside(1439, 480, 480) === true)
-
-const overlapRules = [
-  { start: '22:00', end: '02:00', priority: { a: 1 } },
-  { start: '23:00', end: '23:30', priority: { b: 2 } },
-]
-check('activeRuleAt：命中多条时最具体的窗口胜出',
-  TS.activeRuleAt(overlapRules, 23 * 60 + 10)?.rule?.priority?.b === 2,
-  JSON.stringify(TS.activeRuleAt(overlapRules, 23 * 60 + 10)))
-check('activeRuleAt：窗口外只剩跨界那条',
-  TS.activeRuleAt(overlapRules, 23 * 60 + 45)?.rule?.priority?.a === 1)
-check('activeRuleAt：都没命中时为 null', TS.activeRuleAt(overlapRules, 12 * 60) === null)
-check('activeRuleAt：同起点的两条第一条优先',
-  TS.activeRuleAt([
-    { start: '08:00', end: '09:00', priority: { a: 1 } },
-    { start: '08:00', end: '09:00', priority: { b: 2 } },
-  ], 8 * 60 + 30)?.rule?.priority?.a === 1)
-check('activeRuleAt：同起点不同长度时按窗口取更具体者（整点不翻回宽规则）',
-  TS.activeRuleAt([
-    { start: '08:00', end: '17:00', priority: { wide: 1 } },
-    { start: '08:00', end: '09:00', priority: { narrow: 2 } },
-  ], 8 * 60)?.rule?.priority?.narrow === 2
-  && TS.activeRuleAt([
-    { start: '08:00', end: '17:00', priority: { wide: 1 } },
-    { start: '08:00', end: '09:00', priority: { narrow: 2 } },
-  ], 8 * 60 + 1)?.rule?.priority?.narrow === 2)
-
-const orderRows = [
-  { provider: 'p1', model: 'm1' }, { provider: 'p2', model: 'm2' },
-  { provider: 'p3', model: 'm3' }, { provider: 'p4', model: 'm4' },
-]
-const oneHit = TS.applyTimeOrder(orderRows, [{ start: '00:00', end: '23:59', priority: { p3: 1 } }], 600)
-check('applyTimeOrder：命中项整体前移，其余保持静态相对序',
-  oneHit.rows.map((row) => row.provider).join(',') === 'p3,p1,p2,p4', oneHit.rows.map((r) => r.provider).join(','))
-const twoHits = TS.applyTimeOrder(orderRows, [{ start: '00:00', end: '23:59', priority: { p3: 2, p1: 5 } }], 600)
-check('applyTimeOrder：命中项按档位升序，数字小的先试（p3=2 压过 p1=5）',
-  twoHits.rows.map((row) => row.provider).join(',') === 'p3,p1,p2,p4', twoHits.rows.map((r) => r.provider).join(','))
-const tieHits = TS.applyTimeOrder(orderRows, [{ start: '00:00', end: '23:59', priority: { p4: 3, p2: 3 } }], 600)
-check('applyTimeOrder：档位相同时仍按顺序表的静态位置（表是并列时的裁判）',
-  tieHits.rows.map((row) => row.provider).join(',') === 'p2,p4,p1,p3', tieHits.rows.map((r) => r.provider).join(','))
-const untieredTail = TS.applyTimeOrder(orderRows, [{ start: '00:00', end: '23:59', priority: { p4: 1 } }], 600)
-check('applyTimeOrder：没被点名的供应商整体排在点名者之后，内部保持静态序',
-  untieredTail.rows.map((row) => row.provider).join(',') === 'p4,p1,p2,p3',
-  untieredTail.rows.map((r) => r.provider).join(','))
-const disabled = TS.applyTimeOrder(orderRows, [{ start: '00:00', end: '23:59', priority: { p2: 0 } }], 600)
-check('applyTimeOrder：档位 0 的供应商本轮被剔除',
-  disabled.rows.map((row) => row.provider).join(',') === 'p1,p3,p4'
-  && disabled.disabled.map((row) => row.provider).join(',') === 'p2')
-const noRules = TS.applyTimeOrder(orderRows, [], 600)
-check('applyTimeOrder：没配时段时是恒等变换',
-  noRules.rows.map((row) => row.provider).join(',') === 'p1,p2,p3,p4' && noRules.active === null)
-// The old `pin` option existed to protect the row a caller had named. The
-// northbound name is ignored now, so nothing can be pinned and the fourth
-// argument is gone: passing one must have no effect at all.
-const ignoredExtra = TS.applyTimeOrder(orderRows, [{ start: '00:00', end: '23:59', priority: { p3: 1 } }], 600, { pin: 1 })
-check('applyTimeOrder：pin 概念已删除，多传的选项不再改变排序',
-  ignoredExtra.rows.map((row) => row.provider).join(',') === 'p3,p1,p2,p4',
-  ignoredExtra.rows.map((r) => r.provider).join(','))
-check('providerPriorityAt：未点名的供应商为 null（走静态顺序）',
-  TS.providerPriorityAt(overlapRules, 'a', 23 * 60 + 45) === 1
-  && TS.providerPriorityAt(overlapRules, 'zzz', 23 * 60 + 45) === null)
-
-// -- validation / repair -------------------------------------------------
-check('validateTimeSlots：合法规则原样通过',
-  TS.validateTimeSlots([{ start: '22:00', end: '02:00', priority: { a: 1, b: 0 } }])[0].priority.b === 0)
-check('validateTimeSlots：坏 HH:mm 被拒', throws(() => TS.validateTimeSlots([{ start: '25:00', end: '02:00', priority: { a: 1 } }])))
-check('validateTimeSlots：起止相同被拒', throws(() => TS.validateTimeSlots([{ start: '08:00', end: '08:00', priority: { a: 1 } }])))
-check('validateTimeSlots：档位越界被拒',
-  throws(() => TS.validateTimeSlots([{ start: '08:00', end: '09:00', priority: { a: 10 } }]))
-  && throws(() => TS.validateTimeSlots([{ start: '08:00', end: '09:00', priority: { a: -1 } }]))
-  && throws(() => TS.validateTimeSlots([{ start: '08:00', end: '09:00', priority: { a: 1.5 } }])))
-check('validateTimeSlots：空的供应商表被拒',
-  throws(() => TS.validateTimeSlots([{ start: '08:00', end: '09:00', priority: {} }])))
-check('validateTimeSlots：不是数组被拒', throws(() => TS.validateTimeSlots({})))
-check('validateTimeSlots：超过上限被拒',
-  throws(() => TS.validateTimeSlots(Array.from({ length: TS.TIME_SLOT_LIMIT + 1 }, (_, i) => ({ start: '00:00', end: '23:59', priority: { [`p${i}`]: 1 } })))))
-check('normalizeTimeSlots：读时修复，丢坏留好并封顶',
-  TS.normalizeTimeSlots([
-    { start: '08:00', end: '09:00', priority: { a: 1 } },
-    { start: 'bogus', end: '09:00', priority: { a: 1 } },
-    { start: '08:00', end: '08:00', priority: { a: 1 } },
-    { start: '10:00', end: '11:00', priority: { a: 99 } },
-    { start: '12:00', end: '13:00', priority: {} },
-  ]).length === 1)
-check('normalizeTimeSlots：非数组退化为空表', TS.normalizeTimeSlots('nope').length === 0 && TS.normalizeTimeSlots(undefined).length === 0)
-
-// -- config wiring -------------------------------------------------------
-const cfgWithSlots = C.normalizeConfig({
-  providers: { x: { baseURL: 'https://host/v1', apiKey: 'k', models: ['m'] } },
-  router: { order: [{ provider: 'x', model: 'm' }], timeSlots: [{ start: '22:00', end: '02:00', priority: { x: 1 } }] },
-})
-check('normalizeConfig：timeSlots 不会被白名单丢掉（读时保留）',
-  cfgWithSlots.router.timeSlots.length === 1 && cfgWithSlots.router.timeSlots[0].priority.x === 1)
-const patchedSlots = C.applyConfigPatch(cfgWithSlots, { router: { timeSlots: [{ start: '08:00', end: '09:00', priority: { x: 0 } }] } })
-check('applyConfigPatch：合法 timeSlots 写入生效',
-  patchedSlots.config.router.timeSlots[0].start === '08:00' && patchedSlots.config.router.timeSlots[0].priority.x === 0)
-check('applyConfigPatch：坏 timeSlots 拒绝写入',
-  throws(() => C.applyConfigPatch(cfgWithSlots, { router: { timeSlots: [{ start: '08:00', end: '08:00', priority: { x: 1 } }] } })))
-
-// -- live selection ------------------------------------------------------
-/** A slot window that certainly contains "now", in the service's local clock. */
-function slotNow(priority) {
-  const at = (offset) => {
-    const date = new Date(Date.now() + offset * 60_000)
-    return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`
-  }
-  return { start: at(-2), end: at(2), priority }
-}
-const fullOrder = () => DEFAULT_ORDER.map((row) => ({ ...row }))
-
-await cleanSlate()
-await configure({ order: fullOrder() })
-stub.keyStatus = { 'gw-good': 503 }
-stub.calls.length = 0
-await chat('deepseek-v4-flash')
-check('基线（无时段）：第一条失败后按静态顺序落到第二家',
-  stub.calls.map((call) => call.key).join(',') === 'gw-good,gw-broken',
-  stub.calls.map((call) => call.key).join(','))
-
-await cleanSlate()
-await configure({ order: fullOrder(), router: { timeSlots: [slotNow({ 'p-switch': 1 })] } })
-stub.keyStatus = { 'gw-good': 503 }
-stub.calls.length = 0
-await chat('deepseek-v4-flash')
-check('时段命中：档位 1 的供应商第一个被尝试（名字不再把它钉在后面）',
-  stub.calls.map((call) => call.key).join(',') === 'sw-a',
-  stub.calls.map((call) => call.key).join(','))
-
-await cleanSlate()
-await configure({ order: fullOrder(), router: { timeSlots: [slotNow({ 'maas-coclaw': 0 })] } })
-stub.keyStatus = { 'gw-good': 503 }
-stub.calls.length = 0
-await chat('deepseek-v4-flash')
-check('档位 0：被停用的供应商本轮完全不发请求',
-  stub.calls.every((call) => call.key !== 'gw-broken'),
-  stub.calls.map((call) => call.key).join(','))
-check('档位 0：/state 如实上报生效档位为 0',
-  service.admin.state().timeSlot?.effective?.['maas-coclaw'] === 0,
-  JSON.stringify(service.admin.state().timeSlot))
-check('档位 0：这件事在事件流里看得见（kind=timeslot）',
-  (service.admin.state().recent ?? []).some((event) => event.kind === 'timeslot' && event.provider === 'maas-coclaw'),
-  JSON.stringify((service.admin.state().recent ?? []).filter((event) => event.kind === 'timeslot')))
-
-const liveSlot = service.admin.state().timeSlot
-check('/state 上报当前命中时段：label 为规则窗口，at 为 HH:mm，未点名者为静态',
-  typeof liveSlot?.label === 'string' && /^\d{2}:\d{2}-\d{2}:\d{2}$/.test(liveSlot.label)
-  && /^\d{2}:\d{2}$/.test(liveSlot.at)
-  && liveSlot.effective['maas-coclaw'] === 0
-  && liveSlot.effective['p-switch'] === null,
-  JSON.stringify(liveSlot))
-
-await cleanSlate()
-await configure({ order: fullOrder(), router: { timeSlots: [] } })
-check('清空时段后 /state 不再报命中，选路回到静态顺序',
-  service.admin.state().timeSlot?.label === null
-  && Array.isArray(service.admin.state().router.timeSlots)
-  && service.admin.state().router.timeSlots.length === 0,
-  JSON.stringify(service.admin.state().timeSlot))
-
-/* ───────────────────────── 25. 内置高峰规则 ───────────────────────── */
-
-section('25. 内置高峰规则：北京时间的工作日峰谷 + 覆盖 timeSlots')
-
+// -- 纯函数：北京日历峰谷 ------------------------------------------------
 /** A Beijing instant as an epoch millisecond: `at('2026-10-14 10:00')`. */
 const bj = (text) => {
   const [date, time] = String(text).trim().split(/\s+/)
@@ -2005,7 +1847,6 @@ const bj = (text) => {
   return Date.UTC(y, m - 1, d, hh - 8, mm)
 }
 
-// -- 纯函数：周内峰谷 -----------------------------------------------------
 const wedMorning = TS.beijingPeakStatus(bj('2026-10-14 09:00'))
 check('beijingPeakStatus：周三 09:00 起算高峰（含起点）',
   wedMorning.status === 'peak' && wedMorning.weekday === 3 && wedMorning.minutes === 540 && wedMorning.date === '2026-10-14',
@@ -2040,7 +1881,6 @@ check('beijingPeakStatus：时钟按北京时间读，UTC 与本地都不是判�
     TS.beijingPeakStatus(Date.UTC(2026, 9, 13, 6, 0)),
   ]))
 
-// -- 纯函数：法定节假日（周内也要变空闲） --------------------------------
 const holidayWeekday = ['2026-10-02 10:00', '2026-05-01 10:00', '2026-01-01 10:00', '2026-02-17 10:00']
 check('beijingPeakStatus：周内的法定节假日整天算空闲',
   holidayWeekday.every((text) => {
@@ -2070,178 +1910,195 @@ const badInstant = TS.beijingPeakStatus(Number.NaN)
 check('beijingPeakStatus：坏时刻不抛异常（读时兜底为空闲）',
   badInstant.status === 'off-peak' && badInstant.date === '', JSON.stringify(badInstant))
 
-// -- 纯函数：档位表（timeSlots 只当表用，窗口被忽略） ---------------------
-const bizSlots = [
-  { start: '09:00', end: '12:00', priority: { a: 3, b: 0 } },
-  { start: '22:00', end: '02:00', priority: { a: 1, c: 5 } },
-]
-check('effectiveBusinessPriority：同一供应商取最低档位，与窗口无关',
-  JSON.stringify(TS.effectiveBusinessPriority(bizSlots)) === JSON.stringify({ a: 1, b: 0, c: 5 }),
-  JSON.stringify(TS.effectiveBusinessPriority(bizSlots)))
-check('effectiveBusinessPriority：空表/坏表退化为空映射',
-  Object.keys(TS.effectiveBusinessPriority([])).length === 0
-  && Object.keys(TS.effectiveBusinessPriority(null)).length === 0)
-
-// -- 覆盖优先级：businessRule 开 = 内置日历算窗口，关 = timeSlots ----------
-const bizCfg = C.normalizeConfig({
+// -- 配置：两张表 + 旧 order/timeSlots/businessRule 迁移 -------------------
+const migrateCfg = C.normalizeConfig({
   providers: { x: { baseURL: 'https://host/v1', apiKey: 'k', models: ['m'] } },
-  router: { order: [{ provider: 'x', model: 'm' }], businessRule: true },
+  router: {
+    order: [{ provider: 'a', model: 'm' }, { provider: 'b', model: 'm' }, { provider: 'c', model: 'm' }],
+    timeSlots: [{ priority: { c: 2, b: 1, a: 0 } }],
+    businessRule: true,
+  },
 })
-check('normalizeConfig：businessRule 缺省为 false，写了 true 就保留',
-  C.normalizeConfig({}).router.businessRule === false && bizCfg.router.businessRule === true)
-const bizPatched = C.applyConfigPatch(bizCfg, { router: { businessRule: false } })
-check('applyConfigPatch：businessRule 可写回 false',
-  bizPatched.config.router.businessRule === false)
-check('applyConfigPatch：businessRule 非布尔被拒',
-  throws(() => C.applyConfigPatch(bizCfg, { router: { businessRule: 'yes' } }))
-  && throws(() => C.applyConfigPatch(bizCfg, { router: { businessRule: 1 } }))
-  && throws(() => C.applyConfigPatch(bizCfg, { router: { businessRule: null } })))
-check('applyConfigPatch：只发 timeSlots 不会顺手改写 businessRule（缺省=保持）',
-  C.applyConfigPatch(bizCfg, { router: { timeSlots: [] } }).config.router.businessRule === true)
-check('normalizeConfig：坏 businessRule 读时兜底为 false',
-  C.normalizeConfig({ router: { businessRule: 'yes' } }).router.businessRule === false)
+check('旧 order 迁到 offPeakOrder，原样保留',
+  migrateCfg.router.offPeakOrder.map((row) => row.provider).join(',') === 'a,b,c',
+  migrateCfg.router.offPeakOrder.map((row) => row.provider).join(','))
+check('高峰表从旧档位表迁移：档位>0 升序在前、档位 0 剔除',
+  migrateCfg.router.peakOrder.map((row) => row.provider).join(',') === 'b,c',
+  migrateCfg.router.peakOrder.map((row) => row.provider).join(','))
+check('迁移后不再残留 order/timeSlots/businessRule 旧键',
+  !('order' in migrateCfg.router) && !('timeSlots' in migrateCfg.router) && !('businessRule' in migrateCfg.router),
+  JSON.stringify(Object.keys(migrateCfg.router)))
 
-// -- HTTP：坏配置被拒 -----------------------------------------------------
-const badBiz = await post(`${base}/admin/api/config`, { router: { businessRule: 'on' } }, adminHeaders)
-check('HTTP：businessRule 非布尔被管理面拒绝（不改磁盘）',
-  badBiz.json?.ok === false && /boolean/.test(badBiz.json?.error?.message ?? ''),
-  JSON.stringify(badBiz.json))
+const noTierCfg = C.normalizeConfig({
+  providers: { x: { baseURL: 'https://host/v1', apiKey: 'k', models: ['m'] } },
+  router: { order: [{ provider: 'a', model: 'm' }, { provider: 'b', model: 'm' }] },
+})
+check('没有档位表时高峰表 = 低谷表（是复制，不是同一个引用）',
+  noTierCfg.router.peakOrder.map((row) => row.provider).join(',') === 'a,b'
+  && noTierCfg.router.peakOrder !== noTierCfg.router.offPeakOrder
+  && noTierCfg.router.peakOrder[0] !== noTierCfg.router.offPeakOrder[0])
+check('缺省 enabled=true（时间路由开着，日历常驻）', C.normalizeConfig({}).router.enabled === true)
 
-// -- 真服务：开关切换与 /state 上报 --------------------------------------
-const beforeBiz = service.admin.state().router.businessRule
-check('/state 上报 router.businessRule（默认 false）', beforeBiz === false, String(beforeBiz))
+check('timeSlots 写入被大声拒绝（提示改用 peakOrder/offPeakOrder）',
+  throws(() => C.applyConfigPatch(C.seedConfig(), { router: { timeSlots: [{ start: '08:00', end: '09:00', priority: { x: 1 } }] } }))
+  && throws(() => C.applyConfigPatch(C.seedConfig(), { router: { timeSlots: [] } })))
+check('businessRule 写入被大声拒绝（日历常驻，没有开关了）',
+  throws(() => C.applyConfigPatch(C.seedConfig(), { router: { businessRule: true } })))
+check('peakOrder 缺行的补丁被拒绝',
+  throws(() => C.applyConfigPatch(C.seedConfig(), { router: { peakOrder: [{ provider: 'a' }] } })))
+const twoLists = C.applyConfigPatch(C.seedConfig(), {
+  router: {
+    peakOrder: [{ provider: 'maas-dsv4', model: 'deepseek-v4-flash' }],
+    offPeakOrder: [{ provider: 'maas-coclaw', model: 'co-claw' }],
+  },
+})
+check('两张表可分别写入',
+  twoLists.config.router.peakOrder[0]?.provider === 'maas-dsv4'
+  && twoLists.config.router.offPeakOrder[0]?.provider === 'maas-coclaw',
+  JSON.stringify({ peak: twoLists.config.router.peakOrder, off: twoLists.config.router.offPeakOrder }))
+check('写上去的行没有任何档位数字字段',
+  twoLists.config.router.peakOrder.every((row) => row.tier === undefined && row.priority === undefined))
 
-await cleanSlate()
-await configure({ order: fullOrder(), router: { businessRule: false, timeSlots: [slotNow({ 'p-switch': 1 })] } })
-stub.keyStatus = { 'gw-good': 503 }
-stub.calls.length = 0
-await chat('deepseek-v4-flash')
-check('关（缺省）时仍走 timeSlots：档位 1 的供应商先被尝试',
-  stub.calls.map((call) => call.key).join(',') === 'sw-a',
-  stub.calls.map((call) => call.key).join(','))
-const slotsSource = service.admin.state().timeSlot
-check('关时 /state 的生效来源是自定义时段表，标签就是窗口本身',
-  slotsSource?.source === 'slots' && slotsSource?.businessRule === false
-  && /^[0-9]{2}:[0-9]{2}-[0-9]{2}:[0-9]{2}$/.test(String(slotsSource?.label)),
-  JSON.stringify(slotsSource))
+/* \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 25. live: the two tables drive the chain \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
 
-await cleanSlate()
-await configure({ order: fullOrder(), router: { businessRule: true, timeSlots: [slotNow({ 'p-switch': 1 })] } })
-check('/state 打开开关后上报 businessRule=true',
-  service.admin.state().router.businessRule === true)
-stub.keyStatus = { 'gw-good': 503 }
-stub.calls.length = 0
-await chat('deepseek-v4-flash')
+section('25. 真服务：高峰用高峰表、低谷用低谷表（注入时钟，任意时刻都确定）')
 
-// The service has one real clock, so the assertion is stated relative to what
-// that clock says about Beijing right now: the same input must produce the
-// peak behaviour during peak hours and the static order outside them. Both
-// branches are exact, so this is deterministic whenever it runs.
-const nowStatus = TS.beijingPeakStatus(Date.now())
-const bizState = service.admin.state().timeSlot
-const bizCalls = stub.calls.map((call) => call.key).join(',')
-check('开时 /state 的生效来源标成内置高峰规则，标签写明「高峰规则」',
-  bizState?.source === 'business' && bizState?.businessRule === true
-  && (nowStatus.status === 'peak' ? bizState.label === '高峰规则' : bizState.label === null),
-  `${JSON.stringify(bizState)} raw=${nowStatus.status}`)
-check('开时 /state 带出北京时间的峰谷判定结果（含周末/节假日标志）',
-  bizState?.status?.status === nowStatus.status && bizState?.status?.date === nowStatus.date
-  && bizState?.status?.weekend === nowStatus.weekend && bizState?.status?.holiday === nowStatus.holiday,
-  `${JSON.stringify(bizState?.status)} vs ${JSON.stringify(nowStatus)}`)
-if (nowStatus.status === 'peak') {
-  check('高峰时段：内置规则让档位 1 的供应商先试（窗口由日历算，不看 timeSlots 的 start/end）',
-    bizCalls === 'sw-a', bizCalls)
-  check('高峰时段：命中的供应商未配档位时留在静态位置（p-switch 是 1，maas-coclaw 仍按静态序）',
-    bizState?.effective?.['p-switch'] === 1 && bizState?.effective?.['maas-coclaw'] === null,
-    JSON.stringify(bizState?.effective))
-} else {
-  check('空闲时段：内置规则不动静态顺序（周末/节假日全天、午休、夜间都空闲）',
-    bizCalls === 'gw-good,gw-broken', bizCalls)
-  check('空闲时段：没有生效规则，/state 的生效档位全为 null',
-    Object.values(bizState?.effective ?? { x: 1 }).every((value) => value === null),
-    JSON.stringify(bizState?.effective))
+// The pinned service runs in-process with an injected `now`, so the two
+// contexts are exercised on any day of the week: 2026-10-14 10:00 Beijing is a
+// Wednesday morning (peak), 2026-10-11 12:30 is a Sunday (off-peak).
+const PIN_PEAK = bj('2026-10-14 10:00')
+const PIN_OFF = bj('2026-10-11 12:30')
+const PIN_DOC = (port, routerOverrides = {}) => ({
+  server: { host: '127.0.0.1', port, token: 'pin-token' },
+  providers: providersDoc(),
+  router: {
+    enabled: true,
+    peakOrder: [
+      { provider: 'maas-coclaw', model: 'co-claw' },
+      { provider: 'maas-dsv4', model: 'deepseek-v4-flash' },
+    ],
+    offPeakOrder: [
+      { provider: 'maas-dsv4', model: 'deepseek-v4-flash' },
+      { provider: 'maas-coclaw', model: 'co-claw' },
+    ],
+    retries: 0,
+    failureThreshold: 2,
+    logLevel: 'silent',
+    ...routerOverrides,
+  },
+  converters: ['maas'],
+})
+
+async function startPinned(nowAt, routerOverrides = {}) {
+  const port = await freePort()
+  const stateFile = join(process.env.DSH_HOME, `pinned-${port}.json`)
+  const doc = PIN_DOC(port, routerOverrides)
+  const svc = await startService({ listen: true, poll: false, logger: quiet, config: doc, stateFile, now: () => nowAt })
+  return { svc, base: `http://127.0.0.1:${port}`, headers: { 'x-router-token': 'pin-token' } }
 }
 
-// -- 真服务：高峰时档位 0 停用 + 事件原因写明高峰规则 --------------------
-await cleanSlate()
-await configure({ order: fullOrder(), router: { businessRule: true, timeSlots: [slotNow({ 'maas-coclaw': 0, 'p-switch': 1 })] } })
-stub.keyStatus = { 'gw-good': 503 }
-stub.calls.length = 0
-await chat('deepseek-v4-flash')
-const bizAfterDisable = service.admin.state()
-if (nowStatus.status === 'peak') {
-  check('高峰时段：档位 0 的供应商本轮完全不发请求',
-    stub.calls.every((call) => call.key !== 'gw-broken'),
-    stub.calls.map((call) => call.key).join(','))
-  check('高峰时段：停用事件的原因写明「高峰规则」而不是笼统的时段窗口',
-    (bizAfterDisable.recent ?? []).some((event) => event.kind === 'timeslot'
-      && event.provider === 'maas-coclaw' && event.message === '高峰规则'),
-    JSON.stringify((bizAfterDisable.recent ?? []).filter((event) => event.kind === 'timeslot')))
-  check('高峰时段：/state 如实上报生效档位 0',
-    bizAfterDisable.timeSlot?.effective?.['maas-coclaw'] === 0,
-    JSON.stringify(bizAfterDisable.timeSlot))
-} else {
-  check('空闲时段：档位 0 不生效（空闲时不看档位表，静态顺序照走）',
-    stub.calls.map((call) => call.key).join(',') === 'gw-good,gw-broken'
-    && (bizAfterDisable.recent ?? []).every((event) => event.kind !== 'timeslot'),
-    `${stub.calls.map((call) => call.key).join(',')} / ${JSON.stringify((bizAfterDisable.recent ?? []).filter((event) => event.kind === 'timeslot'))}`)
+// -- 低谷时刻：按低谷表先试 dsv4，失败后落到第二位 -------------------------
+{
+  const { svc, base, headers } = await startPinned(PIN_OFF)
+  try {
+    stub.keyStatus = { 'gw-good': 503 }
+    stub.calls.length = 0
+    await post(`${base}/v1/chat/completions`, { model: 'm-switch', messages: [{ role: 'user', content: 'ping' }] }, headers)
+    check('低谷时刻：按低谷表先试 dsv4（gw-good），失败后落到 coclaw',
+      stub.calls.map((call) => call.key).join(',') === 'gw-good,gw-broken',
+      stub.calls.map((call) => call.key).join(','))
+    const st = svc.admin.state().timeSlot
+    check('低谷实例 /state 上报 flavor=off-peak、日历结果与低谷表',
+      st?.flavor === 'off-peak' && st?.status?.status === 'off-peak' && st?.status?.minutes === 750
+      && st?.order?.offPeak?.[0]?.provider === 'maas-dsv4' && st?.order?.peak?.[0]?.provider === 'maas-coclaw',
+      JSON.stringify(st))
+  } finally {
+    await svc.stop()
+  }
 }
 
-// -- 真服务：关掉开关立刻退回 timeSlots ---------------------------------
-await cleanSlate()
-await configure({ order: fullOrder(), router: { businessRule: false, timeSlots: [slotNow({ 'p-switch': 1 })] } })
-stub.keyStatus = { 'gw-good': 503 }
-stub.calls.length = 0
-await chat('deepseek-v4-flash')
-check('关掉开关立刻退回 timeSlots（无需重启服务）',
-  stub.calls.map((call) => call.key).join(',') === 'sw-a'
-  && service.admin.state().timeSlot?.source === 'slots',
-  `${stub.calls.map((call) => call.key).join(',')} / ${service.admin.state().timeSlot?.source}`)
+// -- 高峰时刻：按高峰表先试 coclaw -----------------------------------------
+{
+  const { svc, base, headers } = await startPinned(PIN_PEAK)
+  try {
+    stub.keyStatus = { 'gw-good': 503 }
+    stub.calls.length = 0
+    await post(`${base}/v1/chat/completions`, { model: 'm-switch', messages: [{ role: 'user', content: 'ping' }] }, headers)
+    check('高峰时刻：按高峰表先试 coclaw（健康）且完全不碰 dsv4',
+      stub.calls.map((call) => call.key).join(',') === 'gw-broken',
+      stub.calls.map((call) => call.key).join(','))
+    const st = svc.admin.state().timeSlot
+    check('高峰实例 /state 上报 flavor=peak、日历结果与高峰表',
+      st?.flavor === 'peak' && st?.status?.status === 'peak' && st?.status?.minutes === 600
+      && st?.order?.peak?.[0]?.provider === 'maas-coclaw',
+      JSON.stringify(st))
+  } finally {
+    await svc.stop()
+  }
+}
 
-await cleanSlate()
-await configure({ order: fullOrder(), router: { businessRule: true, timeSlots: [] } })
-check('开着开关但没有档位表时退化为恒等变换（不误伤静态顺序）',
-  service.admin.state().timeSlot?.rule === null
-  && service.admin.state().timeSlot?.effective?.['maas-coclaw'] === null,
-  JSON.stringify(service.admin.state().timeSlot))
+// -- 不在表里 = 该时刻不试它（删除是唯一停用方式） -------------------------
+{
+  const offOnly = [
+    { provider: 'maas-dsv4', model: 'deepseek-v4-flash' },
+  ]
+  const { svc, base, headers } = await startPinned(PIN_OFF, { offPeakOrder: offOnly })
+  try {
+    stub.keyStatus = { 'gw-good': 503, 'gw-broken': 503 }
+    stub.calls.length = 0
+    const resp = await post(`${base}/v1/chat/completions`, { model: 'm-switch', messages: [{ role: 'user', content: 'ping' }] }, headers)
+    check('低谷表里没有 coclaw → 这条链只试 dsv4，绝不试 coclaw',
+      stub.calls.map((call) => call.key).join(',') === 'gw-good',
+      stub.calls.map((call) => call.key).join(','))
+    check('链耗尽时把最后一个上游的 503 原样奉还', resp.status === 503, String(resp.status))
+  } finally {
+    await svc.stop()
+  }
+}
 
-await configure({ order: DEFAULT_ORDER, router: { businessRule: false, timeSlots: [], retries: 0, failureThreshold: 2 } })
+// -- 两张表都空 = 503，不动上游 --------------------------------------------
+{
+  const { svc, base, headers } = await startPinned(PIN_PEAK, { peakOrder: [], offPeakOrder: [] })
+  try {
+    stub.calls.length = 0
+    const resp = await post(`${base}/v1/chat/completions`, { model: 'm-switch', messages: [{ role: 'user', content: 'ping' }] }, headers)
+    check('两张表都空时返回 503 且不碰任何上游',
+      resp.status === 503 && stub.calls.length === 0, `${resp.status} calls=${stub.calls.length}`)
+  } finally {
+    await svc.stop()
+  }
+}
 
-// -- 高峰分支的确定性覆盖（不依赖跑用例的时刻） -------------------------
-// The live assertions above follow whatever the wall clock happens to say, so
-// on a weekend only the off-peak branch runs. These pin the instant and drive
-// the very three functions `walk()` chains together (beijingPeakStatus →
-// effectiveBusinessPriority → partitionByRule), which is exactly the peak-time
-// decision, so the peak branch is covered on any day.
-const peakRule = { rule: { start: '0500', end: '2300', priority: TS.effectiveBusinessPriority(bizSlots) } }
-const peakRows = [
-  { provider: 'a', model: 'm1' }, { provider: 'b', model: 'm2' },
-  { provider: 'c', model: 'm3' }, { provider: 'd', model: 'm4' },
-]
-const peakPartition = TS.partitionByRule(peakRows, peakRule)
-check('高峰规则（固定时刻）：点名者按档位升序在前，未点名者按静态序在后',
-  peakPartition.rows.map((row) => row.provider).join(',') === 'a,c,d',
-  peakPartition.rows.map((row) => row.provider).join(','))
-check('高峰规则（固定时刻）：档位 0 的供应商进入 disabled 列表（事件流据此上报）',
-  peakPartition.disabled.map((row) => row.provider).join(',') === 'b',
-  peakPartition.disabled.map((row) => row.provider).join(','))
-check('高峰规则（固定时刻）：档位表把三家都点名时，链顺序完全由档位决定',
-  TS.partitionByRule(
-    [{ provider: 'd', model: 'm4' }, { provider: 'a', model: 'm1' }, { provider: 'b', model: 'm2' }],
-    { rule: { start: '0500', end: '2300', priority: { a: 3, b: 1, d: 2 } } },
-  ).rows.map((row) => row.provider).join(',') === 'b,d,a')
-check('高峰规则（固定时刻）：pin 概念不存在，多传的选项不改变结果',
-  TS.partitionByRule(
-    [{ provider: 'd', model: 'm4' }, { provider: 'a', model: 'm1' }],
-    { rule: { start: '0500', end: '2300', priority: { a: 1 } } },
-    { pin: 1 },
-  ).rows.map((row) => row.provider).join(',') === 'a,d')
-check('高峰规则（固定时刻）：同一个时刻在日历上确实是高峰，午休时不是',
-  TS.beijingPeakStatus(bj('2026-10-14 10:00')).status === 'peak'
-  && TS.beijingPeakStatus(bj('2026-10-14 12:30')).status === 'off-peak')
-check('停用事件的原因文案就是「高峰规则」（不存在第二个峰值标签）',
-  read('lib/service/proxy.js').includes("label: '高峰规则'")
-  && !read('lib/service/proxy.js').includes("label: '高峰时段'"))
+// -- 两张表一样 = 旧行为（时间无关），且 enabled=false 只试当前表第一行 ------
+{
+  const same = PIN_DOC(0).router.offPeakOrder.map((row) => ({ ...row }))
+  const { svc, base, headers } = await startPinned(PIN_PEAK, { peakOrder: same, offPeakOrder: same.map((r) => ({ ...r })) })
+  try {
+    stub.keyStatus = { 'gw-good': 503 }
+    stub.calls.length = 0
+    await post(`${base}/v1/chat/completions`, { model: 'm-switch', messages: [{ role: 'user', content: 'ping' }] }, headers)
+    check('两张表一样 = 时间无关：dsv4 失败后照旧落到 coclaw',
+      stub.calls.map((call) => call.key).join(',') === 'gw-good,gw-broken',
+      stub.calls.map((call) => call.key).join(','))
+  } finally {
+    await svc.stop()
+  }
+}
+{
+  // Default peak order is [coclaw, dsv4] and the clock is pinned to peak, so a
+  // plain proxy must try coclaw first and stop there.
+  const { svc, base, headers } = await startPinned(PIN_PEAK, { enabled: false })
+  try {
+    stub.keyStatus = { 'gw-good': 503, 'gw-broken': 200 }
+    stub.calls.length = 0
+    await post(`${base}/v1/chat/completions`, { model: 'm-switch', messages: [{ role: 'user', content: 'ping' }] }, headers)
+    check('enabled=false 仍是纯代理：只试当前表第一行一次（coclaw），不重试',
+      stub.calls.map((call) => call.key).join(',') === 'gw-broken',
+      stub.calls.map((call) => call.key).join(','))
+  } finally {
+    await svc.stop()
+  }
+}
 
 /* ───────────────────────── 23. stop ───────────────────────── */
 

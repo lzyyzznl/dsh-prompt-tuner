@@ -2018,7 +2018,8 @@ section('3c-12. 路由表对账：供应商变了表就跟着变')
     },
   }, {})
   check('删掉一个供应商后它的行确实消失了',
-    patchResult.config.router.order.map((r) => r.provider).join(',') === 'p1'
+    patchResult.config.router.offPeakOrder.map((r) => r.provider).join(',') === 'p1'
+      && patchResult.config.router.peakOrder.map((r) => r.provider).join(',') === 'p1'
       && patchResult.removedOrderRows.some((row) => row.provider === 'p2'),
   JSON.stringify(patchResult.removedOrderRows))
   check('只改 router 时不动顺序表', (() => {
@@ -2029,7 +2030,8 @@ section('3c-12. 路由表对账：供应商变了表就跟着变')
       router: { enabled: true, order: [{ provider: 'ghost', model: 'z' }] },
       converters: ['maas'],
     }, { router: { failureThreshold: 4 } }, {})
-    return only.config.router.order.length === 1 && only.removedOrderRows.length === 0
+    return only.config.router.offPeakOrder.length === 1 && only.config.router.peakOrder.length === 1
+      && only.removedOrderRows.length === 0
   })())
 }
 
@@ -3842,7 +3844,7 @@ function makeInput(initial = {}, chatNodes = [], legacyExtra = {}) {
   /* ── the split's acceptance criterion: no omission, no duplication ── */
   // Keyed off the `dspo-set-label` nodes on purpose: the 说明 blocks re-print
   // some of these names, so raw text would double-count them.
-  const ROW_KEYS = ['recentMessagesLabel', 'promptLabel', 'outputLangLabel', 'rewriteModelLabel', 'rewriteEffortLabel', 'btwModelLabel', 'btwEffortLabel', 'btwContextLabel', 'btwSaveHistoryLabel', 'titleModelLabel', 'titleEffortLabel', 'titleRerollLabel', 'titleMaxCharsLabel', 'notifyToggle', 'notifyPlatformLabel', 'notifyModelLabel', 'notifyEffortLabel', 'notifyCharsLabel', 'routerServiceLabel', 'routerOrderLabel', 'routerProvidersLabel', 'routerConvertersLabel', 'routerPolicyLabel', 'routerBusinessLabel', 'routerLiveStatsLabel', 'routerLiveLabel']
+  const ROW_KEYS = ['recentMessagesLabel', 'promptLabel', 'outputLangLabel', 'rewriteModelLabel', 'rewriteEffortLabel', 'btwModelLabel', 'btwEffortLabel', 'btwContextLabel', 'btwSaveHistoryLabel', 'titleModelLabel', 'titleEffortLabel', 'titleRerollLabel', 'titleMaxCharsLabel', 'notifyToggle', 'notifyPlatformLabel', 'notifyModelLabel', 'notifyEffortLabel', 'notifyCharsLabel', 'routerServiceLabel', 'routerOrderLabel', 'routerProvidersLabel', 'routerConvertersLabel', 'routerPolicyLabel', 'routerTimeLabel', 'routerLiveStatsLabel', 'routerLiveLabel']
   const expectedRows = ROW_KEYS.map((key) => bundle.DICT.zh[key])
   const sets = TAB_IDS.map((id) => labelsByTab[id])
   const summary = TAB_IDS.map((id) => `${id}:[${labelsByTab[id].join('|')}]`).join(' ')
