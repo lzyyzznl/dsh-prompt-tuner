@@ -2844,7 +2844,7 @@ function makeReact() {
   return React
 }
 
-function loadClientBundle(fetchImpl) {
+function loadClientBundle(fetchImpl, dom = null) {
   let captured = null
   const windowStub = {
     __ModuleLoader__: { load(spec) { captured = spec } },
@@ -2860,6 +2860,7 @@ function loadClientBundle(fetchImpl) {
   const documentListeners = new Map()
   globalThis.document = {
     querySelector: () => null,
+    querySelectorAll: (selector) => (typeof dom?.querySelectorAll === 'function' ? dom.querySelectorAll(selector) : []),
     createElement: () => ({ setAttribute() {}, remove() {}, textContent: '' }),
     head: { appendChild() {} },
     addEventListener(type, handler) {
@@ -2882,11 +2883,119 @@ function loadClientBundle(fetchImpl) {
     const full = { key: '', altKey: false, ctrlKey: false, metaKey: false, shiftKey: false, defaultPrevented: false, ...event }
     for (const handler of [...(documentListeners.get('keydown') ?? [])]) handler(full)
   }
+  /** Deliver one event to every document listener of that type, as the browser does. */
+  bundle.__fire = (type, event) => {
+    for (const handler of [...(documentListeners.get(type) ?? [])]) handler(event)
+    return event
+  }
+  /** How many document listeners of one type are registered right now. */
+  bundle.__listeners = (type) => documentListeners.get(type)?.size ?? 0
   bundle.__restore = () => {
     globalThis.fetch = previousFetch
     globalThis.window = previousWindow
   }
   return bundle
+}
+
+/* ── a tiny DOM: only the element shape the send hold reads ── */
+
+/** Does one element match one of the selectors this plugin writes? */
+function matchesSelector(element, selector) {
+  const tag = /^[a-zA-Z][\w-]*/.exec(selector)?.[0]?.toLowerCase() ?? null
+  const attribute = /\[([\w-]+)(?:="([^"]*)")?\]/.exec(selector)
+  if (tag !== null && String(element.tagName ?? '').toLowerCase() !== tag) return false
+  if (attribute === null) return true
+  const value = element.getAttribute?.(attribute[1])
+  if (value === null || value === undefined) return false
+  return attribute[2] === undefined || value === attribute[2]
+}
+
+/**
+ * One fake element: attributes, classes, children, and the four lookups the
+ * send hold performs (`querySelectorAll`, `closest`, `contains`, `classList`).
+ * @param {string} tag - element name.
+ * @param {object} attrs - initial attributes (a `contenteditable: 'true'` also sets `isContentEditable`).
+ * @param {object[]} children - children to append.
+ * @returns {object} the element.
+ */
+function makeFakeElement(tag, attrs = {}, children = []) {
+  const element = {
+    tagName: String(tag).toUpperCase(),
+    nodeType: 1,
+    attributes: { ...attrs },
+    children: [],
+    parent: null,
+    classes: new Set(),
+    isContentEditable: attrs.contenteditable === 'true',
+  }
+  element.getAttribute = (name) => (Object.prototype.hasOwnProperty.call(element.attributes, name) ? element.attributes[name] : null)
+  element.setAttribute = (name, value) => {
+    element.attributes[name] = String(value)
+  }
+  element.removeAttribute = (name) => {
+    delete element.attributes[name]
+  }
+  element.classList = {
+    add: (name) => element.classes.add(name),
+    remove: (name) => element.classes.delete(name),
+    contains: (name) => element.classes.has(name),
+  }
+  element.append = (child) => {
+    child.parent = element
+    element.children.push(child)
+    return child
+  }
+  element.descendants = () => element.children.flatMap((child) => [child, ...child.descendants()])
+  element.querySelectorAll = (selector) => element.descendants().filter((node) => matchesSelector(node, selector))
+  element.closest = (selector) => {
+    let current = element
+    while (current !== null && current !== undefined) {
+      if (matchesSelector(current, selector)) return current
+      current = current.parent
+    }
+    return null
+  }
+  element.contains = (node) => {
+    let current = node
+    while (current !== null && current !== undefined) {
+      if (current === element) return true
+      current = current.parent ?? null
+    }
+    return false
+  }
+  for (const child of children) element.append(child)
+  return element
+}
+
+/** A fake document that keeps its listeners, so a captured gesture can be delivered. */
+function makeFakeDocument() {
+  const listeners = new Map()
+  return {
+    addEventListener(type, handler) {
+      if (!listeners.has(type)) listeners.set(type, new Set())
+      listeners.get(type).add(handler)
+    },
+    removeEventListener(type, handler) {
+      listeners.get(type)?.delete(handler)
+    },
+    count: (type) => listeners.get(type)?.size ?? 0,
+    fire(type, event) {
+      for (const handler of [...(listeners.get(type) ?? [])]) handler(event)
+      return event
+    },
+  }
+}
+
+/** One fake event: records whether the capture-phase guard swallowed it. */
+function makeFakeEvent(target, extra = {}) {
+  const event = { ...extra, target, prevented: false, stopped: false }
+  event.preventDefault = () => {
+    event.prevented = true
+  }
+  event.stopPropagation = () => {
+    event.stopped = true
+  }
+  return event
 }
 
 /**
@@ -4725,6 +4834,117 @@ function makeClientCtx(face) {
   check('失败的时刻用错误文案回显', textOf(bundle.BtwPanel(input.props)).includes('超时'))
   check('失败同样不写输入框', input.writes.length === 0)
   bundle.__restore()
+}
+
+/* ── 发送锁：优化期间只锁「发送」，编辑器照常可打字 ── */
+
+/** The composer card the hold has to find, built the way the shell builds it. */
+function makeComposerCard() {
+  const editor = makeFakeElement('div', { contenteditable: 'true' })
+  const commands = makeFakeElement('button', { 'aria-label': '命令' })
+  const stop = makeFakeElement('button', { 'aria-label': '停止' })
+  const model = makeFakeElement('button', { 'aria-label': '选择模型' })
+  const send = makeFakeElement('button', { 'aria-label': '发送消息', class: 'core_primary' })
+  const btwBox = makeFakeElement('textarea', { 'aria-label': '旁路提问' })
+  const card = makeFakeElement('div', { 'data-composer-card': 'true' }, [editor, commands, stop, model, send, btwBox])
+  return { card, editor, commands, stop, model, send, btwBox }
+}
+
+{
+  const bundle = loadClientBundle(makeFetch())
+  const labels = bundle.sendButtonLabels()
+  check('发送按钮按 shell 自己的文案定位（不是「最后一个按钮」）', bundle.sendButtonIn(makeComposerCard().card, labels).getAttribute('aria-label') === '发送消息')
+  check('停止按钮不在发送文案里（同一个槽位换脸也不误伤）', !labels.includes('停止'))
+  check('定位不到时如实返回 null，而不是猜一个按钮', bundle.sendButtonIn(makeFakeElement('div'), labels) === null)
+
+  const { card, send, stop, model, editor, btwBox } = makeComposerCard()
+  const doc = makeFakeDocument()
+  const release = bundle.lockComposerSend(card, { labels, title: '优化中', document: doc })
+  check('锁住的是发送按钮本身', release !== null && send.classes.has('dspo-send-locked') === true && send.getAttribute('aria-disabled') === 'true')
+  check('锁住时给出可见理由（title）', send.getAttribute('title') === '优化中')
+  check('锁不写按钮自己的 disabled 属性（那个属性归 shell / React 所有）', send.getAttribute('disabled') === null)
+
+  const clickSend = doc.fire('click', makeFakeEvent(send))
+  check('发送按钮的点击在捕获阶段被吞掉', clickSend.prevented === true && clickSend.stopped === true)
+  check('停止按钮不受影响', doc.fire('click', makeFakeEvent(stop)).prevented === false)
+  check('同排的模型按钮不受影响', doc.fire('click', makeFakeEvent(model)).prevented === false)
+
+  const enter = doc.fire('keydown', makeFakeEvent(editor, { key: 'Enter' }))
+  check('编辑器里的回车（发送）被吞掉', enter.prevented === true && enter.stopped === true)
+  check('Shift+Enter（换行）不受影响', doc.fire('keydown', makeFakeEvent(editor, { key: 'Enter', shiftKey: true })).prevented === false)
+  check('输入法组字中的回车不受影响', doc.fire('keydown', makeFakeEvent(editor, { key: 'Enter', isComposing: true })).prevented === false)
+  check('旁路提问的 textarea 回车照常（只锁草稿编辑器）', doc.fire('keydown', makeFakeEvent(btwBox, { key: 'Enter' })).prevented === false)
+  check('卡片之外的编辑器不受影响', doc.fire('keydown', makeFakeEvent(makeFakeElement('div', { contenteditable: 'true' }), { key: 'Enter' })).prevented === false)
+  check('普通按键不受影响', doc.fire('keydown', makeFakeEvent(editor, { key: 'a' })).prevented === false)
+
+  release?.()
+  check('解锁后标记、理由、aria 全部还回去',
+    send.classes.has('dspo-send-locked') === false && send.getAttribute('title') === null && send.getAttribute('aria-disabled') === null)
+  check('解锁后发送按钮立刻恢复', doc.fire('click', makeFakeEvent(send)).prevented === false)
+  check('解锁后监听器也拆干净了', doc.count('click') === 0 && doc.count('keydown') === 0)
+
+  const kept = makeComposerCard()
+  kept.send.setAttribute('title', '原本的提示')
+  const keptDoc = makeFakeDocument()
+  bundle.lockComposerSend(kept.card, { labels, title: '优化中', document: keptDoc })?.()
+  check('解锁后按钮原本的 title 原样还回', kept.send.getAttribute('title') === '原本的提示')
+  check('找不到发送按钮时如实返回 null（调用方据此告警）', bundle.lockComposerSend(makeFakeElement('div'), { labels, document: makeFakeDocument() }) === null)
+  bundle.__restore()
+}
+
+{
+  // The whole point, end to end: while the rewrite streams the composer's own
+  // send gesture is held shut; the moment the run settles it is released — and
+  // the editor was never disabled along the way.
+  const fetchImpl = makeFetch()
+  const { card, send, editor } = makeComposerCard()
+  // The seat marker is how the hold finds its own card: the component renders
+  // `data-dspo-seat`, the fake document hands the same node back.
+  const seat = makeFakeElement('div', { 'data-dspo-seat': 'session-a' })
+  card.append(seat)
+  const bundle = loadClientBundle(fetchImpl, { querySelectorAll: (selector) => (selector === '[data-dspo-seat]' ? [seat] : []) })
+  await bundle.settingsStore.load(true)
+  const input = makeInput({ draft: '原始草稿' })
+  bundle.patchSession('session-a', { phase: 'running', text: '改写中', startedAt: Date.now() })
+  bundle.OptimizeButton(input.props)
+  check('优化中：shell 自己的发送按钮被锁住并给出理由',
+    send.classes.has('dspo-send-locked') === true && send.getAttribute('title').includes('优化中'))
+  check('优化中：发送点击被吞掉', bundle.__fire('click', makeFakeEvent(send)).prevented === true)
+  check('优化中：发送回车被吞掉', bundle.__fire('keydown', makeFakeEvent(editor, { key: 'Enter' })).prevented === true)
+  check('优化中：编辑器没有被禁用（草稿仍然可编辑）', editor.getAttribute('disabled') === null && editor.isContentEditable === true)
+  flushEffects()
+  check('改写结束（离开 running）后发送立刻恢复',
+    send.classes.has('dspo-send-locked') === false && bundle.__fire('click', makeFakeEvent(send)).prevented === false)
+  check('改写结束后监听器也拆掉了', bundle.__listeners('click') === 0 && bundle.__listeners('keydown') === 0)
+  input.state.draft = '原始草稿'
+  bundle.clearSession('session-a')
+  bundle.__restore()
+}
+
+{
+  // A shell whose send button this plugin cannot find must say so instead of
+  // leaving a button that still sends: no silent "locked" that is not locked.
+  const bundle = loadClientBundle(makeFetch())
+  await bundle.settingsStore.load(true)
+  const input = makeInput({ draft: '原始草稿' })
+  bundle.patchSession('session-a', { phase: 'running', text: '改写中', startedAt: Date.now() })
+  const render = mountClient(bundle, bundle.OptimizeButton)
+  render(input.props)
+  const tree = render(input.props)
+  check('锁不上发送按钮时明说（而不是静默地不禁用）', textOf(tree).includes('未能锁住发送按钮'))
+  flushEffects()
+  bundle.clearSession('session-a')
+  bundle.__restore()
+}
+
+{
+  // The hold is a gesture guard, not a DOM rewrite: it never writes the button's
+  // own disabled property and it never touches the editor.
+  check('发送锁不写任何 disabled 属性', !/\.disabled\s*=/.test(clientSource))
+  check('发送锁装在捕获阶段（先于 shell 的监听生效）', clientSource.includes("addEventListener('click', onClick, true)") && clientSource.includes("addEventListener('keydown', onKeyDown, true)"))
+  check('发送锁只在 running 期间安装', /if \(!busy\) \{[\s\S]{0,80}setSendLock\('idle'\)/.test(clientSource))
+  check('发送锁按 shell 自己的会话词典取文案（不硬编码选择器）', clientSource.includes("bind.call(locale, 'conversation')"))
+  check('发送锁只在优化期间生效（不改其它功能的输入框）', /lockComposerSend\(composerCardOf\(key\)/.test(clientSource))
 }
 
 {
