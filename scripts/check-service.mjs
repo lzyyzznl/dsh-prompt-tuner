@@ -537,15 +537,16 @@ section('4. /v1/models 与入参语义')
 const models = await get(`${base}/v1/models`)
 check('/v1/models 返回 list 形状', models.json?.object === 'list' && Array.isArray(models.json.data))
 const modelIds = (models.json?.data ?? []).map((entry) => entry.id)
-check('只列 provider/model 带前缀拼写，不再列有歧义的裸名',
-  modelIds.includes('maas-dsv4/deepseek-v4-flash') && modelIds.includes('maas-coclaw/co-claw')
-  && !modelIds.includes('deepseek-v4-flash') && !modelIds.includes('co-claw'), modelIds.join(','))
-check('每条模型都是 OpenAI 形状',
-  (models.json?.data ?? []).every((entry) => entry.object === 'model' && typeof entry.owned_by === 'string' && Number.isFinite(entry.created)))
-check('每条模型带官方名字段与可选窗口字段（ZTE 网关不报 context_window → 落到 1M 默认）',
-  (models.json?.data ?? []).every((entry) => typeof entry.name === 'string' && Number.isSafeInteger(entry.context_window))
-    && (models.json?.data ?? []).every((entry) => entry.context_window === U.DEFAULT_CONTEXT_WINDOW),
-  JSON.stringify((models.json?.data ?? []).slice(0, 2)))
+check('目录只有一条 auto：调用方不再从内部行里选',
+  modelIds.length === 1 && modelIds[0] === 'auto', modelIds.join(','))
+check('这条是 OpenAI 形状，owner 是路由器自己而不是某个供应商',
+  (models.json?.data ?? []).every((entry) => entry.object === 'model' && Number.isFinite(entry.created)
+    && entry.owned_by === 'dsh-prompt-tuner' && entry.name === 'auto'),
+  JSON.stringify(models.json?.data))
+check('窗口取候选里最小的那个（ZTE 网关都不报 → 落到 1M 默认）',
+  (models.json?.data ?? []).every((entry) => Number.isSafeInteger(entry.context_window))
+    && models.json.data[0].context_window === U.DEFAULT_CONTEXT_WINDOW,
+  JSON.stringify(models.json?.data))
 
 stub.mode = 'ok'
 stub.keyStatus = {}
@@ -557,7 +558,7 @@ const completion = await post(`${base}/v1/chat/completions`, {
   max_completion_tokens: 64,
 })
 check('非流式 HTTP 200', completion.status === 200, completion.text.slice(0, 200))
-check('model 回显调用方请求的名字', completion.json?.model === 'deepseek-v4-flash', completion.json?.model)
+check('model 回显的是 auto，而不是调用方请求的名字', completion.json?.model === 'auto', completion.json?.model)
 const message = completion.json?.choices?.[0]?.message
 check('reasoning 被改名为 reasoning_content', message?.reasoning_content === 'let me think about that' && message?.reasoning === undefined)
 check('常驻 null 的网关字段被摘掉', message?.refusal === undefined && message?.annotations === undefined && message?.audio === undefined)
@@ -680,7 +681,7 @@ await configure({
 stub.calls.length = 0
 const failover = await chat('co-claw')
 check('第一条路由 503 后仍能由第二条作答', failover.status === 200 && failover.json?.choices?.[0]?.message?.content === 'pong', `${failover.status} ${failover.text.slice(0, 200)}`)
-check('切换后响应的 model 仍是调用方请求的名字', failover.json?.model === 'co-claw', failover.json?.model)
+check('切换后响应的 model 仍是 auto（不泄漏实际作答的那一行）', failover.json?.model === 'auto', failover.json?.model)
 check('两次尝试都真的打到了上游', stub.calls.length === 2, String(stub.calls.length))
 const afterFailover = service.admin.state()
 check('坏路由的熔断器被打开', rowOf('maas-coclaw#k1', afterFailover)?.state === 'open')
@@ -691,37 +692,37 @@ stub.calls.length = 0
 const second = await chat('co-claw')
 check('第二次请求直接跳过已熔断的路由', second.status === 200 && stub.calls.length === 1, `${second.status} calls=${stub.calls.length}`)
 
-section('5a-2. 表里没有的模型不会被别的模型顶包')
-// 这一段防的是最坏的一类错：请求一个模型、拿到 200、名字还回显成你请求的那个，
-// 而背后答话的是另一个网关。上面 5a 里 `co-claw` 命中的是表里的行（正常切换），
-// 这里把 maas-coclaw 从表里拿掉——它仍然是**配置好的**供应商，所以全名应当只打它自己。
+section('5a-2. 北向模型名只是装饰：任意名字都按规则走整张表')
+// 这一段防的是旧契约最坏的一类错：调用方点名一个模型，那一行就被钉在第一位，
+// 于是时段/高峰档位再也改不动选路——规则形同虚设。新契约里名字不参与选路。
 stub.keyStatus = {}
 await cleanSlate()
-await configure({ order: [{ provider: 'maas-dsv4', model: 'deepseek-v4-flash' }], router: { retries: 0, failureThreshold: 2 } })
+await configure({
+  order: [{ provider: 'maas-dsv4', model: 'deepseek-v4-flash' }, { provider: 'maas-coclaw', model: 'co-claw' }],
+  router: { retries: 0, failureThreshold: 2, timeSlots: [] },
+})
 stub.calls.length = 0
-const qualified = await chat('maas-coclaw/co-claw')
-check('没列进表的全名由它自己的供应商作答（HTTP 200）', qualified.status === 200, `${qualified.status} ${qualified.text.slice(0, 160)}`)
-check('而且真的打在 co-claw 的密钥上，不是表头那条', stub.calls.length === 1 && stub.calls[0]?.key === 'gw-broken', `${stub.calls.length} calls key=${stub.calls[0]?.key}`)
-check('回显的仍是调用方请求的名字', qualified.json?.model === 'maas-coclaw/co-claw', qualified.json?.model)
+const named = await chat('co-claw')
+check('点名一个在表里的模型名，也不会把它提到第一位（名字被忽略）',
+  named.status === 200 && stub.calls.length >= 1 && stub.calls[0]?.key === 'gw-good',
+  `${named.status} calls=${stub.calls.map((call) => call.key).join(',')}`)
+check('回显的是 auto，不是被点名的那个', named.json?.model === 'auto', named.json?.model)
 
 stub.calls.length = 0
-stub.keyStatus = { 'gw-broken': 503 }
-const stranded = await chat('maas-coclaw/co-claw')
-check('它自己挂了就如实失败，不切到别的模型去', stranded.status >= 400, `${stranded.status}`)
-check('失败时也只打了它自己一次', stub.calls.length === 1 && stub.calls[0]?.key === 'gw-broken', `${stub.calls.length} calls key=${stub.calls[0]?.key}`)
-stub.keyStatus = {}
+const ghostName = await chat('totally-bogus/not-configured')
+check('瞎写的模型名不再 404，而是照常按顺序表服务', ghostName.status === 200, `${ghostName.status} ${ghostName.text.slice(0, 160)}`)
+check('它同样从顺序表第一行开始', stub.calls[0]?.key === 'gw-good', stub.calls.map((call) => call.key).join(','))
+check('回显仍是 auto', ghostName.json?.model === 'auto', ghostName.json?.model)
+
+stub.calls.length = 0
+const emptyName = await chat('')
+check('空字符串名字也照常服务（名字不参与校验）', emptyName.status === 200 && stub.calls.length >= 1, `${emptyName.status}`)
+
+stub.calls.length = 0
+const missingName = await post(`${base}/v1/chat/completions`, { messages: [{ role: 'user', content: 'ping' }] })
+check('连 model 字段都没有也照常服务', missingName.status === 200, `${missingName.status} ${missingName.text.slice(0, 160)}`)
+
 await cleanSlate()
-
-stub.calls.length = 0
-const ghost = await chat('totally-bogus/not-configured')
-check('瞎写的供应商/模型返回 404，而不是 200', ghost.status === 404, `${ghost.status} ${ghost.text.slice(0, 160)}`)
-check('404 的错误体仍是参照契约形状', ghost.json?.error?.type === 'invalid_request_error' && ghost.json?.error?.param === null, JSON.stringify(ghost.json).slice(0, 140))
-check('被拒的请求一个上游包都没发', stub.calls.length === 0, String(stub.calls.length))
-
-stub.calls.length = 0
-const bare = await chat('co-claw')
-check('只有模型名、表里又没有：无从判断供应商，也 404', bare.status === 404, `${bare.status}`)
-check('这条同样没有打上游', stub.calls.length === 0, String(stub.calls.length))
 await configure({ order: DEFAULT_ORDER, router: { retries: 0, failureThreshold: 2 } })
 
 section('5b. 同一条路由先重试，重试用完才切换')
@@ -1128,9 +1129,10 @@ check('发现 context_window 后写入 discoveredWindows',
   winProvider.discoveredWindows['m-manual'] === 3_000_000 && winProvider.discoveredWindows['stub-alpha'] === 2_000_000,
   JSON.stringify(winProvider.discoveredWindows))
 const modelsWithWin = await get(`${base}/v1/models`)
-check('/v1/models 用上游上报的窗口，而不是 1M 默认',
-  modelsWithWin.json?.data?.find((row) => row.id === 'p-models/m-manual')?.context_window === 3_000_000,
-  JSON.stringify(modelsWithWin.json?.data?.find((row) => row.id === 'p-models/m-manual') ?? null))
+check('/v1/models 的 auto 报候选里最小的窗口，而不是 1M 默认',
+  modelsWithWin.json?.data?.length === 1 && modelsWithWin.json.data[0].id === 'auto'
+  && modelsWithWin.json.data[0].context_window === 3_000_000,
+  JSON.stringify(modelsWithWin.json?.data))
 stub.modelsBody = null
 
 stub.calls.length = 0
@@ -1859,8 +1861,15 @@ const oneHit = TS.applyTimeOrder(orderRows, [{ start: '00:00', end: '23:59', pri
 check('applyTimeOrder：命中项整体前移，其余保持静态相对序',
   oneHit.rows.map((row) => row.provider).join(',') === 'p3,p1,p2,p4', oneHit.rows.map((r) => r.provider).join(','))
 const twoHits = TS.applyTimeOrder(orderRows, [{ start: '00:00', end: '23:59', priority: { p3: 2, p1: 5 } }], 600)
-check('applyTimeOrder：命中项之间不按档位排序，仍是静态序（稳定分区）',
-  twoHits.rows.map((row) => row.provider).join(',') === 'p1,p3,p2,p4', twoHits.rows.map((r) => r.provider).join(','))
+check('applyTimeOrder：命中项按档位升序，数字小的先试（p3=2 压过 p1=5）',
+  twoHits.rows.map((row) => row.provider).join(',') === 'p3,p1,p2,p4', twoHits.rows.map((r) => r.provider).join(','))
+const tieHits = TS.applyTimeOrder(orderRows, [{ start: '00:00', end: '23:59', priority: { p4: 3, p2: 3 } }], 600)
+check('applyTimeOrder：档位相同时仍按顺序表的静态位置（表是并列时的裁判）',
+  tieHits.rows.map((row) => row.provider).join(',') === 'p2,p4,p1,p3', tieHits.rows.map((r) => r.provider).join(','))
+const untieredTail = TS.applyTimeOrder(orderRows, [{ start: '00:00', end: '23:59', priority: { p4: 1 } }], 600)
+check('applyTimeOrder：没被点名的供应商整体排在点名者之后，内部保持静态序',
+  untieredTail.rows.map((row) => row.provider).join(',') === 'p4,p1,p2,p3',
+  untieredTail.rows.map((r) => r.provider).join(','))
 const disabled = TS.applyTimeOrder(orderRows, [{ start: '00:00', end: '23:59', priority: { p2: 0 } }], 600)
 check('applyTimeOrder：档位 0 的供应商本轮被剔除',
   disabled.rows.map((row) => row.provider).join(',') === 'p1,p3,p4'
@@ -1868,9 +1877,13 @@ check('applyTimeOrder：档位 0 的供应商本轮被剔除',
 const noRules = TS.applyTimeOrder(orderRows, [], 600)
 check('applyTimeOrder：没配时段时是恒等变换',
   noRules.rows.map((row) => row.provider).join(',') === 'p1,p2,p3,p4' && noRules.active === null)
-const pinned = TS.applyTimeOrder(orderRows, [{ start: '00:00', end: '23:59', priority: { p3: 1 } }], 600, { pin: 1 })
-check('applyTimeOrder：pin=1 时首行不被时段撬动（调用方指定优先于时钟）',
-  pinned.rows.map((row) => row.provider).join(',') === 'p1,p3,p2,p4', pinned.rows.map((r) => r.provider).join(','))
+// The old `pin` option existed to protect the row a caller had named. The
+// northbound name is ignored now, so nothing can be pinned and the fourth
+// argument is gone: passing one must have no effect at all.
+const ignoredExtra = TS.applyTimeOrder(orderRows, [{ start: '00:00', end: '23:59', priority: { p3: 1 } }], 600, { pin: 1 })
+check('applyTimeOrder：pin 概念已删除，多传的选项不再改变排序',
+  ignoredExtra.rows.map((row) => row.provider).join(',') === 'p3,p1,p2,p4',
+  ignoredExtra.rows.map((r) => r.provider).join(','))
 check('providerPriorityAt：未点名的供应商为 null（走静态顺序）',
   TS.providerPriorityAt(overlapRules, 'a', 23 * 60 + 45) === 1
   && TS.providerPriorityAt(overlapRules, 'zzz', 23 * 60 + 45) === null)
@@ -1937,8 +1950,8 @@ await configure({ order: fullOrder(), router: { timeSlots: [slotNow({ 'p-switch'
 stub.keyStatus = { 'gw-good': 503 }
 stub.calls.length = 0
 await chat('deepseek-v4-flash')
-check('时段命中：被点名的供应商越过静态顺序先被尝试（匹配行仍第一）',
-  stub.calls.map((call) => call.key).join(',') === 'gw-good,sw-a',
+check('时段命中：档位 1 的供应商第一个被尝试（名字不再把它钉在后面）',
+  stub.calls.map((call) => call.key).join(',') === 'sw-a',
   stub.calls.map((call) => call.key).join(','))
 
 await cleanSlate()
@@ -2095,8 +2108,8 @@ await configure({ order: fullOrder(), router: { businessRule: false, timeSlots: 
 stub.keyStatus = { 'gw-good': 503 }
 stub.calls.length = 0
 await chat('deepseek-v4-flash')
-check('关（缺省）时仍走 timeSlots：被点名的供应商先被尝试',
-  stub.calls.map((call) => call.key).join(',') === 'gw-good,sw-a',
+check('关（缺省）时仍走 timeSlots：档位 1 的供应商先被尝试',
+  stub.calls.map((call) => call.key).join(',') === 'sw-a',
   stub.calls.map((call) => call.key).join(','))
 const slotsSource = service.admin.state().timeSlot
 check('关时 /state 的生效来源是自定义时段表，标签就是窗口本身',
@@ -2128,8 +2141,8 @@ check('开时 /state 带出北京时间的峰谷判定结果（含周末/节假�
   && bizState?.status?.weekend === nowStatus.weekend && bizState?.status?.holiday === nowStatus.holiday,
   `${JSON.stringify(bizState?.status)} vs ${JSON.stringify(nowStatus)}`)
 if (nowStatus.status === 'peak') {
-  check('高峰时段：内置规则把被点名的供应商前移（窗口由日历算，不看 timeSlots 的 start/end）',
-    bizCalls === 'gw-good,sw-a', bizCalls)
+  check('高峰时段：内置规则让档位 1 的供应商先试（窗口由日历算，不看 timeSlots 的 start/end）',
+    bizCalls === 'sw-a', bizCalls)
   check('高峰时段：命中的供应商未配档位时留在静态位置（p-switch 是 1，maas-coclaw 仍按静态序）',
     bizState?.effective?.['p-switch'] === 1 && bizState?.effective?.['maas-coclaw'] === null,
     JSON.stringify(bizState?.effective))
@@ -2173,7 +2186,7 @@ stub.keyStatus = { 'gw-good': 503 }
 stub.calls.length = 0
 await chat('deepseek-v4-flash')
 check('关掉开关立刻退回 timeSlots（无需重启服务）',
-  stub.calls.map((call) => call.key).join(',') === 'gw-good,sw-a'
+  stub.calls.map((call) => call.key).join(',') === 'sw-a'
   && service.admin.state().timeSlot?.source === 'slots',
   `${stub.calls.map((call) => call.key).join(',')} / ${service.admin.state().timeSlot?.source}`)
 
@@ -2190,26 +2203,31 @@ await configure({ order: DEFAULT_ORDER, router: { businessRule: false, timeSlots
 // The live assertions above follow whatever the wall clock happens to say, so
 // on a weekend only the off-peak branch runs. These pin the instant and drive
 // the very three functions `walk()` chains together (beijingPeakStatus →
-// effectiveBusinessPriority → partitionByRule with pin:1), which is exactly the
-// peak-time decision, so the peak branch is covered on any day.
+// effectiveBusinessPriority → partitionByRule), which is exactly the peak-time
+// decision, so the peak branch is covered on any day.
 const peakRule = { rule: { start: '0500', end: '2300', priority: TS.effectiveBusinessPriority(bizSlots) } }
 const peakRows = [
   { provider: 'a', model: 'm1' }, { provider: 'b', model: 'm2' },
   { provider: 'c', model: 'm3' }, { provider: 'd', model: 'm4' },
 ]
-const peakPartition = TS.partitionByRule(peakRows, peakRule, { pin: 1 })
-check('高峰规则（固定时刻）：命中的供应商整体前移，未点名者留在原地',
+const peakPartition = TS.partitionByRule(peakRows, peakRule)
+check('高峰规则（固定时刻）：点名者按档位升序在前，未点名者按静态序在后',
   peakPartition.rows.map((row) => row.provider).join(',') === 'a,c,d',
   peakPartition.rows.map((row) => row.provider).join(','))
 check('高峰规则（固定时刻）：档位 0 的供应商进入 disabled 列表（事件流据此上报）',
   peakPartition.disabled.map((row) => row.provider).join(',') === 'b',
   peakPartition.disabled.map((row) => row.provider).join(','))
-check('高峰规则（固定时刻）：pin=1 让调用方指定的首行保持在最前',
+check('高峰规则（固定时刻）：档位表把三家都点名时，链顺序完全由档位决定',
+  TS.partitionByRule(
+    [{ provider: 'd', model: 'm4' }, { provider: 'a', model: 'm1' }, { provider: 'b', model: 'm2' }],
+    { rule: { start: '0500', end: '2300', priority: { a: 3, b: 1, d: 2 } } },
+  ).rows.map((row) => row.provider).join(',') === 'b,d,a')
+check('高峰规则（固定时刻）：pin 概念不存在，多传的选项不改变结果',
   TS.partitionByRule(
     [{ provider: 'd', model: 'm4' }, { provider: 'a', model: 'm1' }],
     { rule: { start: '0500', end: '2300', priority: { a: 1 } } },
     { pin: 1 },
-  ).rows.map((row) => row.provider).join(',') === 'd,a')
+  ).rows.map((row) => row.provider).join(',') === 'a,d')
 check('高峰规则（固定时刻）：同一个时刻在日历上确实是高峰，午休时不是',
   TS.beijingPeakStatus(bj('2026-10-14 10:00')).status === 'peak'
   && TS.beijingPeakStatus(bj('2026-10-14 12:30')).status === 'off-peak')

@@ -115,7 +115,9 @@ const record = (name, ok, detail) => {
 {
   const r = await fetch(`${base}/v1/models`)
   const j = await r.json()
-  record('GET /v1/models 合成成功', r.status === 200 && j.object === 'list' && j.data.length >= 2, JSON.stringify(j.data?.map((m) => m.id)))
+  record('GET /v1/models 只广告一条 auto', r.status === 200 && j.object === 'list'
+    && j.data.length === 1 && j.data[0]?.id === 'auto' && j.data[0]?.owned_by === 'dsh-prompt-tuner',
+    JSON.stringify(j.data))
 }
 
 // 2. non-streaming, thinking explicitly disabled
@@ -125,7 +127,9 @@ const record = (name, ok, detail) => {
   const j = await r.json()
   const msg = j.choices?.[0]?.message
   record('非流式 200', r.status === 200, `${r.status} ${JSON.stringify(j).slice(0, 160)}`)
-  record('model 回显请求名', j.model === 'deepseek-v4-flash', j.model)
+  // The body still asks for a legacy name on purpose: the name must be ignored,
+  // not refused, so an existing client keeps working.
+  record('回显 auto 而不是请求名（请求名被忽略）', j.model === 'auto', j.model)
   record('thinking={type:disabled} 真的关掉了思考（无 reasoning_content）', msg?.reasoning_content === undefined, JSON.stringify({ content: msg?.content, reasoning_content: msg?.reasoning_content }))
   record('message 只有参照契约的字段', msg !== undefined && !('reasoning' in msg) && !('audio' in msg) && !('annotations' in msg) && !('refusal' in msg), JSON.stringify(Object.keys(msg ?? {})))
   record('顶层没有网关噪声字段', j.prompt_token_ids === undefined && j.prompt_text === undefined && j.service_tier === undefined && j.metrics === undefined && j.kv_transfer_params === undefined, JSON.stringify(Object.keys(j)))
@@ -155,7 +159,7 @@ const record = (name, ok, detail) => {
   const done = chunks[chunks.length - 1] === '[DONE]'
   const parsed = chunks.filter((c) => c !== '[DONE]').map((c) => { try { return JSON.parse(c) } catch { return null } }).filter(Boolean)
   record('流式以 [DONE] 收尾', r.status === 200 && done, `${r.status} frames=${parsed.length}`)
-  record('每个分片都是参照契约的形状', parsed.every((c) => c.object === 'chat.completion.chunk' && c.model === 'deepseek-v4-flash'), JSON.stringify(parsed[0]))
+  record('每个分片都是参照契约的形状，且都标着 auto', parsed.every((c) => c.object === 'chat.completion.chunk' && c.model === 'auto'), JSON.stringify(parsed[0]))
   record('分片里没有网关噪声字段', parsed.every((c) => c.prompt_token_ids === undefined && c.service_tier === undefined), JSON.stringify(Object.keys(parsed[0] ?? {})))
   record('末片带 usage', parsed.some((c) => c.usage?.prompt_tokens > 0), JSON.stringify(parsed.at(-1)?.usage))
 }

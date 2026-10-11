@@ -1532,7 +1532,7 @@ const {
   reconcileOrder,
 } = await import('../lib/service/config.js')
 
-const { buildCandidates, buildChain, parseRouteName, resolveRoute } = await import('../lib/service/proxy.js')
+const { buildCandidates, NORTHBOUND_MODEL, NORTHBOUND_OWNER } = await import('../lib/service/proxy.js')
 
 section('3c-1. 熔断单位：provider 与 provider#key')
 
@@ -1850,45 +1850,29 @@ section('3c-7. 拉黑判定：凭据死了而不是抽风')
   check('400 请求错误不拉黑', blacklistVerdict({ status: 400, message: 'messages is required' }).should === false)
 }
 
-section('3c-8. 候选展开：顺序表 × key')
+section('3c-8. 候选展开：整张顺序表 × key（北向只服务 auto）')
 
 {
   const order = [
     { provider: 'p1', model: 'm1' },
     { provider: 'p2', model: 'm2' },
   ]
-  check('命中的行排在前面，其余按配置顺序环形跟随',
-    buildChain(order, 'm2').map((r) => r.provider).join(',') === 'p2,p1'
-      && buildChain(order, 'p1/m1').map((r) => r.provider).join(',') === 'p1,p2')
-  check('路由名可以是 model 或 provider/model', parseRouteName('m1').provider === null
-    && parseRouteName('p1/m1').provider === 'p1'
-    && parseRouteName('m1').model === 'm1')
-  check('空顺序表没有候选', buildChain([], 'm1').length === 0)
-
-  // 未命中不再等于「从表头开始」：那正是模型被悄悄顶包的原因。
-  const routed = (requested, ids) => resolveRoute(order, requested, ids)
-  check('未命中顺序表的模型名不再落到表头那一行', buildChain(order, 'unknown').length === 0)
-  check('报了一个配了供应商的全名：只用它自己，后面不跟别的行',
-    routed('p3/m3', ['p1', 'p2', 'p3']).reason === 'provider'
-      && routed('p3/m3', ['p1', 'p2', 'p3']).rows.map((r) => `${r.provider}/${r.model}`).join(',') === 'p3/m3',
-    JSON.stringify(routed('p3/m3', ['p1', 'p2', 'p3'])))
-  check('供应商没配置过就是「本路由不服务这个模型」',
-    routed('ghost/m3', ['p1', 'p2']).reason === 'unknown' && routed('ghost/m3', ['p1', 'p2']).rows.length === 0)
-  check('只有模型名、表里又没有：无从判断供应商，同样拒绝',
-    routed('m9', ['p1', 'p2']).reason === 'unknown')
-  check('什么都没写也算不服务', routed('', ['p1']).reason === 'unknown' && routed('p1/', ['p1']).reason === 'unknown')
-  check('空顺序表即使给了全名也不服务（清空表 = 什么都不路由）',
-    resolveRoute([], 'p1/m1', ['p1']).reason === 'unknown')
+  // The northbound model name is no longer an input: every request is served by
+  // the whole order table, and the routing rules decide the order. There is no
+  // "matching row goes first" and no "provider/model dials only itself", which
+  // is what used to let a caller pin a row and bypass the rules.
+  check('对外只服务一个模型名：auto', NORTHBOUND_MODEL === 'auto' && NORTHBOUND_OWNER === 'dsh-prompt-tuner')
 
   const unitsFor = (row) => (row.provider === 'p1'
     ? [{ id: 'k1', label: 'a', key: 's1' }, { id: 'k2', label: 'b', key: 's2' }]
     : [{ id: null, label: '', key: '' }])
-  const candidates = buildCandidates(buildChain(order, 'm1'), unitsFor)
+  const candidates = buildCandidates(order, unitsFor)
   check('每个候选 = 一行 × 一把 key', candidates.length === 3, JSON.stringify(candidates.map((c) => `${c.provider}#${c.keyId}`)))
   check('同一 provider 的 key 相邻（先在本供应商内换 key）',
     candidates.map((c) => `${c.provider}#${c.keyId ?? '-'}`).join(',') === 'p1#k1,p1#k2,p2#-',
     candidates.map((c) => `${c.provider}#${c.keyId ?? '-'}`).join(','))
   check('候选带着要用的密钥', candidates[0].key === 's1' && candidates[2].key === '')
+  check('空顺序表没有候选', buildCandidates([], unitsFor).length === 0)
   check('unitsForRow 抛异常时退化为一个无 key 单位', (() => {
     const safe = buildCandidates([{ provider: 'p', model: 'm' }], () => { throw new Error('boom') })
     return safe.length === 1 && safe[0].keyId === null
