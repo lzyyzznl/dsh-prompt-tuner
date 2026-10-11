@@ -1964,7 +1964,7 @@ check('写上去的行没有任何档位数字字段',
 
 /* ───────────────────────── 24b. the workday calendar ───────────────────────── */
 
-section('24b. 工作日日历：外部接口是「补班修正层」，每天一问、失败回退内置表')
+section('24b. 工作日日历：接口只用来认节假日，补班周末仍按空闲时段（低谷）')
 
 const CAL = await import('../lib/service/calendar.js')
 const STORE = await import('../lib/service/state.js')
@@ -1998,24 +1998,40 @@ function calendarFetch(byDate, fallback = null) {
   return stubFn
 }
 
-// -- 补班日：内置表说周末，外部接口说工作日 → 高峰 -------------------------
+// -- 补班周末：接口说是工作日，但 DeepSeek 按空闲时段计费 → 仍是低谷 ---------
 // 2026-10-10 is a Saturday that the annual arrangement turns into a workday.
+// The reference bills 调休上班的周末 as 空闲时段, so peak must NOT be handed to it.
 {
   const calls = calendarFetch({ '2026-10-10': apiAnswer('2026-10-10', { workday: true, info: '国庆节后补班', week: '周六' }) })
   const cal = CAL.createWorkdayCalendar({ now: () => bj('2026-10-10 10:00'), fetch: calls })
   const before = cal.status()
-  check('刷新前：内置表把补班周六当周末 → 低谷（内置表口径的已知短板）',
-    before.status === 'off-peak' && before.workday === false && before.source === 'builtin' && before.weekend === true,
+  check('刷新前：补班周六按周末判 → 低谷',
+    before.status === 'off-peak' && before.workday === false && before.makeup === false
+    && before.source === 'builtin' && before.weekend === true,
     JSON.stringify(before))
   await cal.refresh()
   const after = cal.status()
-  check('刷新后：外部接口说是工作日 → 补班日 10:00 判高峰',
-    after.status === 'peak' && after.workday === true && after.source === 'api' && after.info === '国庆节后补班',
+  check('刷新后：接口说这天上班，但调休上班的周末按空闲时段计费 → 仍是低谷',
+    after.status === 'off-peak' && after.workday === false && after.makeup === true && after.weekend === true
+    && after.source === 'api' && after.info === '国庆节后补班',
     JSON.stringify(after))
+  check('补班日的高峰时段（10:00）也不会被判成高峰（周末优先于接口）',
+    after.minutes === 600 && after.status === 'off-peak')
   check('query 打的是 /workingday/api 并带上北京日期',
     calls.calls.length === 1 && calls.calls[0].includes('/workingday/api?date=2026-10-10'), calls.calls.join('|'))
   const again = await cal.refresh()
   check('同一天再刷新不再请求（一天一问）', again !== null && calls.calls.length === 1, String(calls.calls.length))
+}
+
+// -- 普通周末（接口也说是非工作日）：不是补班，标注为普通非工作日 ------------
+{
+  const calls = calendarFetch({ '2026-10-11': apiAnswer('2026-10-11', { workday: false, info: '周日', week: '周日' }) })
+  const cal = CAL.createWorkdayCalendar({ now: () => bj('2026-10-11 10:00'), fetch: calls })
+  await cal.refresh()
+  const v = cal.status()
+  check('普通周日：低谷、makeup=false、holiday=false（周末不是节假日）',
+    v.status === 'off-peak' && v.makeup === false && v.holiday === false && v.workday === false && v.source === 'api',
+    JSON.stringify(v))
 }
 
 // -- 反方向：外部接口说这个工作日不上班 → 全天低谷 --------------------------
@@ -2025,9 +2041,21 @@ function calendarFetch(byDate, fallback = null) {
   check('刷新前：工作日 + 高峰时段 = 高峰（内置表）', cal.status().status === 'peak')
   await cal.refresh()
   const v = cal.status()
-  check('刷新后：外部接口说这天不上班 → 工作日 10:00 也判低谷',
-    v.status === 'off-peak' && v.workday === false && v.source === 'api' && v.weekend === false && v.holiday === false,
+  check('刷新后：外部接口说这天不上班 → 工作日 10:00 也判低谷（接口能把高峰拿掉）',
+    v.status === 'off-peak' && v.workday === false && v.holiday === true && v.makeup === false
+    && v.source === 'api' && v.weekend === false,
     JSON.stringify(v))
+}
+
+// -- 内置表与接口打架：接口说上班 → 以接口为准（内置表只是兜底） -------------
+{
+  const calls = calendarFetch({ '2026-10-08': apiAnswer('2026-10-08', { workday: true, info: '工作日', week: '周四' }) })
+  const cal = CAL.createWorkdayCalendar({ now: () => bj('2026-10-08 10:00'), fetch: calls })
+  check('刷新前：内置表把 2026-10-08 列为国庆假期 → 低谷（内置表口径）', cal.status().status === 'off-peak')
+  await cal.refresh()
+  const v = cal.status()
+  check('刷新后：接口说这天是工作日 → 以接口为准，判高峰（手写表的错被纠正）',
+    v.status === 'peak' && v.workday === true && v.holiday === false && v.source === 'api', JSON.stringify(v))
 }
 
 // -- 高峰窗口的边界只由「工作日 + 时刻」决定 -------------------------------
@@ -2057,7 +2085,8 @@ function calendarFetch(byDate, fallback = null) {
   let clock = bj('2026-10-10 10:00')
   const cal = CAL.createWorkdayCalendar({ now: () => clock, fetch: calls })
   await cal.refresh()
-  check('补班周六问出工作日（source=api）', cal.status().source === 'api' && cal.status().workday === true)
+  check('补班周六问出「接口说上班」（source=api，makeup=true）',
+    cal.status().source === 'api' && cal.status().makeup === true && cal.status().status === 'off-peak')
   clock = bj('2026-10-11 10:00')
   check('跨到第二天：昨天的答案立刻作废，先退回内置表（周日 → 低谷）',
     cal.status().source === 'builtin' && cal.status().status === 'off-peak', JSON.stringify(cal.status()))
@@ -2146,8 +2175,9 @@ function calendarFetch(byDate, fallback = null) {
     JSON.stringify(onDisk.calendar))
   const second = STORE.createStateStore({ file: stateFile })
   const cal2 = CAL.createWorkdayCalendar({ now: () => bj('2026-10-10 10:00'), fetch: calendarFetch({}, null), store: second })
-  check('重启后直接用盘上的结论，不再请求外部接口（补班日仍是高峰）',
-    cal2.status().source === 'api' && cal2.status().status === 'peak' && cal2.status().info === '国庆节后补班',
+  check('重启后直接用盘上的结论，不再请求外部接口（补班日仍按空闲时段 → 低谷）',
+    cal2.status().source === 'api' && cal2.status().status === 'off-peak' && cal2.status().makeup === true
+    && cal2.status().info === '国庆节后补班',
     JSON.stringify(cal2.status()))
   writeFileSync(stateFile, JSON.stringify({ calendar: { date: 'not-a-date', workday: true } }))
   const third = STORE.createStateStore({ file: stateFile })
@@ -2305,11 +2335,12 @@ async function startPinned(nowAt, routerOverrides = {}, extra = {}) {
   }
 }
 
-// -- 外部日历改写「今天是高峰还是低谷」：同一时刻、同一批表，只换日历 ------
+// -- 日历对选路的影响：接口只能把高峰拿掉，不能把高峰给一个周末 -----------
 {
-  // 2026-10-10 is a Saturday that the annual arrangement turned into a workday.
-  // The built-in table reads it as a weekend; the external calendar says it is a
-  // compulsory workday. Same clock, same tables — only the calendar differs.
+  // 2026-10-10 is a Saturday the annual arrangement turned into a workday, and
+  // DeepSeek bills 调休上班的周末 as 空闲时段. So the external answer makes no
+  // routing difference here — but it must be *reported*, because a bare
+  // 「周六=低谷」 line looks wrong to anyone who knows people worked that day.
   const PIN_MAKEUP = bj('2026-10-10 10:00')
   const calendarUrls = []
   const fetchCalendar = async (url) => {
@@ -2330,9 +2361,10 @@ async function startPinned(nowAt, routerOverrides = {}, extra = {}) {
     // makes the assertion deterministic instead of a race.
     await svc.calendar.refresh()
     const st = svc.admin.state().timeSlot
-    check('补班日的真服务：外部日历说工作日 → flavor=peak（内置表会判低谷）',
-      st?.flavor === 'peak' && st?.status?.source === 'api' && st?.status?.workday === true
-      && st?.status?.info === '国庆节后补班' && st?.status?.weekend === true && st?.status?.date === '2026-10-10',
+    check('补班周末的真服务：接口说上班也不给高峰 → flavor=off-peak，makeup 标注出来',
+      st?.flavor === 'off-peak' && st?.status?.source === 'api' && st?.status?.makeup === true
+      && st?.status?.workday === false && st?.status?.weekend === true
+      && st?.status?.info === '国庆节后补班' && st?.status?.date === '2026-10-10',
       JSON.stringify(st?.status))
     check('真服务：/state 带出日历自身的状态（来源、缓存条目、最近一次失败）',
       st?.calendar?.enabled === true && st?.calendar?.source === 'api' && st?.calendar?.cached?.date === '2026-10-10'
@@ -2341,26 +2373,55 @@ async function startPinned(nowAt, routerOverrides = {}, extra = {}) {
     check('真服务向外部日历报的是北京日期，且一天只问一次',
       calendarUrls.length === 1 && calendarUrls[0].includes('/workingday/api?date=2026-10-10'), calendarUrls.join('|'))
     await post(`${base}/v1/chat/completions`, { model: 'm-switch', messages: [{ role: 'user', content: 'ping' }] }, headers)
-    check('补班日的请求真的按高峰表走：coclaw 先，dsv4 完全不碰',
-      stub.calls.map((call) => call.key).join(',') === 'gw-broken', stub.calls.map((call) => call.key).join(','))
+    check('补班周末照旧按低谷表走：dsv4 先，coclaw 只在它失败后才接',
+      stub.calls.map((call) => call.key).join(',') === 'gw-good,gw-broken', stub.calls.map((call) => call.key).join(','))
   } finally {
     await svc.stop()
   }
 }
 {
-  // Same instant, same tables, no external calendar: the built-in table wins and
-  // the Saturday is off-peak. This is what makes the case above meaningful.
+  // Same instant, same tables, no external calendar: also off-peak (the weekend
+  // rule needs nobody's permission). The difference is only in what is reported.
   const PIN_MAKEUP = bj('2026-10-10 10:00')
   const { svc, base, headers } = await startPinned(PIN_MAKEUP)
   try {
     stub.keyStatus = { 'gw-good': 503 }
     stub.calls.length = 0
     const st = svc.admin.state().timeSlot
-    check('同一时刻关掉外部日历：内置表把周六判低谷，source=builtin',
-      st?.flavor === 'off-peak' && st?.status?.source === 'builtin' && st?.calendar?.enabled === false,
+    check('同一时刻关掉外部日历：同样低谷、source=builtin、没有 makeup 标注',
+      st?.flavor === 'off-peak' && st?.status?.source === 'builtin' && st?.status?.makeup === false
+      && st?.calendar?.enabled === false,
       JSON.stringify({ status: st?.status, calendar: st?.calendar }))
     await post(`${base}/v1/chat/completions`, { model: 'm-switch', messages: [{ role: 'user', content: 'ping' }] }, headers)
     check('同一时刻因此按低谷表走：dsv4 先（失败再落 coclaw）',
+      stub.calls.map((call) => call.key).join(',') === 'gw-good,gw-broken', stub.calls.map((call) => call.key).join(','))
+  } finally {
+    await svc.stop()
+  }
+}
+{
+  // The direction where the calendar *does* change routing: a weekday the API
+  // says is not a working day (a holiday moved onto a Wednesday). Same clock,
+  // same tables — with the calendar the request is off-peak, without it peak.
+  const fetchHoliday = async () => ({
+    ok: true,
+    status: 200,
+    async json() {
+      return { status: 1, date: '2026-10-14', info: '调休放假', week: '周三', is_workingday: 0 }
+    },
+  })
+  const { svc, base, headers } = await startPinned(PIN_PEAK, {}, { calendarFetch: fetchHoliday })
+  try {
+    stub.keyStatus = { 'gw-good': 503 }
+    stub.calls.length = 0
+    await svc.calendar.refresh()
+    const st = svc.admin.state().timeSlot
+    check('工作日放假：接口说不上班 → 高峰时段的周三也判低谷（接口能把高峰拿掉）',
+      st?.flavor === 'off-peak' && st?.status?.source === 'api' && st?.status?.holiday === true
+      && st?.status?.workday === false && st?.status?.weekend === false,
+      JSON.stringify(st?.status))
+    await post(`${base}/v1/chat/completions`, { model: 'm-switch', messages: [{ role: 'user', content: 'ping' }] }, headers)
+    check('因此同一时刻走低谷表：dsv4 先（关掉日历则会先试 coclaw）',
       stub.calls.map((call) => call.key).join(',') === 'gw-good,gw-broken', stub.calls.map((call) => call.key).join(','))
   } finally {
     await svc.stop()

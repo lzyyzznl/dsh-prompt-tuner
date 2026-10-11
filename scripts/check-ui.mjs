@@ -1370,12 +1370,12 @@ check('某张表为空时链上显示「无」，页面不报错',
 check('内置表判定时，说明行注明是内置节假日表（回退口径）',
   peakLine.text.includes(strings.zh.timeLineSourceBuiltin), peakLine.text)
 
-// 补班周六：外部工作日接口说是工作日 —— 说明行必须点出真正下判断的是谁，
-// 否则一个「周六 = 高峰」的结论看起来就是错的。
+// 补班周六：接口说这天上班，但 DeepSeek 按空闲时段计费 —— 说明行必须说清
+// 「为什么是低谷」以及「这个周六其实要上班」，否则看起来就是错的。
 const makeupState = fixtureState()
 makeupState.timeSlot = {
-  flavor: 'peak',
-  status: { status: 'peak', weekday: 6, weekend: true, holiday: false, date: '2026-10-10', minutes: 600, label: '高峰', workday: true, source: 'api', info: '国庆节后补班' },
+  flavor: 'off-peak',
+  status: { status: 'off-peak', weekday: 6, weekend: true, holiday: false, date: '2026-10-10', minutes: 600, label: '低谷', workday: false, makeup: true, source: 'api', info: '国庆节后补班' },
   calendar: { enabled: true, source: 'api', cached: { date: '2026-10-10', workday: true, info: '国庆节后补班', week: '周六', fetchedAt: '2026-10-10T02:00:00.000Z' }, lastError: null },
   order: {
     peak: [{ provider: 'ghost', model: 'ghost-1' }],
@@ -1383,13 +1383,17 @@ makeupState.timeSlot = {
   }
 }
 const makeupLine = await lineOf(makeupState)
-check('补班日：说明行说「当前=高峰」并注明是外部工作日接口、带补班名称',
-  makeupLine.text !== undefined && makeupLine.text.includes(strings.zh.timeLinePeak.split('{when}')[0])
+check('补班周末：说明行是「当前=低谷」，注明是外部工作日接口、带补班名称与试序',
+  makeupLine.text !== undefined && makeupLine.text.includes(strings.zh.timeLineOffPeak.split('{when}')[0])
   && makeupLine.text.includes('2026-10-10 10:00')
   && makeupLine.text.includes('外部工作日接口') && makeupLine.text.includes('国庆节后补班')
-  && makeupLine.text.includes('ghost'),
+  && makeupLine.text.includes('alpha'),
   makeupLine.text)
-check('补班日不再出现「内置节假日表（回退）」这句（不能用回退口径解释高峰）',
+check('补班周末：明确写出「调休上班的周末按空闲时段计费，故按低谷处理」',
+  makeupLine.text.includes(strings.zh.timeLineMakeup.replace(/^\s*｜\s*/, '')), makeupLine.text)
+check('补班周末：高峰表里的 ghost 不出现（这次走的是低谷表）',
+  !makeupLine.text.includes('ghost'), makeupLine.text)
+check('补班周末不出现「内置节假日表（回退）」这句（判断来自外部接口，不是回退）',
   !makeupLine.text.includes(strings.zh.timeLineSourceBuiltin), makeupLine.text)
 
 const routedPage = await lineOf(peakState)
