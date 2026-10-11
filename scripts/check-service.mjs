@@ -589,7 +589,7 @@ check('非 off 的预算档位一律收成 max', stub.calls[0]?.body?.reasoning_
 await post(`${base}/v1/chat/completions`, { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'x' }], reasoning_effort: 'minimal' })
 check('minimal 作为非 off 档位收成 max', stub.calls[1]?.body?.reasoning_effort === 'max', stub.calls[1]?.body?.reasoning_effort)
 await post(`${base}/v1/chat/completions`, { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'x' }] })
-check('调用方什么都没说时不自作主张加档位', stub.calls[2]?.body?.reasoning_effort === undefined, stub.calls[2]?.body?.reasoning_effort)
+check('调用方什么都没说时默认登记成 max（缺省 = 思考）', stub.calls[2]?.body?.reasoning_effort === 'max', stub.calls[2]?.body?.reasoning_effort)
 
 stub.calls.length = 0
 // An expressed-but-unreadable thinking value must never reach the gateway
@@ -604,9 +604,9 @@ const unreadable = [
   ['effort', { effort: 'nonsense' }, 'max', 'effort 拼写读不出来时归一成 max'],
   ['thinking.type', { thinking: { type: 'whatever' } }, 'max', 'thinking 里读不出来的写法归一成 max'],
   ['thinking.extra', { thinking: { weird: 1 } }, 'max', 'thinking 带了认不出含义的键也归一成 max'],
-  ['thinking.empty', { thinking: {} }, undefined, '空的 thinking 不算表态，不发档位'],
-  ['reasoning_effort', { reasoning_effort: null }, undefined, 'null 等同于没表态'],
-  ['reasoning_effort', { reasoning_effort: '' }, undefined, '空串等同于没表态'],
+  ['thinking.empty', { thinking: {} }, 'max', '空的 thinking 不算表态 → 默认 max'],
+  ['reasoning_effort', { reasoning_effort: null }, 'max', 'null 等同于没表态 → 默认 max'],
+  ['reasoning_effort', { reasoning_effort: '' }, 'max', '空串等同于没表态 → 默认 max'],
   ['both', { effort: 'bogus', reasoning_effort: 'off' }, 'none', '能读出来的写法优先于读不出来的（off 胜出）'],
   ['reasoning_effort', { reasoning_effort: 'off' }, 'none', 'off 仍然是真的关（归一成 none）'],
   ['thinking', { thinking: { type: 'disabled' }, reasoning_effort: 'bogus' }, 'none', 'thinking 胜过 reasoning_effort'],
@@ -647,9 +647,9 @@ check('enable_thinking=true 是开启思考（收成 max）', stub.calls[2]?.bod
 await post(`${base}/v1/chat/completions`, { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'x' }], chat_template_kwargs: { enable_thinking: 'maybe' } })
 check('模板开关读不出来时同样归一成 max', stub.calls[3]?.body?.reasoning_effort === 'max', stub.calls[3]?.body?.reasoning_effort)
 await post(`${base}/v1/chat/completions`, { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'x' }], chat_template_kwargs: { unrelated_template_var: 7 } })
-check('没有 enable_thinking 的模板参数不算思考表态', stub.calls[4]?.body?.reasoning_effort === undefined, stub.calls[4]?.body?.reasoning_effort)
+check('没有 enable_thinking 的模板参数不算思考表态 → 默认 max', stub.calls[4]?.body?.reasoning_effort === 'max', stub.calls[4]?.body?.reasoning_effort)
 check('无关的模板参数原样继续走', stub.calls[4]?.body?.chat_template_kwargs?.unrelated_template_var === 7, JSON.stringify(stub.calls[4]?.body?.chat_template_kwargs))
-check('没表态时也不凭空加 enable_thinking', stub.calls[4]?.body?.chat_template_kwargs?.enable_thinking === undefined)
+check('缺省同样被判定成档位，模板开关写成 true', stub.calls[4]?.body?.chat_template_kwargs?.enable_thinking === true)
 await post(`${base}/v1/chat/completions`, { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'x' }], reasoning_effort: 'bogus', chat_template_kwargs: { enable_thinking: false } })
 check('读得懂的模板开关胜过读不出的档位（不是 max）', stub.calls[5]?.body?.reasoning_effort === 'none', stub.calls[5]?.body?.reasoning_effort)
 await post(`${base}/v1/chat/completions`, { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'x' }], thinking: { type: 'disabled' }, chat_template_kwargs: { enable_thinking: true, unrelated_template_var: 7 } })
@@ -1191,6 +1191,57 @@ check('GET /models 空列表 → code=EMPTY',
   modelsEmpty.json?.value?.fetch?.code === 'EMPTY' && modelsEmpty.json.value.fetch.ok === false,
   JSON.stringify(modelsEmpty.json?.value?.fetch))
 stub.modelsMode = 'ok'
+
+/* ───────────────────── 10c. config-driven context-window overrides ───────────────────── */
+
+section('10c. 管理页配置的 contextWindows 覆盖上游发现与 1M 默认')
+
+// The admin page now ships provider.contextWindows; the override must beat both
+// the upstream-discovered window and the 1M default, and only for the model it
+// names (the discovery at the top of this section left m-manual=3M / stub-alpha=2M).
+await saveProvider('p-models', { contextWindows: { 'm-manual': 64_000 } })
+const overcrowded = await get(`${base}/v1/models`)
+const overcrowdedWinOf = (id) => overcrowded.json?.data?.find((entry) => entry.id === id)?.context_window
+check('配置覆盖压过上游发现：peak(只走 m-manual)报 64000、off-peak(只走 stub-alpha)仍报发现的 2M、auto 取最小值',
+  overcrowdedWinOf('peak') === 64_000 && overcrowdedWinOf('off-peak') === 2_000_000 && overcrowdedWinOf('auto') === 64_000,
+  JSON.stringify(overcrowded.json?.data))
+check('覆盖写进 /state 的供应商回显（管理页据此回填输入框）',
+  providerState('p-models').contextWindows?.['m-manual'] === 64_000,
+  JSON.stringify(providerState('p-models').contextWindows))
+
+// A save that never mentions contextWindows must keep the stored override, not
+// silently wipe it — the same "absent means keep" rule every other field uses.
+await saveProvider('p-models', { timeoutMs: 99_000 })
+check('没提 contextWindows 的保存保留已存覆盖',
+  providerState('p-models').timeoutMs === 99_000 && providerState('p-models').contextWindows?.['m-manual'] === 64_000,
+  JSON.stringify({ timeoutMs: providerState('p-models').timeoutMs, cw: providerState('p-models').contextWindows }))
+
+await saveProvider('p-models', { contextWindows: {} })
+const windowsCleared = await get(`${base}/v1/models`)
+const clearedWinOf = (id) => windowsCleared.json?.data?.find((entry) => entry.id === id)?.context_window
+check('清空覆盖后回到上游发现（peak 报回 3M），不再残留空对象之外的旧值',
+  clearedWinOf('peak') === 3_000_000
+  && providerState('p-models').contextWindows && Object.keys(providerState('p-models').contextWindows).length === 0,
+  JSON.stringify(providerState('p-models').contextWindows))
+
+const cwBadValue = await post(`${base}/admin/api/config`, {
+  providers: { 'p-models': { ...PROVIDER_SPEC['p-models'], contextWindows: { 'm-manual': 'not-a-number' } } },
+}, adminHeaders)
+check('contextWindows 里非整数值被拒绝',
+  cwBadValue.json?.ok === false && /contextWindows/.test(cwBadValue.json?.error?.message ?? ''),
+  cwBadValue.json?.error?.message)
+const cwBadRange = await post(`${base}/admin/api/config`, {
+  providers: { 'p-models': { ...PROVIDER_SPEC['p-models'], contextWindows: { 'm-manual': 0 } } },
+}, adminHeaders)
+check('contextWindows 里越界整数被拒绝',
+  cwBadRange.json?.ok === false && /contextWindows/.test(cwBadRange.json?.error?.message ?? ''),
+  cwBadRange.json?.error?.message)
+const cwBadShape = await post(`${base}/admin/api/config`, {
+  providers: { 'p-models': { ...PROVIDER_SPEC['p-models'], contextWindows: [64_000] } },
+}, adminHeaders)
+check('contextWindows 整体不是对象时被拒绝',
+  cwBadShape.json?.ok === false && /contextWindows/.test(cwBadShape.json?.error?.message ?? ''),
+  cwBadShape.json?.error?.message)
 
 /* ───────────────────────── 11. order-table reconciliation ───────────────────────── */
 

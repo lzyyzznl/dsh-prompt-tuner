@@ -133,8 +133,7 @@ defineConverter({ id, label, match, toUpstream, fromUpstream, fromUpstreamChunk,
 | 错误体 | `{error: {message, type, param, code}}` | vLLM 自己的形状 | 按状态码重写 |
 | 未知字段 | — | — | **一律原样透传**，不丢数据 |
 
-转换器**不会自作主张加参数**：调用方什么都没说时不发 `reasoning_effort`，由网关自己的默认值决定（`co-claw` 默认为开、`deepseek-v4-flash` 默认为关）。
-它保证的是「显式控制两边同义」。逐条实测见[历史改进记录 · 路由服务与 maas 转换器](docs/HISTORY.md#路由服务与-maas-转换器2026-10-10)。
+转换器**会把思考档位缺省成一个明确的默认**：调用方什么都没说时，按路由规则登记成 `reasoning_effort: "max"`（缺省 = 思考，两条路由都按这一档运营），要关思考只能显式传 `none`（各种拼法都归一成 `none`，模板开关同步为 `false`）。它保证的是「显式控制两边同义，没说就默认思考」。逐条实测见[历史改进记录 · 路由服务与 maas 转换器](docs/HISTORY.md#路由服务与-maas-转换器2026-10-10)。
 
 ### 配置与密钥
 
@@ -147,6 +146,12 @@ defineConverter({ id, label, match, toUpstream, fromUpstream, fromUpstreamChunk,
 
 页面上**留空即保留已存密钥**：服务从不把明文回传给页面，只回掩码，所以"不改密钥"只能是留空；填入新值即覆盖，从列表里删掉即删除。
 请求头仍然是一个字符串值的扁平 JSON 对象，直接合并进上游请求。
+
+**每个模型可以单独覆盖上下文窗口**：`GET /v1/models` 给三个语境名各报一个 `context_window`（取各自候选里最小的那个），取值顺序是
+**管理页填的窗口 → 上游 `GET /models` 自己声明的窗口 → 100 万 token 默认**。ZTE 那两个网关的 `/models` 是 404 不报窗口，
+所以不填的话它们和直连官方的小窗口模型都按 1M 报——想要真实数字，就在供应商区块的「上下文窗口」里给对应模型填一个：窗口留空 =
+用上游发现的值（都没有才落到 1M 默认），把整行删掉再保存 = 清掉覆盖回到默认/发现。窗口存在配置（`providers.<id>.contextWindows`）里，
+页面保存时校验 1–100,000,000 的整数。
 
 ### 熔断：颗粒度在 key，不在供应商
 
@@ -259,8 +264,8 @@ defineConverter({ id, label, match, toUpstream, fromUpstream, fromUpstreamChunk,
 ### 自检
 
 ```sh
-npm run check:service   # 451 项：桩上游 + 真服务 + 真 socket，离线、零 token
-npm run check:ui        # 106 项：管理页（假 DOM 跑真脚本），离线、零 token
+npm run check:service   # 458 项：桩上游 + 真服务 + 真 socket，离线、零 token
+npm run check:ui        # 115 项：管理页（假 DOM 跑真脚本），离线、零 token
 npm run check:live      # 28 项：对真实网关的端到端实测，需网络与密钥，非离线自检
 ```
 

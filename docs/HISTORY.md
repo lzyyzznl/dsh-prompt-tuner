@@ -24,6 +24,8 @@
 - [口径以 DeepSeek 峰谷计费为准：补班周末也是低谷](#口径以-deepseek-峰谷计费为准补班周末也是低谷2026-10-11)
 - [对外回到三个模型名：auto / peak / off-peak](#对外回到三个模型名auto--peak--off-peak2026-10-11)
 - [图片输入：带图的请求只走「图片」行](#图片输入带图的请求只走图片行2026-10-11)
+- [上下文窗口：管理页能配 context_window](#上下文窗口管理页能配-context_window2026-10-11)
+- [maas 缺省变 max：不传 = 思考](#maas-缺省变-max不传--思考2026-10-11)
 - [key 级熔断与多密钥](#key-级熔断与多密钥2026-10-10)
 - [设置页](#设置页)
 - [延迟](#延迟)
@@ -912,6 +914,22 @@ models:
 
 **测试**：`check:service` 451 项（第 27 节：带图跳过表头直达图片行、不带图不受影响、当前表无图片行 → 400 且零上游调用、点名语境与能力交互（强制低谷表无图片行 → 400 且不跨表）、图片行失败落到下一条、唯一图片行失败 → 503、`enabled:false` 只打图片行一次、多图等价一张图、整表空 → 503）；`check` 858 项（`requestHasImage` 纯函数、`normalizeOrder` 只留字面 `true`）；`check:ui` 106 项（勾选后保存带 `vision: true`、已有 `vision: true` 的行渲染时勾选、unchecked 行不带该字段）。
 
+## 上下文窗口：管理页能配 context_window（2026-10-11）
+
+**要解决的问题**：`GET /v1/models` 为三个语境名各报一个 `context_window`（取该语境候选里最小的那个，见「对外回到三个模型名」一节），但取值只有两条路——**上游 `GET /models` 自己声明的窗口**（官方 DeepSeek 列表有，ZTE 那两个网关 404 没有）与 **100 万 token 默认**。config 里其实早已支持 `providers.<id>.contextWindows` 覆盖，却只能**手改 `router-service.json`**：管理页供应商编辑区只有 label / baseURL / models / keys / timeoutMs，**没有窗口输入框**。于是对绝大多数用户"没地方设置，看起来就是写死的 1M"。
+
+**决定**：供应商区块新增「上下文窗口」块——**每行一个模型 id + 一个窗口输入框**，保存进 `providers.<id>.contextWindows`。取值优先级不变（**手填覆盖 → 上游发现 → 1M 默认**），服务端无需改动：`validateProvider` 早已接受并校验 `contextWindows`（整数 1–100,000,000）、patch 合并早已按「absence 保留旧值」处理、`/state` 早已把 `contextWindows` 回显、`/v1/models` 的 `contextWindowOf` 早已先读配置。这次补上的是**缺的那一半 UI**（渲染 + 收集 + 校验 + 增删行）。
+
+几条行为定死的：
+
+- **窗口留空 = 丢弃该模型的覆盖**（回落上游发现或 1M 默认）；模型也留空整行 = 忽略（占位行）。
+- **把整行删掉再保存 = 清掉这个模型的覆盖**；删光所有行保存 = `contextWindows: {}`，全部回到发现/默认——UI 永远显式提交这份 map，"absence 即保留"的规则让页面敢这么做而不怕误清。
+- **越界或非整数、以及"有窗口没模型"的空行都被拦下**：行内错误、不发保存请求（与服务端"写时拒绝"口径一致）。
+- 计数字标=可见行数；没有覆盖时也渲染一个空占位行，用户一眼知道在哪填。
+- 模型输入框接的是同一个 datalist（有下拉建议），但不绑定它——窗口可以给下拉里还没有的模型命名，和 config map 的语义完全一致。
+
+**测试**：`check:service` 458 项（新 10c 节：覆盖压过上游发现且只作用于点名的模型 —— peak(只走 m-manual)报 64000、off-peak(只走 stub-alpha)仍报发现的 2M、auto 取两者最小值；覆盖写进 `/state` 回显；**没提 `contextWindows` 的保存保留已存覆盖**；清空覆盖回到上游发现；非整数值 / 越界整数 / 整体不是对象三种拒绝）。`check:ui` 115 项（新 13 节：回传的窗口渲染成预填行、没窗口的供应商也有空占位行、增/删/计数徽标、编辑后提交的映射含改动值与新行而空窗口行不出条目、删光提交空 map、越界值与"有窗口没模型"都被行内拦下）。
+
 ## 口径以 DeepSeek 峰谷计费为准：补班周末也是低谷（2026-10-11）
 
 **要解决的问题**：上一版把外部工作日接口的 `is_workingday` 直接当成「今天是不是工作日」，于是**调休上班的周六被判成高峰**（`makeup` 之前反而是「正确」的行为）。但路由服务的判据不是政府日历，而是**参考方的计费规则**：DeepSeek API 的峰谷说明写明「**调休上班的周末、中国法定节假日全天均按空闲时段计费**」。口径错了，选路就反了——补班那天本该走空闲时段（官方 API 打折）那张表，却走了高峰表。
@@ -951,6 +969,20 @@ models:
 
 这两个网关按**同一档**在跑，所以细粒度思考等级对它们没有意义——之前 `low`/`medium`/`high`/`max`、任何 `budget_tokens`、以及各种别名（`minimal`→`low`、`xhigh`/`maximum`→`max`）会被**原样换算成各自等级**，同一个"开思考"却可能因为调用方拼写不同而让两条路由用不同深度。现改为**一个天花板**：`toUpstream` 里 `resolveEffort` 的结果只有 `none`（一切 off 拼写）被原样保留，**任一非 off 档位一律收成 `max`**；没表态仍不发字段（各网关默认照旧）。`resolveEffort` 只负责读懂并决出等级，封顶发生在落线那一层，所以 `enable_thinking` 的同步写出也自动跟着 `max` 走。`check:service` 的预算/别名/`enable_thinking:true` 断言从 `medium`/`low`/`high` 改成 `max`（当时 419 项，现 451 项），并新增 low/medium/预算 4096 三条显式封顶用例。
 
+
+## maas 缺省变 max：不传 = 思考（2026-10-11）
+
+上一节把「任一非 off 档位一律收成 max」立成天花板时，还留着一条老约定：**调用方什么都没说就不发思考字段**，由各网关自己的模板默认值决定（`co-claw` 开、`deepseek-v4-flash` 关）。这次把这最后一条也收掉，规则变成一句话：
+
+> **显式 `none`（随便怎么拼）→ 不思考；其余一切，包括根本没传 → `max`。**
+
+所以 maas 转换器 `toUpstream`（`lib/service/converters/maas.js`）不再有「发不发字段」的分支：`resolveEffort` 的 `null`（缺省）、`UNREADABLE_LEVEL`（说了听不懂）以及任一 non-`none` 档位，全部落到同一个 `NON_OFF_LEVEL = 'max'`；只有 `'none'` 原样保留。因为是「决定了一个档位」，`chat_template_kwargs.enable_thinking` 也一定被写成与档位一致（`none` → `false`，其余 → `true`），缺省不再把模板开关留给后端默认。
+
+**为什么要改**：这两条路由按同一档运营，「没说话」却让两个网关各自默认（co-claw 开 / dsv4 关）等于同一个请求在两个模型上行为不一致。改成显式 `max` 后，缺省与任何开思考的拼写同义，`none` 是唯一的关。
+
+**作用边界（重要）**：这个改动在 8790 的北向边界生效——凡是**真正没带思考字段**到 8790 的请求（外部 OpenAI 兼容客户端、脚本，以及任何「不带字段」通道的调用），上游现在会收到 `reasoning_effort: max`（含 `enable_thinking: true`）。**DSH 自己发的调用要注意**：pi-ai 把 `thinkingLevelMap.off` 当作「不带档位」时的线上值，所以 DSH 的「Default / off」到 8790 时是显式 `reasoning_effort: none`，不是缺省——转换器的这个默认对它们**不生效**（它们仍落到 `none` = 不思考）。要让 DSH 里的「Default」在 maas 上也变成思考，得在 DSH 的 provider 声明里把这两条 custom 路由的**默认档位**配成 `reasoning: max`（并把 `max` 补进 `reasoningEfforts` 的线上映射），那是 DSH 侧配置的事，不在转换器里。官方 `deepseek-official` 不经过 maas 转换器（注册表里只有 `maas`），原逻辑不变。
+
+**怎么复核**：`npm run check:service` 把「什么都没说 → 不发字段」「null / 空串 / 空的 thinking / 无关模板变量 → 不发字段」等断言改成「→ `max`」，并断言缺省时模板开关写成 `true`；`none`/`off` → `none`、`high`/`max`/`minimal` → `max` 的断言原样保留。真网关侧「没表态仍由网关默认」的老实测（记录在 2026-10-10 那节）不再成立，只作为历史保留。
 
 ## 设置页
 
@@ -1092,8 +1124,8 @@ models:
 
 ```sh
 npm run check                 # 847 项，含宿主通知/标题/路由服务与设置页契约
-npm run check:service         # 451 项，路由服务本体（桩上游，离线）
-npm run check:ui              # 106 项，管理页脚本（假 DOM）
+npm run check:service         # 458 项，路由服务本体（桩上游，离线）
+npm run check:ui              # 115 项，管理页脚本（假 DOM）
 npm run check:shape           # 对**已安装**的 DSH 复核旁路提问的消息形状（需要本机有 DSH）
 npm run check:title           # 对**已安装**的 DSH 复核标题重总结（真会话、真投影，不调模型）
 node scripts/bench.mjs --runs 3

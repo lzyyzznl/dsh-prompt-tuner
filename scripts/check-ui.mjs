@@ -579,7 +579,8 @@ function fixtureState() {
         models: ['alpha-small'],
         discoveredModels: ['alpha-large'],
         allModels: ['alpha-small', 'alpha-large'],
-        timeoutMs: 120000
+        timeoutMs: 120000,
+        contextWindows: { 'alpha-small': 128000 }
       },
       {
         id: 'beta',
@@ -824,7 +825,9 @@ check(`页面引用的 ${referenced.length} 个键在中英词典里都有定义
 check('新增的字段/枚举/原因键都在词典里',
   ['failureRateThreshold', 'minSamples', 'windowSize', 'halfOpenSuccesses', 'thUnit', 'thRate',
     'thBlacklist', 'kindBlacklist', 'kindIgnored', 'kindUnconfigured', 'reasonInsufficientBalance',
-    'classRetryable', 'removedOrderRows'].every((key) => zhKeys.includes(key) && enKeys.includes(key)))
+    'classRetryable', 'removedOrderRows', 'contextWindowsTitle', 'contextWindowsHint', 'cwModel',
+    'cwTokens', 'addContextWindow', 'deleteContextWindow', 'invalidContextWindow', 'cwLimitReached']
+    .every((key) => zhKeys.includes(key) && enKeys.includes(key)))
 
 /* ───────────────────────── 3. buttons and handlers ───────────────────────── */
 
@@ -1457,5 +1460,105 @@ check('路由页签顶部也有同一句实时选路行',
   routingLive !== null && routingLive.textContent.includes('当前=高峰')
   && routingLive.textContent.includes('alpha → beta → ghost'),
   routingLive ? routingLive.textContent : 'missing')
+
+/* ──────────────────────── 13. context windows ──────────────────────── */
+
+section('13. 上下文窗口：每行一个模型 + 窗口，留空即回落默认/上游发现')
+
+const cwPage = bootPage()
+await cwPage.settle()
+const cwGroupOf = (id) => cwPage.all('[data-role="provider"]').find((node) => node.getAttribute('data-id') === id)
+const alphaCW = cwGroupOf('alpha')
+const betaCW = cwGroupOf('beta')
+const cwRowsOf = (group) => group.querySelectorAll('[data-role="cw-row"]')
+check('服务端回传的窗口渲染成预填行（alpha-small → 128000）',
+  cwRowsOf(alphaCW).length === 1
+  && cwRowsOf(alphaCW)[0].querySelector('input[data-field="cw-model"]').value === 'alpha-small'
+  && cwRowsOf(alphaCW)[0].querySelector('input[data-field="cw-window"]').value === '128000',
+  JSON.stringify([...cwRowsOf(alphaCW)].map((row) => ({
+    model: row.querySelector('input[data-field="cw-model"]').value,
+    window: row.querySelector('input[data-field="cw-window"]').value
+  }))))
+check('没有窗口的供应商也渲染一个空行（用户知道在哪填）',
+  cwRowsOf(betaCW).length === 1
+  && cwRowsOf(betaCW)[0].querySelector('input[data-field="cw-model"]').value === ''
+  && cwRowsOf(betaCW)[0].querySelector('input[data-field="cw-window"]').value === '')
+check('每个供应商区块都有新增窗口按钮，每行有删除按钮，计数徽标等于可见行数',
+  alphaCW.querySelector('button[data-act="add-cw"]') !== null
+  && betaCW.querySelector('button[data-act="add-cw"]') !== null
+  && cwRowsOf(alphaCW)[0].querySelector('button[data-act="remove-cw"]') !== null
+  && alphaCW.querySelector('[data-role="cw-count"]').textContent === '1'
+  && betaCW.querySelector('[data-role="cw-count"]').textContent === '1')
+
+const cwSave = bootPage()
+await cwSave.settle()
+cwSave.click(cwSave.all('button[data-act="save-providers"]')[0])
+await cwSave.settle()
+const bodyCW = cwSave.lastBody('config')
+const rowErrorsCW = cwSave.all('[data-role="row-error"]').map((node) => node.textContent).filter((text) => text !== '')
+check('保存把已存窗口原样提交，没有窗口的供应商提交空 map（可清空旧值）',
+  bodyCW !== null && rowErrorsCW.length === 0
+  && bodyCW.providers.alpha.contextWindows['alpha-small'] === 128000
+  && JSON.stringify(bodyCW.providers.beta.contextWindows) === '{}',
+  `rowErrors=${rowErrorsCW.join('|')} alpha=${JSON.stringify(bodyCW?.providers?.alpha?.contextWindows)} beta=${JSON.stringify(bodyCW?.providers?.beta?.contextWindows)}`)
+
+const cwEdit = bootPage()
+await cwEdit.settle()
+const cwAlpha = cwEdit.all('[data-role="provider"]').find((node) => node.getAttribute('data-id') === 'alpha')
+const cwBeta = cwEdit.all('[data-role="provider"]').find((node) => node.getAttribute('data-id') === 'beta')
+cwEdit.type(cwAlpha.querySelector('[data-role="cw-row"] [data-field="cw-window"]'), '262144')
+cwEdit.click(cwAlpha.querySelector('button[data-act="add-cw"]'))
+const cwNewRows = cwAlpha.querySelectorAll('[data-role="cw-row"]')
+cwEdit.type(cwNewRows[1].querySelector('input[data-field="cw-model"]'), 'alpha-large')
+// 第二行窗口留空：该模型的覆盖被丢弃（回落上游发现 / 1M 默认）
+cwEdit.type(cwBeta.querySelector('[data-role="cw-row"] [data-field="cw-model"]'), 'beta-1')
+cwEdit.type(cwBeta.querySelector('[data-role="cw-row"] [data-field="cw-window"]'), '65536')
+cwEdit.click(cwEdit.all('button[data-act="save-providers"]')[0])
+await cwEdit.settle()
+const bodyEdit = cwEdit.lastBody('config')
+check('编辑后提交的窗口映射包含改动的值与新行，空窗口行不产生条目',
+  bodyEdit !== null
+  && bodyEdit.providers.alpha.contextWindows['alpha-small'] === 262144
+  && bodyEdit.providers.alpha.contextWindows['alpha-large'] === undefined
+  && bodyEdit.providers.beta.contextWindows['beta-1'] === 65536,
+  JSON.stringify({ alpha: bodyEdit?.providers?.alpha?.contextWindows, beta: bodyEdit?.providers?.beta?.contextWindows }))
+check('新增窗口行后计数徽标跟着变', cwAlpha.querySelector('[data-role="cw-count"]').textContent === '2')
+
+const cwRemove = bootPage()
+await cwRemove.settle()
+const cwRemoval = cwRemove.all('[data-role="provider"]').find((node) => node.getAttribute('data-id') === 'alpha')
+cwRemove.click(cwRemoval.querySelector('[data-role="cw-row"] button[data-act="remove-cw"]'))
+cwRemove.click(cwRemove.all('button[data-act="save-providers"]')[0])
+await cwRemove.settle()
+const bodyRemoved = cwRemove.lastBody('config')
+check('删除唯一的窗口行后提交空 map（覆盖被彻底清掉，回到默认/发现）',
+  bodyRemoved !== null
+  && JSON.stringify(bodyRemoved.providers.alpha.contextWindows) === '{}'
+  && cwRemoval.querySelector('[data-role="cw-count"]').textContent === '0',
+  JSON.stringify(bodyRemoved?.providers?.alpha?.contextWindows))
+
+const cwBad = bootPage()
+await cwBad.settle()
+const cwBadAlpha = cwBad.all('[data-role="provider"]').find((node) => node.getAttribute('data-id') === 'alpha')
+cwBad.type(cwBadAlpha.querySelector('[data-role="cw-row"] [data-field="cw-window"]'), '0')
+const beforeBadCW = cwBad.posts().length
+cwBad.click(cwBad.all('button[data-act="save-providers"]')[0])
+await cwBad.settle()
+check('越界的窗口值被拦下：显示行内错误且不发保存请求',
+  cwBad.posts().length === beforeBadCW
+  && cwBadAlpha.querySelector('[data-role="row-error"]').textContent.includes(strings.zh.invalidContextWindow),
+  cwBadAlpha.querySelector('[data-role="row-error"]').textContent)
+
+const cwNoModel = bootPage()
+await cwNoModel.settle()
+const cwBadBeta = cwNoModel.all('[data-role="provider"]').find((node) => node.getAttribute('data-id') === 'beta')
+cwNoModel.type(cwBadBeta.querySelector('[data-role="cw-row"] [data-field="cw-window"]'), '64000')
+const beforeBadBeta = cwNoModel.posts().length
+cwNoModel.click(cwNoModel.all('button[data-act="save-providers"]')[0])
+await cwNoModel.settle()
+check('有窗口没模型的空行同样被拦下',
+  cwNoModel.posts().length === beforeBadBeta
+  && cwBadBeta.querySelector('[data-role="row-error"]').textContent.includes(strings.zh.invalidContextWindow),
+  cwBadBeta.querySelector('[data-role="row-error"]').textContent)
 
 finish()
