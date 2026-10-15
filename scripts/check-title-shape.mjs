@@ -241,6 +241,37 @@ probe('a forked child session is not re-titled',
   `${asks.length} call(s) / ${ctx.sessionTitle.get(forked)?.title}`)
 probe('the fork really carries a parent on its header', forked.header.parentSession === session.id)
 
+/* ── the cadence counts injected user/message context, but titles only come
+      from human messages: an agent-driven session floods the log with host
+      context (runtime, skill/tool catalogs, checkpoints) while the human's own
+      turns are sparse, so the counter must advance on every user/message event
+      or automatic re-summarization never fires there ── */
+const injected = ctx.sessions.create(SessionId('title-shape-cadence'))
+const asksBeforeCadence = asks.length
+injected.append('user/message', createUserMessage({
+  content: [{ type: 'text', text: '系统注入的运行时上下文' }],
+  source: { kind: 'time-context' },
+}), { surfaceOp: 'append' })
+injected.append('user/message', createUserMessage({
+  content: [{ type: 'text', text: '系统注入的工具目录' }],
+  source: { kind: 'skill-catalog' },
+}), { surfaceOp: 'append' })
+say(injected, '人类的第一条')
+await settle()
+await watcher.whenIdle()
+const cadenceRevision = injected.snapshotEvents()
+  .findLast((event) => event.type === 'session/title' && event.data.source.kind === 'provider')
+probe('系统注入事件推进计数：2 条注入 + 1 条人类消息即触发一次重总结',
+  asks.length === asksBeforeCadence + 1 && cadenceRevision !== undefined,
+  `${asks.length - asksBeforeCadence} call(s)`)
+probe('标题窗口只读人类消息，注入文本不进入标题输入',
+  asks.at(-1) !== undefined && JSON.parse(asks.at(-1).text).join('|') === '人类的第一条',
+  String(asks.at(-1)?.text))
+probe('修订引用的 messageSeqs 只含人类消息，不含注入事件',
+  JSON.stringify(cadenceRevision?.data?.messageSeqs) === JSON.stringify(
+    injected.snapshotEvents().filter((event) => event.type === 'user/message' && event.data.source.kind === 'user').map((event) => event.seq)),
+  JSON.stringify(cadenceRevision?.data?.messageSeqs))
+
 /* ── the refresher can be disposed and stops reacting ── */
 watcher.dispose()
 const asksBeforeDispose = asks.length

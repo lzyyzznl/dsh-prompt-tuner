@@ -414,6 +414,12 @@ check('只有人类用户的非空文本消息进标题窗口',
     && title.titleMessageOf({ type: 'user/message', seq: 3, data: { content: [{ type: 'image' }], source: { kind: 'user' } } }) === undefined
     && title.titleMessageOf({ type: 'assistant/message', seq: 4, data: {} }) === undefined)
 
+const cadenceLog = [userEvent(0, '你好'), userEvent(1, '', 'time-context'), userEvent(2, '目录', 'skill-catalog'), { type: 'assistant/message', seq: 3, data: {} }]
+check('轮次计数器数每个 user/message 事件，无论来源（含系统注入）',
+  title.countTurnEvents(cadenceLog) === 3
+    && title.countTurnEvents(cadenceLog, 1) === 2
+    && title.countTurnEvents([{ type: 'assistant/message', seq: 0, data: {} }]) === 0)
+
 const titleLog = [userEvent(0, '第一条'), userEvent(1, ''), { type: 'assistant/message', seq: 2, data: {} }, userEvent(3, '第三条')]
 check('eligibleTitleMessages 只收集合规消息并保持顺序',
   JSON.stringify(title.eligibleTitleMessages(titleLog).map((message) => message.seq)) === '[0,3]')
@@ -592,15 +598,28 @@ function makeTitleHarness(options = {}) {
 }
 
 {
+  // The cadence counter counts every `user/message` event, whatever its source:
+  // an agent-driven session floods the log with host-injected context (runtime,
+  // tool catalogs, checkpoints) while the human's own turns are sparse, and the
+  // title must still re-summarize as the conversation moves on. The *window* a
+  // title is built from stays on eligible human messages, so a boundary reached
+  // with nothing human to read is a no-op, and injected text never becomes a title.
   const h = makeTitleHarness({ settings: { titleRerollTurns: 2 } })
   h.session.append('user/message', { content: [{ type: 'text', text: '   ' }], source: { kind: 'user' } })
-  h.session.append('user/message', { content: [{ type: 'text', text: '来自别的 agent' }], source: { kind: 'agent' } })
-  h.say('真·第一条')
+  h.session.append('user/message', { content: [{ type: 'text', text: '系统注入的上下文' }], source: { kind: 'runtime-context' } })
   await h.installer.whenIdle()
-  check('空白 / 非人类消息不推进计数器', h.calls.length === 0)
+  check('系统注入事件推进计数器到边界，但窗口无可读人类消息时不调用模型',
+    h.calls.length === 0 && h.autoTitles().length === 0)
+  h.say('真·第一条')
   h.say('第二条')
   await h.installer.whenIdle()
-  check('第 2 条真消息才触发重总结', h.calls.length === 1)
+  check('计数器计入系统注入事件：跨过边界即触发一次重总结',
+    h.calls.length === 1, String(h.calls.length))
+  check('窗口仍只读人类消息，系统注入文本不进入标题输入',
+    JSON.parse(h.calls[0].text).join('|') === '真·第一条|第二条', h.calls[0]?.text)
+  const written = h.autoTitles()[0]
+  check('写入的修订引用真实的人类消息 seq，而非注入事件',
+    written !== undefined && JSON.stringify(written.data.messageSeqs) === '[2,3]', JSON.stringify(written?.data?.messageSeqs))
 }
 
 {
