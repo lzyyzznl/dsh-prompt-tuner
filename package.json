@@ -22,13 +22,11 @@
     "url": "https://github.com/lzyyzznl/dsh-prompt-tuner/issues"
   },
   "keywords": [
-    "circuit-breaker",
     "composer",
     "deepseek-harness",
     "dsh",
     "dsh-plugin",
     "dsh-plugin-suite",
-    "model-routing",
     "prompt"
   ],
   "scripts": {
@@ -37,10 +35,7 @@
     "check:title": "node scripts/check-title-shape.mjs",
     "bench": "node scripts/bench.mjs",
     "eval:prompt": "node scripts/eval-prompt.mjs",
-    "eval:attribution": "node scripts/eval-attribution.mjs",
-    "check:service": "node scripts/check-service.mjs",
-    "check:ui": "node scripts/check-ui.mjs",
-    "check:live": "node scripts/check-live.mjs"
+    "eval:attribution": "node scripts/eval-attribution.mjs"
   },
   "exports": {
     ".": {
@@ -50,13 +45,7 @@
       "default": "./lib/client.js"
     },
     "./cordis.patch.yml": "./cordis.patch.yml",
-    "./package.json": "./package.json",
-    "./service": {
-      "default": "./lib/service/main.js"
-    },
-    "./service/client": {
-      "default": "./lib/service-client.js"
-    }
+    "./package.json": "./package.json"
   },
   "dsh": {
     "bundle": {
